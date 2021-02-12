@@ -4,7 +4,7 @@
  *
  * Routines for dropping distributed tables and their metadata on worker nodes.
  *
- * Copyright (c) 2016, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  * $Id$
  *
@@ -20,9 +20,11 @@
 #include "catalog/pg_foreign_server.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/distribution_column.h"
-#include "distributed/master_metadata_utility.h"
-#include "distributed/master_protocol.h"
+#include "distributed/listutils.h"
+#include "distributed/metadata_utility.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/metadata/distobject.h"
 #include "foreign/foreign.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -51,9 +53,6 @@ worker_drop_distributed_table(PG_FUNCTION_ARGS)
 	Oid relationId = ResolveRelationId(relationName, true);
 
 	ObjectAddress distributedTableObject = { InvalidOid, InvalidOid, 0 };
-	Relation distributedRelation = NULL;
-	List *shardList = NULL;
-	ListCell *shardCell = NULL;
 	char relationKind = '\0';
 
 	CheckCitusVersion(ERROR);
@@ -66,10 +65,10 @@ worker_drop_distributed_table(PG_FUNCTION_ARGS)
 		PG_RETURN_VOID();
 	}
 
-	shardList = LoadShardList(relationId);
+	List *shardList = LoadShardList(relationId);
 
 	/* first check the relation type */
-	distributedRelation = relation_open(relationId, AccessShareLock);
+	Relation distributedRelation = relation_open(relationId, AccessShareLock);
 	relationKind = distributedRelation->rd_rel->relkind;
 	EnsureRelationKindSupported(relationId);
 
@@ -102,26 +101,29 @@ worker_drop_distributed_table(PG_FUNCTION_ARGS)
 		performMultipleDeletions(objects, DROP_RESTRICT,
 								 PERFORM_DELETION_INTERNAL);
 	}
-	else
+	else if (!IsObjectAddressOwnedByExtension(&distributedTableObject, NULL))
 	{
-		/* drop the table with cascade since other tables may be referring to it */
+		/*
+		 * If the table is owned by an extension, we cannot drop it, nor should we
+		 * until the user runs DROP EXTENSION. Therefore, we skip dropping the
+		 * table and only delete the metadata.
+		 *
+		 * We drop the table with cascade since other tables may be referring to it.
+		 */
 		performDeletion(&distributedTableObject, DROP_CASCADE,
 						PERFORM_DELETION_INTERNAL);
 	}
 
 	/* iterate over shardList to delete the corresponding rows */
-	foreach(shardCell, shardList)
+	uint64 *shardIdPointer = NULL;
+	foreach_ptr(shardIdPointer, shardList)
 	{
-		List *shardPlacementList = NIL;
-		ListCell *shardPlacementCell = NULL;
-		uint64 *shardIdPointer = (uint64 *) lfirst(shardCell);
-		uint64 shardId = (*shardIdPointer);
+		uint64 shardId = *shardIdPointer;
 
-		shardPlacementList = ShardPlacementList(shardId);
-		foreach(shardPlacementCell, shardPlacementList)
+		List *shardPlacementList = ShardPlacementList(shardId);
+		ShardPlacement *placement = NULL;
+		foreach_ptr(placement, shardPlacementList)
 		{
-			ShardPlacement *placement = (ShardPlacement *) lfirst(shardPlacementCell);
-
 			/* delete the row from pg_dist_placement */
 			DeleteShardPlacementRow(placement->placementId);
 		}

@@ -60,7 +60,7 @@ SELECT get_referencing_relation_id_list::regclass FROM get_referencing_relation_
 SELECT get_referenced_relation_id_list::regclass FROM get_referenced_relation_id_list('dtt4'::regclass) ORDER BY 1;
 SELECT get_referencing_relation_id_list::regclass FROM get_referencing_relation_id_list('dtt4'::regclass) ORDER BY 1;
 
--- some tests within transction blocks to make sure that 
+-- some tests within transction blocks to make sure that
 -- cache invalidation works fine
 CREATE TABLE test_1 (id int UNIQUE);
 CREATE TABLE test_2 (id int UNIQUE);
@@ -74,17 +74,17 @@ SELECT create_distributed_Table('test_3', 'id');
 SELECT create_distributed_Table('test_4', 'id');
 SELECT create_distributed_Table('test_5', 'id');
 
-CREATE VIEW referential_integrity_summary AS 
-    WITH RECURSIVE referential_integrity_summary(n, table_name, referencing_relations, referenced_relations) AS 
+CREATE VIEW referential_integrity_summary AS
+    WITH RECURSIVE referential_integrity_summary(n, table_name, referencing_relations, referenced_relations) AS
     (
         SELECT 0,'0','{}'::regclass[],'{}'::regclass[]
       UNION ALL
-        SELECT 
-          n + 1, 
-          'test_' || n + 1|| '' as table_name, 
-          (SELECT  array_agg(get_referencing_relation_id_list::regclass ORDER BY 1) FROM get_referencing_relation_id_list(('test_' || (n +1) ) ::regclass)) as referencing_relations, 
+        SELECT
+          n + 1,
+          'test_' || n + 1|| '' as table_name,
+          (SELECT  array_agg(get_referencing_relation_id_list::regclass ORDER BY 1) FROM get_referencing_relation_id_list(('test_' || (n +1) ) ::regclass)) as referencing_relations,
           (SELECT  array_agg(get_referenced_relation_id_list::regclass ORDER BY 1) FROM get_referenced_relation_id_list(('test_' || (n +1) ) ::regclass)) as referenced_by_relations
-        FROM referential_integrity_summary, pg_class 
+        FROM referential_integrity_summary, pg_class
         WHERE
          pg_class.relname = ('test_' || (n +1))
         AND n < 5
@@ -93,7 +93,7 @@ CREATE VIEW referential_integrity_summary AS
 
 -- make sure that invalidation through ALTER TABLE works fine
 BEGIN;
-    ALTER TABLE test_2 ADD CONSTRAINT fkey_1 FOREIGN KEY(id) REFERENCES test_1(id);   
+    ALTER TABLE test_2 ADD CONSTRAINT fkey_1 FOREIGN KEY(id) REFERENCES test_1(id);
     SELECT * FROM referential_integrity_summary;
     ALTER TABLE test_3 ADD CONSTRAINT fkey_1 FOREIGN KEY(id) REFERENCES test_2(id);
     SELECT * FROM referential_integrity_summary;
@@ -105,7 +105,7 @@ ROLLBACK;
 
 -- similar test, but slightly different order of creating foreign keys
 BEGIN;
-    ALTER TABLE test_2 ADD CONSTRAINT fkey_1 FOREIGN KEY(id) REFERENCES test_1(id);   
+    ALTER TABLE test_2 ADD CONSTRAINT fkey_1 FOREIGN KEY(id) REFERENCES test_1(id);
     SELECT * FROM referential_integrity_summary;
     ALTER TABLE test_4 ADD CONSTRAINT fkey_1 FOREIGN KEY(id) REFERENCES test_3(id);
     SELECT * FROM referential_integrity_summary;
@@ -117,7 +117,7 @@ ROLLBACK;
 
 -- make sure that DROP CONSTRAINT works invalidates the cache correctly
 BEGIN;
-    ALTER TABLE test_2 ADD CONSTRAINT fkey_1 FOREIGN KEY(id) REFERENCES test_1(id);   
+    ALTER TABLE test_2 ADD CONSTRAINT fkey_1 FOREIGN KEY(id) REFERENCES test_1(id);
     ALTER TABLE test_3 ADD CONSTRAINT fkey_1 FOREIGN KEY(id) REFERENCES test_2(id);
     ALTER TABLE test_4 ADD CONSTRAINT fkey_1 FOREIGN KEY(id) REFERENCES test_3(id);
     ALTER TABLE test_5 ADD CONSTRAINT fkey_1 FOREIGN KEY(id) REFERENCES test_4(id);
@@ -149,7 +149,7 @@ COMMIT;
 -- DROP TABLE works expected
 -- re-create the constraints
 BEGIN;
-    ALTER TABLE test_2 ADD CONSTRAINT fkey_1 FOREIGN KEY(id) REFERENCES test_1(id);   
+    ALTER TABLE test_2 ADD CONSTRAINT fkey_1 FOREIGN KEY(id) REFERENCES test_1(id);
     ALTER TABLE test_3 ADD CONSTRAINT fkey_1 FOREIGN KEY(id) REFERENCES test_2(id);
     ALTER TABLE test_4 ADD CONSTRAINT fkey_1 FOREIGN KEY(id) REFERENCES test_3(id);
     ALTER TABLE test_5 ADD CONSTRAINT fkey_1 FOREIGN KEY(id) REFERENCES test_4(id);
@@ -217,8 +217,97 @@ BEGIN;
 
     SELECT get_referencing_relation_id_list::regclass FROM get_referencing_relation_id_list('test_7'::regclass) ORDER BY 1;
     SELECT get_referenced_relation_id_list::regclass FROM get_referenced_relation_id_list('test_7'::regclass) ORDER BY 1;
-    
+
 ROLLBACK;
+
+CREATE OR REPLACE FUNCTION get_foreign_key_connected_relations(IN table_name regclass)
+RETURNS SETOF RECORD
+LANGUAGE C STRICT
+AS 'citus', $$get_foreign_key_connected_relations$$;
+COMMENT ON FUNCTION get_foreign_key_connected_relations(IN table_name regclass)
+IS 'returns relations connected to input relation via a foreign key graph';
+
+CREATE TABLE distributed_table_1(col int unique);
+CREATE TABLE distributed_table_2(col int unique);
+CREATE TABLE distributed_table_3(col int unique);
+CREATE TABLE distributed_table_4(col int unique);
+
+SELECT create_distributed_table('distributed_table_1', 'col');
+SELECT create_distributed_table('distributed_table_2', 'col');
+SELECT create_distributed_table('distributed_table_3', 'col');
+SELECT create_distributed_table('distributed_table_4', 'col');
+
+CREATE TABLE reference_table_1(col int unique);
+CREATE TABLE reference_table_2(col int unique);
+
+SELECT create_reference_table('reference_table_1');
+SELECT create_reference_table('reference_table_2');
+
+
+-- Now build below foreign key graph:
+--
+--                               --------------------------------------------
+--                               ^                                          |
+--                               |                                          v
+-- distributed_table_1 <- distributed_table_2 -> reference_table_1 <- reference_table_2
+--            |                   ^
+--            |                   |
+--            ----------> distributed_table_3
+
+ALTER TABLE distributed_table_2 ADD CONSTRAINT fkey_1 FOREIGN KEY (col) REFERENCES distributed_table_1(col);
+ALTER TABLE distributed_table_2 ADD CONSTRAINT fkey_2 FOREIGN KEY (col) REFERENCES reference_table_1(col);
+ALTER TABLE reference_table_2 ADD CONSTRAINT fkey_3 FOREIGN KEY (col) REFERENCES reference_table_1(col);
+ALTER TABLE distributed_table_3 ADD CONSTRAINT fkey_4 FOREIGN KEY (col) REFERENCES distributed_table_2(col);
+ALTER TABLE distributed_table_2 ADD CONSTRAINT fkey_5 FOREIGN KEY (col) REFERENCES reference_table_2(col);
+ALTER TABLE distributed_table_1 ADD CONSTRAINT fkey_6 FOREIGN KEY (col) REFERENCES distributed_table_3(col);
+
+-- below queries should print all 5 tables mentioned in above graph
+
+SELECT oid::regclass::text AS tablename
+FROM get_foreign_key_connected_relations('reference_table_1') AS f(oid oid)
+ORDER BY tablename;
+
+SELECT oid::regclass::text AS tablename
+FROM get_foreign_key_connected_relations('distributed_table_1') AS f(oid oid)
+ORDER BY tablename;
+
+-- show that this does not print anything as distributed_table_4
+-- is not involved in any foreign key relationship
+SELECT oid::regclass::text AS tablename
+FROM get_foreign_key_connected_relations('distributed_table_4') AS f(oid oid)
+ORDER BY tablename;
+
+ALTER TABLE distributed_table_4 ADD CONSTRAINT fkey_1 FOREIGN KEY (col) REFERENCES distributed_table_4(col);
+
+-- show that we print table itself as it has a self reference
+SELECT oid::regclass::text AS tablename
+FROM get_foreign_key_connected_relations('distributed_table_4') AS f(oid oid)
+ORDER BY tablename;
+
+CREATE TABLE local_table_1 (col int unique);
+CREATE TABLE local_table_2 (col int unique);
+
+-- show that we do not trigger updating foreign key graph when
+-- defining/dropping foreign keys between postgres tables
+
+ALTER TABLE local_table_1 ADD CONSTRAINT fkey_1 FOREIGN KEY (col) REFERENCES local_table_2(col);
+
+SELECT oid::regclass::text AS tablename
+FROM get_foreign_key_connected_relations('local_table_2') AS f(oid oid)
+ORDER BY tablename;
+
+ALTER TABLE local_table_1 DROP CONSTRAINT fkey_1;
+
+SELECT oid::regclass::text AS tablename
+FROM get_foreign_key_connected_relations('local_table_1') AS f(oid oid)
+ORDER BY tablename;
+
+-- show that we error out for non-existent tables
+SELECT oid::regclass::text AS tablename
+FROM get_foreign_key_connected_relations('non_existent_table') AS f(oid oid)
+ORDER BY tablename;
+
+set client_min_messages to error;
 
 SET search_path TO public;
 DROP SCHEMA fkey_graph CASCADE;

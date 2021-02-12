@@ -13,7 +13,7 @@ SELECT * FROM citus_mx_test_schema.nation_hash ORDER BY n_nationkey LIMIT 4;
 -- test cursors
 SET search_path TO public;
 BEGIN;
-DECLARE test_cursor CURSOR FOR 
+DECLARE test_cursor CURSOR FOR
     SELECT *
         FROM nation_hash
         WHERE n_nationkey = 1;
@@ -25,7 +25,7 @@ END;
 -- test with search_path is set
 SET search_path TO citus_mx_test_schema;
 BEGIN;
-DECLARE test_cursor CURSOR FOR 
+DECLARE test_cursor CURSOR FOR
     SELECT *
         FROM nation_hash
         WHERE n_nationkey = 1;
@@ -86,7 +86,7 @@ SET search_path TO citus_mx_test_schema;
 SELECT * FROM nation_hash  WHERE n_nationkey OPERATOR(===) 1;
 
 
-SELECT * FROM citus_mx_test_schema.nation_hash_collation_search_path;
+SELECT * FROM citus_mx_test_schema.nation_hash_collation_search_path ORDER BY 1;
 SELECT n_comment FROM citus_mx_test_schema.nation_hash_collation_search_path ORDER BY n_comment COLLATE citus_mx_test_schema.english;
 
 SET search_path  TO citus_mx_test_schema;
@@ -101,15 +101,15 @@ SELECT * FROM citus_mx_test_schema.nation_hash_composite_types WHERE test_col = 
 SET search_path TO citus_mx_test_schema;
 SELECT * FROM nation_hash_composite_types WHERE test_col = '(a,a)'::new_composite_type ORDER BY 1::int DESC;
 
-
+SET citus.enable_repartition_joins to ON;
 -- check when search_path is public,
 -- join of two tables which are in different schemas,
 -- join on partition column
 SET search_path TO public;
-SELECT 
+SELECT
     count (*)
 FROM
-    citus_mx_test_schema_join_1.nation_hash n1, citus_mx_test_schema_join_2.nation_hash n2 
+    citus_mx_test_schema_join_1.nation_hash n1, citus_mx_test_schema_join_2.nation_hash n2
 WHERE
     n1.n_nationkey = n2.n_nationkey;
 
@@ -117,10 +117,10 @@ WHERE
 -- join of two tables which are in different schemas,
 -- join on partition column
 SET search_path TO citus_mx_test_schema_join_1;
-SELECT 
+SELECT
     count (*)
 FROM
-    nation_hash n1, citus_mx_test_schema_join_2.nation_hash n2 
+    nation_hash n1, citus_mx_test_schema_join_2.nation_hash n2
 WHERE
     n1.n_nationkey = n2.n_nationkey;
 
@@ -128,10 +128,10 @@ WHERE
 -- join of two tables which are in same schemas,
 -- join on partition column
 SET search_path TO public;
-SELECT 
+SELECT
     count (*)
 FROM
-    citus_mx_test_schema_join_1.nation_hash n1, citus_mx_test_schema_join_1.nation_hash_2 n2 
+    citus_mx_test_schema_join_1.nation_hash n1, citus_mx_test_schema_join_1.nation_hash_2 n2
 WHERE
     n1.n_nationkey = n2.n_nationkey;
 
@@ -139,15 +139,14 @@ WHERE
 -- join of two tables which are in same schemas,
 -- join on partition column
 SET search_path TO citus_mx_test_schema_join_1;
-SELECT 
+SELECT
     count (*)
 FROM
-    nation_hash n1, nation_hash_2 n2 
+    nation_hash n1, nation_hash_2 n2
 WHERE
     n1.n_nationkey = n2.n_nationkey;
 
 -- single repartition joins
-SET citus.task_executor_type TO "task-tracker";
 
 -- check when search_path is public,
 -- join of two tables which are in different schemas,
@@ -182,7 +181,7 @@ FROM
 WHERE
     n1.n_nationkey = n2.n_regionkey;
 
--- hash repartition joins 
+-- hash repartition joins
 
 -- check when search_path is public,
 -- join of two tables which are in different schemas,
@@ -217,8 +216,7 @@ FROM
 WHERE
     n1.n_regionkey = n2.n_regionkey;
 
--- set task_executor back to real-time
-SET citus.task_executor_type TO "real-time";
+-- set task_executor back to adaptive
 
 -- connect to the master and do some test
 -- regarding DDL support on schemas where
@@ -249,7 +247,7 @@ SELECT create_distributed_table('mx_ddl_schema_2.table_2', 'key');
 
 ALTER TABLE table_2 ADD CONSTRAINT test_constraint FOREIGN KEY (key) REFERENCES table_1(key);
 
--- we can also handle schema/table names with quotation 
+-- we can also handle schema/table names with quotation
 SET search_path TO "CiTuS.TeAeN";
 CREATE TABLE "TeeNTabLE.1!?!"(id int, "TeNANt_Id" int);
 SELECT create_distributed_table('"TeeNTabLE.1!?!"', 'id');
@@ -277,7 +275,7 @@ ALTER TABLE "TeeNTabLE.1!?!" ADD COLUMN new_col INT;
 SET search_path TO public, "CiTuS.TeAeN";
 ALTER TABLE "TeeNTabLE.1!?!" DROP COLUMN new_col;
 
--- make sure that we handle transaction blocks properly 
+-- make sure that we handle transaction blocks properly
 BEGIN;
     SET search_path TO public, "CiTuS.TeAeN";
     ALTER TABLE "TeeNTabLE.1!?!" ADD COLUMN new_col INT;
@@ -299,3 +297,39 @@ SET search_path TO not_existing_schema;
 ALTER TABLE "CiTuS.TeAeN"."TeeNTabLE.1!?!" DROP COLUMN new_col;
 
 DROP SCHEMA mx_ddl_schema_1, mx_ddl_schema_2, "CiTuS.TeAeN" CASCADE;
+
+-- test if ALTER TABLE SET SCHEMA sets the original table in the worker
+SET search_path TO public;
+
+CREATE SCHEMA mx_old_schema;
+CREATE TABLE mx_old_schema.table_set_schema (id int);
+SELECT create_distributed_table('mx_old_schema.table_set_schema', 'id');
+CREATE SCHEMA mx_new_schema;
+
+SELECT objid::oid::regnamespace as "Distributed Schemas"
+    FROM citus.pg_dist_object
+    WHERE objid::oid::regnamespace IN ('mx_old_schema', 'mx_new_schema');
+\c - - - :worker_1_port
+SELECT table_schema AS "Table's Schema" FROM information_schema.tables WHERE table_name='table_set_schema';
+SELECT table_schema AS "Shards' Schema"
+    FROM information_schema.tables
+    WHERE table_name LIKE 'table\_set\_schema\_%'
+    GROUP BY table_schema;
+\c - - - :master_port
+
+ALTER TABLE mx_old_schema.table_set_schema SET SCHEMA mx_new_schema;
+
+SELECT objid::oid::regnamespace as "Distributed Schemas"
+    FROM citus.pg_dist_object
+    WHERE objid::oid::regnamespace IN ('mx_old_schema', 'mx_new_schema');
+\c - - - :worker_1_port
+SELECT table_schema AS "Table's Schema" FROM information_schema.tables WHERE table_name='table_set_schema';
+SELECT table_schema AS "Shards' Schema"
+    FROM information_schema.tables
+    WHERE table_name LIKE 'table\_set\_schema\_%'
+    GROUP BY table_schema;
+\c - - - :master_port
+SELECT * FROM mx_new_schema.table_set_schema;
+
+DROP SCHEMA mx_old_schema CASCADE;
+DROP SCHEMA mx_new_schema CASCADE;

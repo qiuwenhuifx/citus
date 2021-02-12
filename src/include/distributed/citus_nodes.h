@@ -23,7 +23,7 @@
  *   * Use DEFINE_NODE_METHODS within the nodeMethods array (near the
  *     bottom of citus_nodefuncs.c) to register the node in PostgreSQL
  *
- * Copyright (c) 2012-2016, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -57,18 +57,20 @@ typedef enum CitusNodeTag
 	T_MapMergeJob,
 	T_DistributedPlan,
 	T_DistributedSubPlan,
+	T_UsedDistributedSubPlan,
 	T_Task,
-	T_TaskExecution,
+	T_LocalPlannedStatement,
 	T_ShardInterval,
 	T_ShardPlacement,
 	T_RelationShard,
 	T_RelationRowLock,
 	T_DeferredErrorMessage,
-	T_GroupShardPlacement
+	T_GroupShardPlacement,
+	T_TableDDLCommand
 } CitusNodeTag;
 
 
-const char** CitusNodeTagNames;
+extern const char** CitusNodeTagNames;
 
 
 typedef struct CitusNode

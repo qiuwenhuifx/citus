@@ -4,7 +4,7 @@
  *
  * Routines for accessing file related information on this worker node.
  *
- * Copyright (c) 2012-2016, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  * $Id$
  *
@@ -15,7 +15,8 @@
 #include "funcapi.h"
 
 #include "commands/defrem.h"
-#include "distributed/master_protocol.h"
+#include "distributed/listutils.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/worker_protocol.h"
 #include "foreign/foreign.h"
 #include "utils/builtins.h"
@@ -39,13 +40,11 @@ worker_foreign_file_path(PG_FUNCTION_ARGS)
 	Oid relationId = ResolveRelationId(foreignTableName, false);
 	ForeignTable *foreignTable = GetForeignTable(relationId);
 
-	ListCell *optionCell = NULL;
-
 	CheckCitusVersion(ERROR);
 
-	foreach(optionCell, foreignTable->options)
+	DefElem *option = NULL;
+	foreach_ptr(option, foreignTable->options)
 	{
-		DefElem *option = (DefElem *) lfirst(optionCell);
 		char *optionName = option->defname;
 
 		int compareResult = strncmp(optionName, FOREIGN_FILENAME_OPTION, MAXPGPATH);

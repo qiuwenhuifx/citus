@@ -1,6 +1,8 @@
--- print whether we're using version > 10 to make version-specific tests clear
-SHOW server_version \gset
-SELECT substring(:'server_version', '\d+')::int > 10 AS version_above_ten;
+-- We have different output files for the executor. This is because
+-- we don't mark transactions with ANALYZE as critical anymore, and
+-- get WARNINGs instead of ERRORs.
+
+SET citus.next_shard_id TO 12000000;
 
 SELECT citus.mitmproxy('conn.allow()');
 
@@ -23,6 +25,10 @@ SELECT citus.mitmproxy('conn.onQuery(query="^COMMIT").kill()');
 ANALYZE vacuum_test;
 
 -- ANALYZE transactions being critical is an open question, see #2430
+-- show that we marked as INVALID on COMMIT FAILURE
+SELECT shardid, shardstate FROM pg_dist_shard_placement where shardstate != 1 AND
+shardid in ( SELECT shardid FROM pg_dist_shard WHERE logicalrelid = 'vacuum_test'::regclass);
+
 UPDATE pg_dist_shard_placement SET shardstate = 1
 WHERE shardid IN (
   SELECT shardid FROM pg_dist_shard WHERE logicalrelid = 'vacuum_test'::regclass

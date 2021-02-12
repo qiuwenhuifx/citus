@@ -3,20 +3,12 @@
 --
 -- Tests which cover task assignment for MapMerge jobs for single range repartition
 -- and dual hash repartition joins. The tests also cover task assignment propagation
--- from a sql task to its depended tasks. Note that we set the executor type to task
+-- from a sql task to its dependent tasks. Note that we set the executor type to task
 -- tracker executor here, as we cannot run repartition jobs with real time executor.
 SET citus.next_shard_id TO 710000;
--- print whether we're using version > 9 to make version-specific tests clear
-SHOW server_version \gset
-SELECT substring(:'server_version', '\d+')::int > 9 AS version_above_nine;
- version_above_nine 
---------------------
- t
-(1 row)
-
 BEGIN;
 SET client_min_messages TO DEBUG3;
-SET citus.task_executor_type TO 'task-tracker';
+SET citus.enable_repartition_joins to ON;
 -- Single range repartition join to test anchor-shard based task assignment and
 -- assignment propagation to merge and data-fetch tasks.
 SELECT
@@ -25,8 +17,13 @@ FROM
 	orders, customer_append
 WHERE
 	o_custkey = c_custkey;
-DEBUG:  assigned task 2 to node localhost:57637
-DEBUG:  assigned task 1 to node localhost:57638
+DEBUG:  Router planner does not support append-partitioned tables.
+DEBUG:  no sharding pruning constraints on orders found
+DEBUG:  shard count after pruning for orders: 2
+DEBUG:  assigned task to node localhost:xxxxx
+DEBUG:  assigned task to node localhost:xxxxx
+DEBUG:  no sharding pruning constraints on customer_append found
+DEBUG:  shard count after pruning for customer_append: 3
 DEBUG:  join prunable for intervals [1,1000] and [1001,2000]
 DEBUG:  join prunable for intervals [1,1000] and [6001,7000]
 DEBUG:  join prunable for intervals [1001,2000] and [1,1000]
@@ -39,11 +36,11 @@ DEBUG:  pruning merge fetch taskId 3
 DETAIL:  Creating dependency on merge taskId 6
 DEBUG:  pruning merge fetch taskId 5
 DETAIL:  Creating dependency on merge taskId 9
-DEBUG:  assigned task 4 to node localhost:57637
-DEBUG:  assigned task 6 to node localhost:57638
-DEBUG:  assigned task 2 to node localhost:57637
- count 
--------
+DEBUG:  assigned task to node localhost:xxxxx
+DEBUG:  assigned task to node localhost:xxxxx
+DEBUG:  assigned task to node localhost:xxxxx
+ count
+---------------------------------------------------------------------
   2985
 (1 row)
 
@@ -58,19 +55,24 @@ FROM
 WHERE
 	o_custkey = c_custkey AND
 	o_orderkey = l_orderkey;
-DEBUG:  assigned task 2 to node localhost:57637
-DEBUG:  assigned task 3 to node localhost:57638
-DEBUG:  assigned task 1 to node localhost:57637
+DEBUG:  Router planner does not support append-partitioned tables.
+DEBUG:  no sharding pruning constraints on customer_append found
+DEBUG:  shard count after pruning for customer_append: 3
+DEBUG:  assigned task to node localhost:xxxxx
+DEBUG:  assigned task to node localhost:xxxxx
+DEBUG:  assigned task to node localhost:xxxxx
+DEBUG:  no sharding pruning constraints on lineitem found
+DEBUG:  shard count after pruning for lineitem: 2
 DEBUG:  join prunable for intervals [1,5986] and [8997,14947]
 DEBUG:  join prunable for intervals [8997,14947] and [1,5986]
 DEBUG:  pruning merge fetch taskId 1
 DETAIL:  Creating dependency on merge taskId 4
 DEBUG:  pruning merge fetch taskId 3
 DETAIL:  Creating dependency on merge taskId 8
-DEBUG:  assigned task 4 to node localhost:57637
-DEBUG:  assigned task 2 to node localhost:57638
- count 
--------
+DEBUG:  assigned task to node localhost:xxxxx
+DEBUG:  assigned task to node localhost:xxxxx
+ count
+---------------------------------------------------------------------
  12000
 (1 row)
 
@@ -82,11 +84,16 @@ FROM
 	lineitem, customer_append
 WHERE
 	l_partkey = c_nationkey;
-DEBUG:  assigned task 2 to node localhost:57637
-DEBUG:  assigned task 1 to node localhost:57638
-DEBUG:  assigned task 2 to node localhost:57637
-DEBUG:  assigned task 3 to node localhost:57638
-DEBUG:  assigned task 1 to node localhost:57637
+DEBUG:  Router planner does not support append-partitioned tables.
+DEBUG:  no sharding pruning constraints on lineitem found
+DEBUG:  shard count after pruning for lineitem: 2
+DEBUG:  assigned task to node localhost:xxxxx
+DEBUG:  assigned task to node localhost:xxxxx
+DEBUG:  no sharding pruning constraints on customer_append found
+DEBUG:  shard count after pruning for customer_append: 3
+DEBUG:  assigned task to node localhost:xxxxx
+DEBUG:  assigned task to node localhost:xxxxx
+DEBUG:  assigned task to node localhost:xxxxx
 DEBUG:  join prunable for task partitionId 0 and 1
 DEBUG:  join prunable for task partitionId 0 and 2
 DEBUG:  join prunable for task partitionId 0 and 3
@@ -115,12 +122,12 @@ DEBUG:  pruning merge fetch taskId 10
 DETAIL:  Creating dependency on merge taskId 12
 DEBUG:  pruning merge fetch taskId 11
 DETAIL:  Creating dependency on merge taskId 16
-DEBUG:  assigned task 3 to node localhost:57638
-DEBUG:  assigned task 6 to node localhost:57637
-DEBUG:  assigned task 9 to node localhost:57638
-DEBUG:  assigned task 12 to node localhost:57637
- count 
--------
+DEBUG:  assigned task to node localhost:xxxxx
+DEBUG:  assigned task to node localhost:xxxxx
+DEBUG:  assigned task to node localhost:xxxxx
+DEBUG:  assigned task to node localhost:xxxxx
+ count
+---------------------------------------------------------------------
    125
 (1 row)
 

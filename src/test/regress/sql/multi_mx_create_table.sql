@@ -3,7 +3,6 @@
 --
 
 ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 1220000;
-ALTER SEQUENCE pg_catalog.pg_dist_colocationid_seq RESTART 1390000;
 
 SELECT start_metadata_sync_to_node('localhost', :worker_1_port);
 SELECT start_metadata_sync_to_node('localhost', :worker_2_port);
@@ -60,8 +59,11 @@ CREATE TYPE order_side_mx AS ENUM ('buy', 'sell');
 -- now create required stuff in the worker 1
 \c - - - :worker_1_port
 
+-- show that we do not support creating citus local tables from mx workers for now
+CREATE TABLE citus_local_table(a int);
+SELECT citus_add_local_table_to_metadata('citus_local_table');
+
 -- create schema to test schema support
-CREATE SCHEMA citus_mx_test_schema;
 CREATE SCHEMA citus_mx_test_schema_join_1;
 CREATE SCHEMA citus_mx_test_schema_join_2;
 
@@ -102,18 +104,10 @@ CREATE OPERATOR citus_mx_test_schema.=== (
     HASHES, MERGES
 );
 
-SET search_path TO public;
-CREATE COLLATION citus_mx_test_schema.english (LOCALE=:current_locale);
-
-SET search_path TO public;
-CREATE TYPE citus_mx_test_schema.new_composite_type as (key1 text, key2 text);
-CREATE TYPE order_side_mx AS ENUM ('buy', 'sell');
-
 -- now create required stuff in the worker 2
 \c - - - :worker_2_port
 
 -- create schema to test schema support
-CREATE SCHEMA citus_mx_test_schema;
 CREATE SCHEMA citus_mx_test_schema_join_1;
 CREATE SCHEMA citus_mx_test_schema_join_2;
 
@@ -154,14 +148,6 @@ CREATE OPERATOR citus_mx_test_schema.=== (
     NEGATOR = !==,
     HASHES, MERGES
 );
-
-
-SET search_path TO public;
-CREATE COLLATION citus_mx_test_schema.english (LOCALE=:current_locale);
-
-SET search_path TO public;
-CREATE TYPE citus_mx_test_schema.new_composite_type as (key1 text, key2 text);
-CREATE TYPE order_side_mx AS ENUM ('buy', 'sell');
 
 -- connect back to the master, and do some more tests
 \c - - - :master_port
@@ -230,7 +216,7 @@ SELECT create_distributed_table('nation_hash_collation_search_path', 'n_nationke
 \COPY nation_hash_collation_search_path FROM STDIN with delimiter '|';
 0|ALGERIA|0|haggle. carefully final deposits detect slyly agai
 1|ARGENTINA|1|al foxes promise slyly according to the regular accounts. bold requests alon
-2|BRAZIL|1|y alongside of the pending deposits. carefully special packages are about the ironic forges. slyly special 
+2|BRAZIL|1|y alongside of the pending deposits. carefully special packages are about the ironic forges. slyly special
 3|CANADA|1|eas hang ironic, silent packages. slyly regular packages are furiously over the tithes. fluffily bold
 4|EGYPT|4|y above the carefully unusual theodolites. final dugouts are quickly across the furiously regular d
 5|ETHIOPIA|0|ven packages wake quickly. regu
@@ -256,7 +242,7 @@ SELECT create_distributed_table('citus_mx_test_schema.nation_hash_composite_type
 5|ETHIOPIA|0|ven packages wake quickly. regu|(a,f)
 \.
 
--- now create tpch tables 
+-- now create tpch tables
 -- Create new table definitions for use in testing in distributed planning and
 -- execution functionality. Also create indexes to boost performance.
 SET search_path TO public;
@@ -279,7 +265,6 @@ CREATE TABLE lineitem_mx (
     l_shipmode char(10) not null,
     l_comment varchar(44) not null,
     PRIMARY KEY(l_orderkey, l_linenumber) );
-
 SET citus.shard_count TO 16;
 SELECT create_distributed_table('lineitem_mx', 'l_orderkey');
 
@@ -433,12 +418,26 @@ SET citus.shard_count TO 1;
 SELECT create_distributed_table('articles_single_shard_hash_mx', 'author_id');
 
 SET citus.shard_count TO 4;
-CREATE TABLE company_employees_mx (company_id int, employee_id int, manager_id int); 
+CREATE TABLE company_employees_mx (company_id int, employee_id int, manager_id int);
 SELECT create_distributed_table('company_employees_mx', 'company_id');
 
 WITH shard_counts AS (
 	SELECT logicalrelid, count(*) AS shard_count FROM pg_dist_shard GROUP BY logicalrelid
 	)
-SELECT logicalrelid, colocationid, shard_count, partmethod, repmodel 
-FROM pg_dist_partition NATURAL JOIN shard_counts 
+SELECT logicalrelid, colocationid, shard_count, partmethod, repmodel
+FROM pg_dist_partition NATURAL JOIN shard_counts
 ORDER BY colocationid, logicalrelid;
+
+-- check the citus_tables view
+SELECT table_name, citus_table_type, distribution_column, shard_count, table_owner
+FROM citus_tables
+ORDER BY table_name::text;
+
+\c - - - :worker_1_port
+
+SELECT table_name, citus_table_type, distribution_column, shard_count, table_owner
+FROM citus_tables
+ORDER BY table_name::text;
+
+
+SELECT shard_name, table_name, citus_table_type, shard_size FROM citus_shards ORDER BY shard_name::text;

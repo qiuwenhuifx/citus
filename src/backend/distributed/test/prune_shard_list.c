@@ -5,12 +5,15 @@
  * This file contains functions to exercise shard creation functionality
  * within Citus.
  *
- * Copyright (c) 2014-2016, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
+
+#include "distributed/pg_version_constants.h"
+
 #include "c.h"
 #include "fmgr.h"
 
@@ -20,14 +23,18 @@
 #include "catalog/pg_type.h"
 #include "distributed/listutils.h"
 #include "distributed/metadata_cache.h"
-#include "distributed/master_metadata_utility.h"
+#include "distributed/metadata_utility.h"
 #include "distributed/multi_join_order.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/resource_lock.h"
 #include "distributed/shard_pruning.h"
+#if PG_VERSION_NUM >= PG_VERSION_12
+#include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
+#endif
+#include "nodes/nodes.h"
 #include "nodes/pg_list.h"
 #include "nodes/primnodes.h"
-#include "nodes/nodes.h"
 #include "optimizer/clauses.h"
 #include "utils/array.h"
 #include "utils/palloc.h"
@@ -169,7 +176,11 @@ MakeTextPartitionExpression(Oid distributedTableId, text *value)
 	if (value != NULL)
 	{
 		OpExpr *equalityExpr = MakeOpExpression(partitionColumn, BTEqualStrategyNumber);
-		Const *rightConst = (Const *) get_rightop((Expr *) equalityExpr);
+		Node *rightOp = get_rightop((Expr *) equalityExpr);
+
+		Assert(rightOp != NULL);
+		Assert(IsA(rightOp, Const));
+		Const *rightConst = (Const *) rightOp;
 
 		rightConst->constvalue = (Datum) value;
 		rightConst->constisnull = false;
@@ -198,32 +209,27 @@ MakeTextPartitionExpression(Oid distributedTableId, text *value)
 static ArrayType *
 PrunedShardIdsForTable(Oid distributedTableId, List *whereClauseList)
 {
-	ArrayType *shardIdArrayType = NULL;
-	ListCell *shardCell = NULL;
 	int shardIdIndex = 0;
 	Oid shardIdTypeId = INT8OID;
 	Index tableId = 1;
 
-	List *shardList = NIL;
-	int shardIdCount = -1;
-	Datum *shardIdDatumArray = NULL;
 
-	shardList = PruneShards(distributedTableId, tableId, whereClauseList, NULL);
+	List *shardList = PruneShards(distributedTableId, tableId, whereClauseList, NULL);
 
-	shardIdCount = list_length(shardList);
-	shardIdDatumArray = palloc0(shardIdCount * sizeof(Datum));
+	int shardIdCount = list_length(shardList);
+	Datum *shardIdDatumArray = palloc0(shardIdCount * sizeof(Datum));
 
-	foreach(shardCell, shardList)
+	ShardInterval *shardInterval = NULL;
+	foreach_ptr(shardInterval, shardList)
 	{
-		ShardInterval *shardId = (ShardInterval *) lfirst(shardCell);
-		Datum shardIdDatum = Int64GetDatum(shardId->shardId);
+		Datum shardIdDatum = Int64GetDatum(shardInterval->shardId);
 
 		shardIdDatumArray[shardIdIndex] = shardIdDatum;
 		shardIdIndex++;
 	}
 
-	shardIdArrayType = DatumArrayToArrayType(shardIdDatumArray, shardIdCount,
-											 shardIdTypeId);
+	ArrayType *shardIdArrayType = DatumArrayToArrayType(shardIdDatumArray, shardIdCount,
+														shardIdTypeId);
 
 	return shardIdArrayType;
 }
@@ -236,16 +242,14 @@ PrunedShardIdsForTable(Oid distributedTableId, List *whereClauseList)
 static ArrayType *
 SortedShardIntervalArray(Oid distributedTableId)
 {
-	ArrayType *shardIdArrayType = NULL;
-	int shardIndex = 0;
 	Oid shardIdTypeId = INT8OID;
 
-	DistTableCacheEntry *cacheEntry = DistributedTableCacheEntry(distributedTableId);
+	CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(distributedTableId);
 	ShardInterval **shardIntervalArray = cacheEntry->sortedShardIntervalArray;
 	int shardIdCount = cacheEntry->shardIntervalArrayLength;
 	Datum *shardIdDatumArray = palloc0(shardIdCount * sizeof(Datum));
 
-	for (shardIndex = 0; shardIndex < shardIdCount; ++shardIndex)
+	for (int shardIndex = 0; shardIndex < shardIdCount; ++shardIndex)
 	{
 		ShardInterval *shardId = shardIntervalArray[shardIndex];
 		Datum shardIdDatum = Int64GetDatum(shardId->shardId);
@@ -253,8 +257,8 @@ SortedShardIntervalArray(Oid distributedTableId)
 		shardIdDatumArray[shardIndex] = shardIdDatum;
 	}
 
-	shardIdArrayType = DatumArrayToArrayType(shardIdDatumArray, shardIdCount,
-											 shardIdTypeId);
+	ArrayType *shardIdArrayType = DatumArrayToArrayType(shardIdDatumArray, shardIdCount,
+														shardIdTypeId);
 
 	return shardIdArrayType;
 }

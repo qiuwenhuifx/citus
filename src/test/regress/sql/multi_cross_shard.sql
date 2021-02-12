@@ -4,10 +4,12 @@
 -- Tests to log cross shard queries according to error log level
 --
 
+SET citus.enable_repartition_joins to ON;
+
 -- Create a distributed table and add data to it
 CREATE TABLE multi_task_table
 (
-	id int, 
+	id int,
 	name varchar(20)
 );
 SELECT create_distributed_table('multi_task_table', 'id');
@@ -29,7 +31,7 @@ SELECT AVG(id) AS avg_id FROM multi_task_table;
 SET citus.multi_task_query_log_level TO error;
 SELECT * FROM multi_task_table;
 
--- Check the log message with INSERT INTO ... SELECT 
+-- Check the log message with INSERT INTO ... SELECT
 CREATE TABLE raw_table
 (
     id int,
@@ -88,7 +90,6 @@ SET citus.multi_task_query_log_level TO notice;
 -- Shouldn't log since it is a router select query
 SELECT * FROM raw_table WHERE ID = 1;
 
--- Task tracker query test
 CREATE TABLE tt1
 (
 	id int,
@@ -111,9 +112,7 @@ INSERT INTO tt1 VALUES(2, 'Mehmet');
 INSERT INTO tt2 VALUES(1, 'Ahmet', 5);
 INSERT INTO tt2 VALUES(2, 'Mehmet', 15);
 
--- Should notice since it is a task-tracker query
-SET citus.task_executor_type to "task-tracker";
-SELECT tt1.id, tt2.count from tt1,tt2 where tt1.id = tt2.id;
+SELECT tt1.id, tt2.count from tt1,tt2 where tt1.id = tt2.id ORDER BY 1;
 
 SET citus.task_executor_type to DEFAULT;
 

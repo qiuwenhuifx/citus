@@ -1,12 +1,14 @@
 --
 -- MULTI_FUNCTION_EVALUATION
 --
+CREATE SCHEMA multi_function_evaluation;
+SET search_path TO multi_function_evaluation;
 
 SET citus.next_shard_id TO 1200000;
 
 -- many of the tests in this file is intended for testing non-fast-path
--- router planner, so we're explicitly disabling it in this file. 
--- We've bunch of other tests that triggers fast-path-router 
+-- router planner, so we're explicitly disabling it in this file.
+-- We've bunch of other tests that triggers fast-path-router
 SET citus.enable_fast_path_router_planner TO false;
 
 -- nextval() works (no good way to test DEFAULT, or, by extension, SERIAL)
@@ -129,6 +131,52 @@ $function$;
 INSERT INTO example VALUES (44, (ARRAY[stable_fn(),stable_fn()])[1]);
 SELECT * FROM example WHERE key = 44;
 
-DROP FUNCTION stable_fn();
+-- unnest is a set-returning function, which should not be evaluated
+UPDATE example SET value = stable_fn() + interval '2 hours' FROM UNNEST(ARRAY[44, 4]) AS k (key) WHERE example.key = k.key;
+SELECT * FROM example WHERE key = 44;
 
-DROP TABLE example;
+-- create a table with multiple shards to trigger recursive planning
+CREATE TABLE table_1 (key int, value timestamptz);
+SELECT create_distributed_table('table_1', 'key');
+
+-- the following query will have a read_intermediate_result call, but it should be skipped
+DELETE
+FROM table_1
+WHERE key >= (SELECT min(KEY) FROM table_1)
+AND value > now() - interval '1 hour';
+
+CREATE OR REPLACE FUNCTION stable_squared(int)
+RETURNS int STABLE
+LANGUAGE plpgsql
+AS $function$
+BEGIN
+	RAISE NOTICE 'stable_fn called';
+	RETURN $1 * $1;
+END;
+$function$;
+SELECT create_distributed_function('stable_squared(int)');
+
+UPDATE example SET value = timestamp '10-10-2000 00:00'
+FROM (SELECT key, stable_squared(count(*)::int) y FROM example GROUP BY key) a WHERE example.key = a.key;
+
+UPDATE example SET value = timestamp '10-10-2000 00:00'
+FROM (SELECT key, stable_squared((count(*) OVER ())::int) y FROM example GROUP BY key) a WHERE example.key = a.key;
+
+UPDATE example SET value = timestamp '10-10-2000 00:00'
+FROM (SELECT key, stable_squared(grouping(key)) y FROM example GROUP BY key) a WHERE example.key = a.key;
+
+-- https://github.com/citusdata/citus/issues/3939
+CREATE TABLE test_table(id int);
+SELECT create_distributed_table('test_table', 'id');
+
+CREATE OR REPLACE FUNCTION f(val text DEFAULT 'default')
+RETURNS int AS $$ BEGIN RETURN length(val); END; $$ LANGUAGE 'plpgsql' IMMUTABLE;
+
+INSERT INTO test_table VALUES (f('test'));
+INSERT INTO test_table VALUES (f());
+INSERT INTO test_table VALUES (f(f()::text));
+
+SELECT * FROM test_table ORDER BY 1;
+
+\set VERBOSITY terse
+DROP SCHEMA multi_function_evaluation CASCADE;

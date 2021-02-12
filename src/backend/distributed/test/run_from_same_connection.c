@@ -6,7 +6,7 @@
  * same connection. UDFs will be used to test MX functionalities in isolation
  * tests.
  *
- * Copyright (c) 2018, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -18,12 +18,13 @@
 #include "access/xact.h"
 #include "distributed/connection_management.h"
 #include "distributed/function_utils.h"
+#include "distributed/intermediate_result_pruning.h"
 #include "distributed/lock_graph.h"
-#include "distributed/master_protocol.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/remote_commands.h"
 #include "distributed/run_from_same_connection.h"
-#include "distributed/task_tracker.h"
+
 #include "distributed/version_compat.h"
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
@@ -85,6 +86,7 @@ start_session_level_connection_to_node(PG_FUNCTION_ARGS)
 	text *nodeName = PG_GETARG_TEXT_P(0);
 	uint32 nodePort = PG_GETARG_UINT32(1);
 	char *nodeNameString = text_to_cstring(nodeName);
+	int connectionFlags = 0;
 
 	CheckCitusVersion(ERROR);
 
@@ -102,7 +104,7 @@ start_session_level_connection_to_node(PG_FUNCTION_ARGS)
 	 */
 	if (singleConnection == NULL)
 	{
-		singleConnection = GetNodeConnection(SESSION_LIFESPAN, nodeNameString, nodePort);
+		singleConnection = GetNodeConnection(connectionFlags, nodeNameString, nodePort);
 		allowNonIdleRemoteTransactionOnXactHandling = true;
 	}
 
@@ -135,7 +137,6 @@ run_commands_on_session_level_connection_to_node(PG_FUNCTION_ARGS)
 	StringInfo workerProcessStringInfo = makeStringInfo();
 	MultiConnection *localConnection = GetNodeConnection(0, LOCAL_HOST_NAME,
 														 PostPortNumber);
-	Oid pgReloadConfOid = InvalidOid;
 
 	if (!singleConnection)
 	{
@@ -159,7 +160,7 @@ run_commands_on_session_level_connection_to_node(PG_FUNCTION_ARGS)
 	CloseConnection(localConnection);
 
 	/* Call pg_reload_conf UDF to update changed GUCs above on each backend */
-	pgReloadConfOid = FunctionOid("pg_catalog", "pg_reload_conf", 0);
+	Oid pgReloadConfOid = FunctionOid("pg_catalog", "pg_reload_conf", 0);
 	OidFunctionCall0(pgReloadConfOid);
 
 
@@ -196,21 +197,23 @@ GetRemoteProcessId()
 {
 	StringInfo queryStringInfo = makeStringInfo();
 	PGresult *result = NULL;
-	int64 rowCount = 0;
-	int64 resultValue = 0;
 
 	appendStringInfo(queryStringInfo, GET_PROCESS_ID);
 
-	ExecuteOptionalRemoteCommand(singleConnection, queryStringInfo->data, &result);
+	int queryResult = ExecuteOptionalRemoteCommand(singleConnection,
+												   queryStringInfo->data, &result);
+	if (queryResult != RESPONSE_OKAY)
+	{
+		PG_RETURN_VOID();
+	}
 
-	rowCount = PQntuples(result);
-
+	int64 rowCount = PQntuples(result);
 	if (rowCount != 1)
 	{
 		PG_RETURN_VOID();
 	}
 
-	resultValue = ParseIntField(result, 0, 0);
+	int64 resultValue = ParseIntField(result, 0, 0);
 
 	PQclear(result);
 	ClearResults(singleConnection, false);

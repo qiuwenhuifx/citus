@@ -47,14 +47,11 @@ CREATE TABLE repartition_udt_other (
     udtcol test_udt,
     txtcol text
 );
--- Connect directly to a worker, create and drop the type, then 
+-- Connect directly to a worker, create and drop the type, then
 -- proceed with type creation as above; thus the OIDs will be different.
 -- so that the OID is off.
 \c - - - :worker_1_port
-CREATE TYPE test_udt AS (i integer, i2 integer);
-DROP TYPE test_udt CASCADE;
 -- START type creation
-CREATE TYPE test_udt AS (i integer, i2 integer);
 -- ... as well as a function to use as its comparator...
 CREATE FUNCTION equal_test_udt_function(test_udt, test_udt) RETURNS boolean
 AS 'select $1.i = $2.i AND $1.i2 = $2.i2;'
@@ -90,7 +87,6 @@ FUNCTION 1 test_udt_hash(test_udt);
 -- END type creation
 \c - - - :worker_2_port
 -- START type creation
-CREATE TYPE test_udt AS (i integer, i2 integer);
 -- ... as well as a function to use as its comparator...
 CREATE FUNCTION equal_test_udt_function(test_udt, test_udt) RETURNS boolean
 AS 'select $1.i = $2.i AND $1.i2 = $2.i2;'
@@ -131,16 +127,16 @@ SET citus.shard_replication_factor TO 1;
 SET citus.replication_model TO streaming;
 SET citus.shard_count TO 3;
 SELECT create_distributed_table('repartition_udt', 'pk');
- create_distributed_table 
---------------------------
- 
+ create_distributed_table
+---------------------------------------------------------------------
+
 (1 row)
 
 SET citus.shard_count TO 5;
 SELECT create_distributed_table('repartition_udt_other', 'pk');
- create_distributed_table 
---------------------------
- 
+ create_distributed_table
+---------------------------------------------------------------------
+
 (1 row)
 
 INSERT INTO repartition_udt values (1, '(1,1)'::test_udt, 'foo');
@@ -156,24 +152,25 @@ INSERT INTO repartition_udt_other values (10, '(2,1)'::test_udt, 'foo');
 INSERT INTO repartition_udt_other values (11, '(2,2)'::test_udt, 'foo');
 INSERT INTO repartition_udt_other values (12, '(2,3)'::test_udt, 'foo');
 SET client_min_messages = LOG;
-SET citus.task_executor_type = 'task-tracker';
+SET citus.enable_repartition_joins to ON;
 -- Query that should result in a repartition
 -- join on int column, and be empty.
 SELECT * FROM repartition_udt JOIN repartition_udt_other
     ON repartition_udt.pk = repartition_udt_other.pk;
- pk | udtcol | txtcol | pk | udtcol | txtcol 
-----+--------+--------+----+--------+--------
+ pk | udtcol | txtcol | pk | udtcol | txtcol
+---------------------------------------------------------------------
 (0 rows)
 
 -- Query that should result in a repartition join on UDT column.
 SET citus.log_multi_join_order = true;
-EXPLAIN SELECT * FROM repartition_udt JOIN repartition_udt_other
+EXPLAIN (COSTS OFF)
+SELECT * FROM repartition_udt JOIN repartition_udt_other
     ON repartition_udt.udtcol = repartition_udt_other.udtcol
     WHERE repartition_udt.pk > 1;
 LOG:  join order: [ "repartition_udt" ][ dual partition join "repartition_udt_other" ]
-                             QUERY PLAN                             
---------------------------------------------------------------------
- Custom Scan (Citus Task-Tracker)  (cost=0.00..0.00 rows=0 width=0)
+                         QUERY PLAN
+---------------------------------------------------------------------
+ Custom Scan (Citus Adaptive)
    Task Count: 4
    Tasks Shown: None, not supported for re-partition queries
    ->  MapMergeJob
@@ -189,8 +186,8 @@ SELECT * FROM repartition_udt JOIN repartition_udt_other
     WHERE repartition_udt.pk > 1
     ORDER BY repartition_udt.pk;
 LOG:  join order: [ "repartition_udt" ][ dual partition join "repartition_udt_other" ]
- pk | udtcol | txtcol | pk | udtcol | txtcol 
-----+--------+--------+----+--------+--------
+ pk | udtcol | txtcol | pk | udtcol | txtcol
+---------------------------------------------------------------------
   2 | (1,2)  | foo    |  8 | (1,2)  | foo
   3 | (1,3)  | foo    |  9 | (1,3)  | foo
   4 | (2,1)  | foo    | 10 | (2,1)  | foo
@@ -198,6 +195,5 @@ LOG:  join order: [ "repartition_udt" ][ dual partition join "repartition_udt_ot
   6 | (2,3)  | foo    | 12 | (2,3)  | foo
 (5 rows)
 
-    
 \c - - - :worker_1_port
 \c - - - :worker_2_port

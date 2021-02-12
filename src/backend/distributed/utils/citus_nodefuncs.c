@@ -3,17 +3,21 @@
  * citus_nodefuncs.c
  *	  Helper functions for dealing with nodes
  *
- * Copyright (c) 2012-2016, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
 
+#include "distributed/pg_version_constants.h"
+
 #include "catalog/pg_type.h"
 #include "distributed/citus_nodes.h"
 #include "distributed/citus_nodefuncs.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/errormessage.h"
+#include "distributed/log_utils.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/distributed_planner.h"
 #include "distributed/multi_router_planner.h"
@@ -34,14 +38,16 @@ static const char *CitusNodeTagNamesD[] = {
 	"MapMergeJob",
 	"DistributedPlan",
 	"DistributedSubPlan",
+	"UsedDistributedSubPlan",
 	"Task",
-	"TaskExecution",
+	"LocalPlannedStatement",
 	"ShardInterval",
 	"ShardPlacement",
 	"RelationShard",
 	"RelationRowLock",
 	"DeferredErrorMessage",
-	"GroupShardPlacement"
+	"GroupShardPlacement",
+	"TableDDLCommand"
 };
 
 const char **CitusNodeTagNames = CitusNodeTagNamesD;
@@ -69,21 +75,15 @@ PG_FUNCTION_INFO_V1(citus_extradata_container);
  * will not be handled by out/readfuncs.c. For the current uses that's ok.
  */
 void
-SetRangeTblExtraData(RangeTblEntry *rte, CitusRTEKind rteKind,
-					 char *fragmentSchemaName, char *fragmentTableName,
-					 List *tableIdList)
+SetRangeTblExtraData(RangeTblEntry *rte, CitusRTEKind rteKind, char *fragmentSchemaName,
+					 char *fragmentTableName, List *tableIdList, List *funcColumnNames,
+					 List *funcColumnTypes, List *funcColumnTypeMods,
+					 List *funcCollations)
 {
-	RangeTblFunction *fauxFunction = NULL;
-	FuncExpr *fauxFuncExpr = NULL;
-	Const *rteKindData = NULL;
-	Const *fragmentSchemaData = NULL;
-	Const *fragmentTableData = NULL;
-	Const *tableIdListData = NULL;
-
 	Assert(rte->eref);
 
 	/* store RTE kind as a plain int4 */
-	rteKindData = makeNode(Const);
+	Const *rteKindData = makeNode(Const);
 	rteKindData->consttype = INT4OID;
 	rteKindData->constlen = 4;
 	rteKindData->constvalue = Int32GetDatum(rteKind);
@@ -92,7 +92,7 @@ SetRangeTblExtraData(RangeTblEntry *rte, CitusRTEKind rteKind,
 	rteKindData->location = -1;
 
 	/* store the fragment schema as a cstring */
-	fragmentSchemaData = makeNode(Const);
+	Const *fragmentSchemaData = makeNode(Const);
 	fragmentSchemaData->consttype = CSTRINGOID;
 	fragmentSchemaData->constlen = -2;
 	fragmentSchemaData->constvalue = CStringGetDatum(fragmentSchemaName);
@@ -101,7 +101,7 @@ SetRangeTblExtraData(RangeTblEntry *rte, CitusRTEKind rteKind,
 	fragmentSchemaData->location = -1;
 
 	/* store the fragment name as a cstring */
-	fragmentTableData = makeNode(Const);
+	Const *fragmentTableData = makeNode(Const);
 	fragmentTableData->consttype = CSTRINGOID;
 	fragmentTableData->constlen = -2;
 	fragmentTableData->constvalue = CStringGetDatum(fragmentTableName);
@@ -110,7 +110,7 @@ SetRangeTblExtraData(RangeTblEntry *rte, CitusRTEKind rteKind,
 	fragmentTableData->location = -1;
 
 	/* store the table id list as an array of integers: FIXME */
-	tableIdListData = makeNode(Const);
+	Const *tableIdListData = makeNode(Const);
 	tableIdListData->consttype = CSTRINGOID;
 	tableIdListData->constbyval = false;
 	tableIdListData->constlen = -2;
@@ -129,18 +129,23 @@ SetRangeTblExtraData(RangeTblEntry *rte, CitusRTEKind rteKind,
 	}
 
 	/* create function expression to store our faux arguments in */
-	fauxFuncExpr = makeNode(FuncExpr);
+	FuncExpr *fauxFuncExpr = makeNode(FuncExpr);
 	fauxFuncExpr->funcid = CitusExtraDataContainerFuncId();
+	fauxFuncExpr->funcresulttype = RECORDOID;
 	fauxFuncExpr->funcretset = true;
 	fauxFuncExpr->location = -1;
 	fauxFuncExpr->args = list_make4(rteKindData, fragmentSchemaData,
 									fragmentTableData, tableIdListData);
 
-	fauxFunction = makeNode(RangeTblFunction);
+	RangeTblFunction *fauxFunction = makeNode(RangeTblFunction);
 	fauxFunction->funcexpr = (Node *) fauxFuncExpr;
 
 	/* set the column count to pass ruleutils checks, not used elsewhere */
 	fauxFunction->funccolcount = list_length(rte->eref->colnames);
+	fauxFunction->funccolnames = funcColumnNames;
+	fauxFunction->funccoltypes = funcColumnTypes;
+	fauxFunction->funccoltypmods = funcColumnTypeMods;
+	fauxFunction->funccolcollations = funcCollations;
 
 	rte->rtekind = RTE_FUNCTION;
 	rte->functions = list_make1(fauxFunction);
@@ -158,10 +163,6 @@ ExtractRangeTblExtraData(RangeTblEntry *rte, CitusRTEKind *rteKind,
 						 char **fragmentSchemaName, char **fragmentTableName,
 						 List **tableIdList)
 {
-	RangeTblFunction *fauxFunction = NULL;
-	FuncExpr *fauxFuncExpr = NULL;
-	Const *tmpConst = NULL;
-
 	/* set base rte kind first, so this can be used for 'non-extended' RTEs as well */
 	if (rteKind != NULL)
 	{
@@ -198,13 +199,13 @@ ExtractRangeTblExtraData(RangeTblEntry *rte, CitusRTEKind *rteKind,
 	}
 
 	/* should pretty much always be a FuncExpr, but be liberal in what we expect... */
-	fauxFunction = linitial(rte->functions);
+	RangeTblFunction *fauxFunction = linitial(rte->functions);
 	if (!IsA(fauxFunction->funcexpr, FuncExpr))
 	{
 		return;
 	}
 
-	fauxFuncExpr = (FuncExpr *) fauxFunction->funcexpr;
+	FuncExpr *fauxFuncExpr = (FuncExpr *) fauxFunction->funcexpr;
 
 	/*
 	 * There will never be a range table entry with this function id, but for
@@ -228,7 +229,7 @@ ExtractRangeTblExtraData(RangeTblEntry *rte, CitusRTEKind *rteKind,
 	}
 
 	/* extract rteKind */
-	tmpConst = (Const *) linitial(fauxFuncExpr->args);
+	Const *tmpConst = (Const *) linitial(fauxFuncExpr->args);
 	Assert(IsA(tmpConst, Const));
 	Assert(tmpConst->consttype == INT4OID);
 	if (rteKind != NULL)
@@ -289,7 +290,7 @@ ModifyRangeTblExtraData(RangeTblEntry *rte, CitusRTEKind rteKind,
 
 	SetRangeTblExtraData(rte, rteKind,
 						 fragmentSchemaName, fragmentTableName,
-						 tableIdList);
+						 tableIdList, NIL, NIL, NIL, NIL);
 }
 
 
@@ -309,10 +310,13 @@ GetRangeTblKind(RangeTblEntry *rte)
 		case RTE_JOIN:
 		case RTE_VALUES:
 		case RTE_CTE:
-		{
-			rteKind = (CitusRTEKind) rte->rtekind;
-			break;
-		}
+#if PG_VERSION_NUM >= PG_VERSION_12
+		case RTE_RESULT:
+#endif
+			{
+				rteKind = (CitusRTEKind) rte->rtekind;
+				break;
+			}
 
 		case RTE_FUNCTION:
 		{
@@ -340,7 +344,6 @@ Datum
 citus_extradata_container(PG_FUNCTION_ARGS)
 {
 	ereport(ERROR, (errmsg("not supposed to get here, did you cheat?")));
-
 	PG_RETURN_NULL();
 }
 
@@ -369,7 +372,7 @@ EqualUnsupportedCitusNode(const struct ExtensibleNode *a,
 		CopyNode##type, \
 		EqualUnsupportedCitusNode, \
 		Out##type, \
-		Read##type \
+		ReadUnsupportedCitusNode \
 	}
 
 #define DEFINE_NODE_METHODS_NO_READ(type) \
@@ -388,6 +391,7 @@ const ExtensibleNodeMethods nodeMethods[] =
 {
 	DEFINE_NODE_METHODS(DistributedPlan),
 	DEFINE_NODE_METHODS(DistributedSubPlan),
+	DEFINE_NODE_METHODS(UsedDistributedSubPlan),
 	DEFINE_NODE_METHODS(Job),
 	DEFINE_NODE_METHODS(ShardInterval),
 	DEFINE_NODE_METHODS(MapMergeJob),
@@ -395,7 +399,7 @@ const ExtensibleNodeMethods nodeMethods[] =
 	DEFINE_NODE_METHODS(RelationShard),
 	DEFINE_NODE_METHODS(RelationRowLock),
 	DEFINE_NODE_METHODS(Task),
-	DEFINE_NODE_METHODS(TaskExecution),
+	DEFINE_NODE_METHODS(LocalPlannedStatement),
 	DEFINE_NODE_METHODS(DeferredErrorMessage),
 	DEFINE_NODE_METHODS(GroupShardPlacement),
 
@@ -409,18 +413,17 @@ const ExtensibleNodeMethods nodeMethods[] =
 	DEFINE_NODE_METHODS_NO_READ(MultiJoin),
 	DEFINE_NODE_METHODS_NO_READ(MultiPartition),
 	DEFINE_NODE_METHODS_NO_READ(MultiCartesianProduct),
-	DEFINE_NODE_METHODS_NO_READ(MultiExtendedOp)
+	DEFINE_NODE_METHODS_NO_READ(MultiExtendedOp),
+	DEFINE_NODE_METHODS_NO_READ(TableDDLCommand)
 };
 
 void
 RegisterNodes(void)
 {
-	int off;
-
 	StaticAssertExpr(lengthof(nodeMethods) == lengthof(CitusNodeTagNamesD),
 					 "number of node methods and names do not match");
 
-	for (off = 0; off < lengthof(nodeMethods); off++)
+	for (int off = 0; off < lengthof(nodeMethods); off++)
 	{
 		RegisterExtensibleNodeMethods(&nodeMethods[off]);
 	}

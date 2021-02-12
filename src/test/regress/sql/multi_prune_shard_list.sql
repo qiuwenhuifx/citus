@@ -1,3 +1,5 @@
+CREATE SCHEMA prune_shard_list;
+SET search_path TO prune_shard_list;
 
 SET citus.next_shard_id TO 800000;
 
@@ -70,20 +72,11 @@ SELECT debug_equality_expression('pruning');
 SELECT print_sorted_shard_intervals('pruning');
 
 -- update only min value for one shard
-UPDATE pg_dist_shard set shardminvalue = NULL, shardmaxvalue = NULL WHERE shardid = 103071;
+UPDATE pg_dist_shard set shardminvalue = NULL WHERE shardid = 800001;
 SELECT print_sorted_shard_intervals('pruning');
 
--- now lets have one more shard without min/max values
-UPDATE pg_dist_shard set shardminvalue = NULL, shardmaxvalue = NULL WHERE shardid = 103072;
-SELECT print_sorted_shard_intervals('pruning');
-
--- now lets have one more shard without min/max values
-UPDATE pg_dist_shard set shardminvalue = NULL, shardmaxvalue = NULL WHERE shardid = 103070;
-SELECT print_sorted_shard_intervals('pruning');
-
--- all shard placements are uninitialized
-UPDATE pg_dist_shard set shardminvalue = NULL, shardmaxvalue = NULL WHERE shardid = 103073;
-SELECT print_sorted_shard_intervals('pruning');
+-- repair shard
+UPDATE pg_dist_shard set shardminvalue = -1073741824 WHERE shardid = 800001;
 
 -- create range distributed table observe shard pruning
 CREATE TABLE pruning_range ( species text, last_pruned date, plant_id integer );
@@ -96,28 +89,28 @@ SELECT master_create_empty_shard('pruning_range');
 SELECT master_create_empty_shard('pruning_range');
 
 -- now the comparison is done via the partition column type, which is text
-UPDATE pg_dist_shard SET shardminvalue = 'a', shardmaxvalue = 'b' WHERE shardid = 103074;
-UPDATE pg_dist_shard SET shardminvalue = 'c', shardmaxvalue = 'd' WHERE shardid = 103075;
-UPDATE pg_dist_shard SET shardminvalue = 'e', shardmaxvalue = 'f' WHERE shardid = 103076;
-UPDATE pg_dist_shard SET shardminvalue = 'g', shardmaxvalue = 'h' WHERE shardid = 103077;
+UPDATE pg_dist_shard SET shardminvalue = 'a', shardmaxvalue = 'b' WHERE shardid = 800004;
+UPDATE pg_dist_shard SET shardminvalue = 'c', shardmaxvalue = 'd' WHERE shardid = 800005;
+UPDATE pg_dist_shard SET shardminvalue = 'e', shardmaxvalue = 'f' WHERE shardid = 800006;
+UPDATE pg_dist_shard SET shardminvalue = 'g', shardmaxvalue = 'h' WHERE shardid = 800007;
 
 -- print the ordering of shard intervals with range partitioning as well
 SELECT print_sorted_shard_intervals('pruning_range');
 
 -- update only min value for one shard
-UPDATE pg_dist_shard set shardminvalue = NULL, shardmaxvalue = NULL WHERE shardid = 103075;
+UPDATE pg_dist_shard set shardminvalue = NULL WHERE shardid = 800005;
 SELECT print_sorted_shard_intervals('pruning_range');
 
 -- now lets have one more shard without min/max values
-UPDATE pg_dist_shard set shardminvalue = NULL, shardmaxvalue = NULL WHERE shardid = 103076;
+UPDATE pg_dist_shard set shardminvalue = NULL, shardmaxvalue = NULL WHERE shardid = 800006;
 SELECT print_sorted_shard_intervals('pruning_range');
 
 -- now lets have one more shard without min/max values
-UPDATE pg_dist_shard set shardminvalue = NULL, shardmaxvalue = NULL WHERE shardid = 103074;
+UPDATE pg_dist_shard set shardminvalue = NULL, shardmaxvalue = NULL WHERE shardid = 800004;
 SELECT print_sorted_shard_intervals('pruning_range');
 
 -- all shard placements are uninitialized
-UPDATE pg_dist_shard set shardminvalue = NULL, shardmaxvalue = NULL WHERE shardid = 103077;
+UPDATE pg_dist_shard set shardminvalue = NULL, shardmaxvalue = NULL WHERE shardid = 800007;
 SELECT print_sorted_shard_intervals('pruning_range');
 
 -- ===================================================================
@@ -151,3 +144,79 @@ SELECT * FROM coerce_hash WHERE id = 1;
 SELECT * FROM coerce_hash WHERE id = 1.0;
 
 SELECT * FROM coerce_hash WHERE id = 1.0::numeric;
+
+-- same queries with PREPARE
+PREPARE coerce_bigint(bigint) AS SELECT * FROM coerce_hash WHERE id=$1::bigint;
+PREPARE coerce_numeric(bigint) AS SELECT * FROM coerce_hash WHERE id=$1::numeric;
+PREPARE coerce_numeric_2(numeric) AS SELECT * FROM coerce_hash WHERE id=$1;
+
+EXECUTE coerce_bigint(1);
+EXECUTE coerce_bigint(1);
+EXECUTE coerce_bigint(1);
+EXECUTE coerce_bigint(1);
+EXECUTE coerce_bigint(1);
+EXECUTE coerce_bigint(1);
+EXECUTE coerce_bigint(1);
+EXECUTE coerce_bigint(1);
+
+EXECUTE coerce_numeric(1);
+EXECUTE coerce_numeric(1);
+EXECUTE coerce_numeric(1);
+EXECUTE coerce_numeric(1);
+EXECUTE coerce_numeric(1);
+EXECUTE coerce_numeric(1);
+EXECUTE coerce_numeric(1);
+
+
+EXECUTE coerce_numeric_2(1);
+EXECUTE coerce_numeric_2(1);
+EXECUTE coerce_numeric_2(1);
+EXECUTE coerce_numeric_2(1);
+EXECUTE coerce_numeric_2(1);
+EXECUTE coerce_numeric_2(1);
+EXECUTE coerce_numeric_2(1);
+
+
+-- Test that we can insert an integer literal into a numeric column as well
+CREATE TABLE numeric_test (id numeric(6, 1), val int);
+SELECT create_distributed_table('numeric_test', 'id');
+
+INSERT INTO numeric_test VALUES (21, 87) RETURNING *;
+SELECT * FROM numeric_test WHERE id = 21;
+SELECT * FROM numeric_test WHERE id = 21::int;
+SELECT * FROM numeric_test WHERE id = 21::bigint;
+SELECT * FROM numeric_test WHERE id = 21.0;
+SELECT * FROM numeric_test WHERE id = 21.0::numeric;
+
+PREPARE insert_p(int) AS INSERT INTO numeric_test VALUES ($1, 87) RETURNING *;
+EXECUTE insert_p(1);
+EXECUTE insert_p(2);
+EXECUTE insert_p(3);
+EXECUTE insert_p(4);
+EXECUTE insert_p(5);
+EXECUTE insert_p(6);
+
+PREPARE select_p(int) AS SELECT * FROM numeric_test WHERE id=$1;
+EXECUTE select_p(1);
+EXECUTE select_p(2);
+EXECUTE select_p(3);
+EXECUTE select_p(4);
+EXECUTE select_p(5);
+EXECUTE select_p(6);
+
+SET citus.enable_fast_path_router_planner TO false;
+EXECUTE select_p(1);
+EXECUTE select_p(2);
+EXECUTE select_p(3);
+EXECUTE select_p(4);
+EXECUTE select_p(5);
+EXECUTE select_p(6);
+
+-- make sure that we don't return wrong resuls
+INSERT INTO numeric_test VALUES (21.1, 87) RETURNING *;
+SELECT * FROM numeric_test WHERE id = 21;
+SELECT * FROM numeric_test WHERE id = 21::numeric;
+SELECT * FROM numeric_test WHERE id = 21.1::numeric;
+
+SET search_path TO public;
+DROP SCHEMA prune_shard_list CASCADE;

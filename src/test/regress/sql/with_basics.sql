@@ -1,7 +1,7 @@
 -- Test the basic CTE functionality and expected error messages
 SET search_path TO 'with_basics';
-CREATE TYPE xy AS (x int, y int);
-SELECT run_command_on_workers('CREATE TYPE with_basics.xy AS (x int, y int)');
+SET citus.coordinator_aggregation_strategy TO 'disabled';
+CREATE TYPE with_basics.xy AS (x int, y int);
 
 -- CTEs in FROM should work
 WITH cte AS (
@@ -49,7 +49,7 @@ FROM
   (SELECT max(user_id), max(value_2) AS value_2 FROM cte_from GROUP BY value_1) f
 WHERE
   value_2 IN (SELECT * FROM cte_where)
-ORDER BY 
+ORDER BY
   1, 2
 LIMIT
   5;
@@ -62,19 +62,21 @@ SELECT user_id FROM (
   SELECT user_id FROM cte WHERE value_2 > 0
 ) a ORDER BY 1 LIMIT 3;
 
--- CTE outside of FROM/WHERE errors out
+-- CTE outside of FROM/WHERE errors
 WITH cte AS (
 	SELECT user_id FROM users_table WHERE value_2 IN (1, 2)
 )
 SELECT (SELECT * FROM cte);
 
 WITH cte_basic AS (
-	SELECT user_id FROM users_table WHERE user_id = 1
+	SELECT user_id FROM users_table WHERE user_id = 1 LIMIT 1
 )
 SELECT
   (SELECT user_id FROM cte_basic), user_id
 FROM
-  users_table;
+  users_table
+ORDER BY 1,2
+LIMIT 1;
 
 -- single-row sublink is acceptable when there is no FROM
 WITH cte AS (
@@ -361,9 +363,9 @@ WITH cte AS (
 SELECT * FROM (
 	SELECT * FROM cte UNION (SELECT * FROM events_table)
 	) a
-ORDER BY 
+ORDER BY
 	1,2,3,4,5,6
-LIMIT 
+LIMIT
 	10;
 
 SELECT * FROM (
@@ -372,9 +374,9 @@ SELECT * FROM (
 		)
 		SELECT * FROM cte
 	)b UNION (SELECT * FROM events_table)) a
-ORDER BY 
+ORDER BY
 1,2,3,4,5,6
-LIMIT 
+LIMIT
 10;
 
 -- SELECT * FROM (SELECT * FROM cte UNION SELECT * FROM cte) a; should work
@@ -385,14 +387,14 @@ SELECT
   *
 FROM
   (SELECT * FROM cte UNION (SELECT * FROM cte)) a
-ORDER BY 
+ORDER BY
   1,2,3,4,5,6
-LIMIT 
+LIMIT
   5;
 
 WITH cte AS (
 	SELECT * FROM users_table WHERE user_id IN (1, 2) ORDER BY 1,2,3 LIMIT 5
-), 
+),
 cte_2 AS (
 	SELECT * FROM users_table WHERE user_id  IN (3, 4) ORDER BY 1,2,3 LIMIT 5
 )
@@ -402,14 +404,14 @@ SELECT * FROM cte UNION ALL SELECT * FROM cte_2;
 WITH RECURSIVE basic_recursive(x) AS (
     VALUES (1)
   UNION ALL
-    SELECT user_id + 1 FROM users_table WHERE user_id < 100
+    SELECT user_id + 1 FROM users_table JOIN basic_recursive ON (user_id = x) WHERE user_id < 100
 )
 SELECT sum(x) FROM basic_recursive;
 
 WITH RECURSIVE basic_recursive AS (
     SELECT -1 as user_id, '2017-11-22 20:16:16.614779'::timestamp, -1, -1, -1, -1
   UNION ALL
-    SELECT * FROM users_table WHERE user_id>1
+    SELECT basic_recursive.* FROM users_table JOIN basic_recursive USING (user_id) WHERE user_id>1
 )
 SELECT * FROM basic_recursive ORDER BY user_id LIMIT 1;
 
@@ -421,7 +423,7 @@ FROM
 (WITH RECURSIVE basic_recursive AS (
       SELECT -1 as user_id, '2017-11-22 20:16:16.614779'::timestamp, -1, -1, -1, -1
     UNION ALL
-      SELECT * FROM users_table WHERE user_id>1
+      SELECT basic_recursive.* FROM users_table JOIN basic_recursive USING (user_id) WHERE user_id>1
   )
   SELECT * FROM basic_recursive ORDER BY user_id LIMIT 1) cte_rec;
 
@@ -436,7 +438,7 @@ WHERE
 (WITH RECURSIVE basic_recursive AS (
       SELECT -1 as user_id
     UNION ALL
-      SELECT user_id FROM users_table WHERE user_id>1
+      SELECT basic_recursive.* FROM users_table JOIN basic_recursive USING (user_id) WHERE user_id>1
   )
   SELECT * FROM basic_recursive ORDER BY user_id LIMIT 1);
 
@@ -445,7 +447,7 @@ WHERE
 WITH RECURSIVE basic_recursive(x) AS(
     VALUES (1)
   UNION ALL
-    SELECT user_id + 1 FROM users_table WHERE user_id < 100
+    SELECT user_id + 1 FROM users_table JOIN basic_recursive ON (user_id = x) WHERE user_id < 100
 ),
 basic AS (
     SELECT count(user_id) FROM users_table
@@ -457,7 +459,7 @@ SELECT x FROM basic, basic_recursive;
 WITH RECURSIVE basic_recursive(x) AS(
     VALUES (1)
   UNION ALL
-    SELECT user_id + 1 FROM users_table WHERE user_id < 100
+    SELECT user_id + 1 FROM users_table JOIN basic_recursive ON (user_id = x) WHERE user_id < 100
 ),
 basic AS (
     SELECT count(x) FROM basic_recursive
@@ -468,10 +470,10 @@ SELECT * FROM basic;
 -- recursive CTE in a NESTED manner
 WITH regular_cte AS (
   WITH regular_2 AS (
-    WITH RECURSIVE recursive AS (
+    WITH RECURSIVE recursive(x) AS (
         VALUES (1)
       UNION ALL
-        SELECT user_id + 1 FROM users_table WHERE user_id < 100
+        SELECT user_id + 1 FROM users_table JOIN recursive ON (user_id = x) WHERE user_id < 100
     )
     SELECT * FROM recursive
   )
@@ -480,7 +482,7 @@ WITH regular_cte AS (
 SELECT * FROM regular_cte;
 
 -- CTEs should work with VIEWs as well
-CREATE VIEW basic_view AS 
+CREATE VIEW basic_view AS
 SELECT * FROM users_table;
 
 
@@ -499,11 +501,207 @@ SELECT user_id, sum(value_2) FROM cte_user GROUP BY 1 ORDER BY 1, 2;
 SELECT * FROM cte_view ORDER BY 1, 2 LIMIT 5;
 
 
-WITH cte_user_with_view AS 
+WITH cte_user_with_view AS
 (
 	SELECT * FROM cte_view WHERE user_id < 3
 )
 SELECT user_id, value_1 FROM cte_user_with_view ORDER BY 1, 2 LIMIT 10 OFFSET 2;
+
+
+-- test case added for https://github.com/citusdata/citus/issues/3565
+CREATE TABLE test_cte
+(
+    user_id varchar
+);
+INSERT INTO test_cte
+SELECT *
+FROM (VALUES ('1'), ('1'), ('2'), ('2'), ('3'), ('4'), ('5'), ('6'), ('7'), ('8')) AS foo;
+CREATE TABLE test_cte_distributed
+(
+    user_id varchar
+);
+SELECT *
+FROM create_distributed_table('test_cte_distributed', 'user_id');
+INSERT INTO test_cte_distributed
+SELECT *
+FROM (VALUES ('1'), ('3'), ('3'), ('5'), ('8')) AS foo;
+
+WITH distinct_undistribured AS (
+    SELECT DISTINCT user_id
+    FROM test_cte
+),
+     exsist_in_distributed AS (
+         SELECT DISTINCT user_id
+         FROM test_cte_distributed
+         WHERE EXISTS(SELECT *
+                      FROM distinct_undistribured
+                      WHERE distinct_undistribured.user_id = test_cte_distributed.user_id)
+     )
+SELECT
+  *
+FROM
+  distinct_undistribured LEFT JOIN exsist_in_distributed
+  ON distinct_undistribured.user_id = exsist_in_distributed.user_id
+ORDER BY 2 DESC, 1 DESC;
+
+-- same query, but the CTE is written as subquery
+WITH distinct_undistribured AS
+  (SELECT DISTINCT user_id
+   FROM test_cte)
+SELECT *
+FROM distinct_undistribured
+LEFT JOIN
+  (SELECT DISTINCT user_id
+   FROM test_cte_distributed
+   WHERE EXISTS
+       (SELECT *
+        FROM distinct_undistribured
+        WHERE distinct_undistribured.user_id = test_cte_distributed.user_id)) exsist_in_distributed
+  ON distinct_undistribured.user_id = exsist_in_distributed.user_id
+ORDER BY 2 DESC, 1 DESC;
+
+-- similar query as the above, but this time
+-- use NOT EXITS, which is pretty common struct
+WITH distinct_undistribured AS
+  (SELECT DISTINCT user_id
+   FROM test_cte)
+SELECT *
+FROM distinct_undistribured
+LEFT JOIN
+  (SELECT DISTINCT user_id
+   FROM test_cte_distributed
+   WHERE NOT EXISTS
+       (SELECT NULL
+        FROM distinct_undistribured
+        WHERE distinct_undistribured.user_id = test_cte_distributed.user_id)) exsist_in_distributed ON distinct_undistribured.user_id = exsist_in_distributed.user_id;
+
+-- same NOT EXISTS struct, but with CTE
+-- so should work
+WITH distinct_undistribured AS (
+    SELECT DISTINCT user_id
+    FROM test_cte
+),
+     not_exsist_in_distributed AS (
+         SELECT DISTINCT user_id
+         FROM test_cte_distributed
+         WHERE NOT EXISTS(SELECT NULL
+                      FROM distinct_undistribured
+                      WHERE distinct_undistribured.user_id = test_cte_distributed.user_id)
+     )
+SELECT
+  *
+FROM
+  distinct_undistribured LEFT JOIN not_exsist_in_distributed
+  ON distinct_undistribured.user_id = not_exsist_in_distributed.user_id
+ORDER BY 2 DESC, 1 DESC;
+
+-- similar query, but this time the second
+-- part of the query is not inside a CTE
+WITH distinct_undistribured AS (
+    SELECT DISTINCT user_id
+    FROM test_cte
+)
+SELECT count(*)
+FROM distinct_undistribured
+LEFT JOIN
+  (SELECT *,
+          random()
+   FROM test_cte_distributed d1
+   WHERE NOT EXISTS
+       (SELECT NULL
+        FROM distinct_undistribured d2
+        WHERE d1.user_id = d2.user_id )) AS bar USING (user_id);
+
+
+-- should work fine with cte inlinig disabled
+SET citus.enable_cte_inlining TO false;
+WITH distinct_undistribured AS (
+    SELECT DISTINCT user_id
+    FROM test_cte
+),
+     exsist_in_distributed AS (
+         SELECT DISTINCT user_id
+         FROM test_cte_distributed
+         WHERE EXISTS(SELECT *
+                      FROM distinct_undistribured
+                      WHERE distinct_undistribured.user_id = test_cte_distributed.user_id)
+     )
+SELECT
+  *
+FROM
+  distinct_undistribured LEFT JOIN exsist_in_distributed
+  ON distinct_undistribured.user_id = exsist_in_distributed.user_id
+ORDER BY 2 DESC, 1 DESC;
+
+WITH distinct_undistribured AS
+  (SELECT DISTINCT user_id
+   FROM test_cte)
+SELECT *
+FROM distinct_undistribured
+LEFT JOIN
+  (SELECT DISTINCT user_id
+   FROM test_cte_distributed
+   WHERE EXISTS
+       (SELECT *
+        FROM distinct_undistribured
+        WHERE distinct_undistribured.user_id = test_cte_distributed.user_id)) exsist_in_distributed
+  ON distinct_undistribured.user_id = exsist_in_distributed.user_id
+ORDER BY 2 DESC, 1 DESC;
+
+WITH distinct_undistribured AS
+  (SELECT DISTINCT user_id
+   FROM test_cte)
+SELECT *
+FROM distinct_undistribured
+LEFT JOIN
+  (SELECT DISTINCT user_id
+   FROM test_cte_distributed
+   WHERE NOT EXISTS
+       (SELECT NULL
+        FROM distinct_undistribured
+        WHERE distinct_undistribured.user_id = test_cte_distributed.user_id)) exsist_in_distributed ON distinct_undistribured.user_id = exsist_in_distributed.user_id;
+
+-- NOT EXISTS struct, with cte inlining disabled
+WITH distinct_undistribured AS (
+    SELECT DISTINCT user_id
+    FROM test_cte
+),
+     not_exsist_in_distributed AS (
+         SELECT DISTINCT user_id
+         FROM test_cte_distributed
+         WHERE NOT EXISTS(SELECT NULL
+                      FROM distinct_undistribured
+                      WHERE distinct_undistribured.user_id = test_cte_distributed.user_id)
+     )
+SELECT
+  *
+FROM
+  distinct_undistribured LEFT JOIN not_exsist_in_distributed
+  ON distinct_undistribured.user_id = not_exsist_in_distributed.user_id
+ORDER BY 2 DESC, 1 DESC;
+
+-- similar query, but this time the second
+-- part of the query is not inside a CTE
+WITH distinct_undistribured AS (
+    SELECT DISTINCT user_id
+    FROM test_cte
+)
+SELECT count(*)
+FROM distinct_undistribured
+LEFT JOIN
+  (SELECT *,
+          random()
+   FROM test_cte_distributed d1
+   WHERE NOT EXISTS
+       (SELECT NULL
+        FROM distinct_undistribured d2
+        WHERE d1.user_id = d2.user_id )) AS bar USING (user_id);
+
+-- some test  with failures
+WITH a AS (SELECT * FROM users_table LIMIT 10)
+	SELECT user_id/0 FROM users_table JOIN a USING (user_id);
+
+RESET citus.enable_cte_inlining;
 
 DROP VIEW basic_view;
 DROP VIEW cte_view;

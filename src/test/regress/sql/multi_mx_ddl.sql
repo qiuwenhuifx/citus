@@ -1,5 +1,4 @@
 -- Tests related to distributed DDL commands on mx cluster
-
 SELECT * FROM mx_ddl_table ORDER BY key;
 
 -- CREATE INDEX
@@ -11,13 +10,12 @@ CREATE INDEX CONCURRENTLY ddl_test_concurrent_index ON mx_ddl_table(value);
 ALTER TABLE mx_ddl_table ADD COLUMN version INTEGER;
 
 -- SET DEFAULT
-ALTER TABLE mx_ddl_table ALTER COLUMN version SET DEFAULT 1; 
+ALTER TABLE mx_ddl_table ALTER COLUMN version SET DEFAULT 1;
 
 UPDATE mx_ddl_table SET version=0.1 WHERE version IS NULL;
 
 -- SET NOT NULL
 ALTER TABLE mx_ddl_table ALTER COLUMN version SET NOT NULL;
-
 
 -- See that the changes are applied on coordinator, worker tables and shards
 SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='mx_ddl_table'::regclass;
@@ -131,3 +129,50 @@ SELECT :worker_1_lastval = :worker_2_lastval;
 ALTER TABLE mx_sequence ALTER value TYPE BIGINT;
 ALTER TABLE mx_sequence ALTER value TYPE INT;
 
+-- test distributed tables owned by extension
+CREATE TABLE seg_test (x int);
+INSERT INTO seg_test VALUES (42);
+
+-- pretend this table belongs to an extension
+CREATE EXTENSION seg;
+ALTER EXTENSION seg ADD TABLE seg_test;
+
+\c - - - :worker_1_port
+
+-- pretend the extension created the table on the worker as well
+CREATE TABLE seg_test (x int);
+ALTER EXTENSION seg ADD TABLE seg_test;
+
+\c - - - :worker_2_port
+
+-- pretend the extension created the table on the worker as well
+CREATE TABLE seg_test (x int);
+ALTER EXTENSION seg ADD TABLE seg_test;
+
+\c - - - :master_port
+
+-- sync table metadata, but skip CREATE TABLE
+SET citus.shard_replication_factor TO 1;
+SET citus.shard_count TO 4;
+SET citus.replication_model TO streaming;
+SELECT create_distributed_table('seg_test', 'x');
+
+\c - - - :worker_1_port
+
+-- should be able to see contents from worker
+SELECT * FROM seg_test;
+
+\c - - - :master_port
+
+-- test metadata sync in the presence of an extension-owned table
+SELECT start_metadata_sync_to_node('localhost', :worker_1_port);
+
+\c - - - :worker_1_port
+
+-- should be able to see contents from worker
+SELECT * FROM seg_test;
+
+\c - - - :master_port
+
+-- also drops table on both worker and master
+DROP EXTENSION seg CASCADE;

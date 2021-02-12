@@ -1,11 +1,15 @@
--- Confirm we can use local, router, real-time, and task-tracker execution
+-- Confirm we can use local, and adaptive execution
 
 CREATE SCHEMA with_executors;
 SET search_path TO with_executors, public;
 SET citus.enable_repartition_joins TO on;
 
 CREATE TABLE with_executors.local_table (id int);
-INSERT INTO local_table VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9), (10); 
+INSERT INTO local_table VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9), (10);
+
+CREATE TABLE ref_table (id int);
+SELECT create_reference_table('ref_table');
+INSERT INTO ref_table VALUES (0), (1), (2), (3), (4), (5), (6), (7), (8), (9), (10);
 
 -- CTEs should be able to use local queries
 WITH cte AS (
@@ -44,15 +48,15 @@ WITH cte AS (
 	)
 	SELECT local_cte.id as id_1, local_cte_2.id as id_2 FROM local_cte,local_cte_2
 )
-SELECT 
-	* 
-FROM 
-	cte 
-join 
-	users_table 
-on 
-	cte.id_1 = users_table.user_id 
-WHERE 
+SELECT
+	*
+FROM
+	cte
+join
+	users_table
+on
+	cte.id_1 = users_table.user_id
+WHERE
 	cte.id_1 IN (3, 4, 5)
 ORDER BY
 	1,2,3,4,5,6,7
@@ -68,9 +72,9 @@ WITH cte AS (
 	router_cte_2 AS (
 		SELECT user_id, event_type, value_2 FROM events_table WHERE user_id = 1
 	)
-	SELECT 
-		router_cte.user_id as uid, event_type 
-	FROM 
+	SELECT
+		router_cte.user_id as uid, event_type
+	FROM
 		router_cte, router_cte_2
 )
 SELECT * FROM cte ORDER BY 2 LIMIT 5;
@@ -91,70 +95,69 @@ WITH cte AS (
 	real_time AS (
 		SELECT user_id, event_type, value_2 FROM events_table
 	)
-	SELECT 
-		router_cte.user_id as uid, event_type 
-	FROM 
-		router_cte, real_time 
-	WHERE 
+	SELECT
+		router_cte.user_id as uid, event_type
+	FROM
+		router_cte, real_time
+	WHERE
 		router_cte.user_id=real_time.user_id
 )
 SELECT * FROM cte WHERE uid=1 ORDER BY 2 LIMIT 5;
 
 
--- CTEs should be able to use task-tracker queries
+-- CTEs should be able to use adaptive executor
 WITH cte AS (
 	WITH task_tracker_1 AS (
-		SELECT 
-			users_table.user_id as uid_1, users_table.value_2 
-		FROM 
-			users_table 
+		SELECT
+			users_table.user_id as uid_1, users_table.value_2
+		FROM
+			users_table
 		JOIN
-			events_table 
-		ON 
+			events_table
+		ON
 			users_table.value_2=events_table.value_2
 	),
 	task_tracker_2 AS (
-		SELECT 
-			users_table.user_id as uid_2, users_table.value_3 
-		FROM 
-			users_table 
-		JOIN 
-			events_table 
-		ON 
+		SELECT
+			users_table.user_id as uid_2, users_table.value_3
+		FROM
+			users_table
+		JOIN
+			events_table
+		ON
 			users_table.value_3=events_table.value_3
 	)
-	SELECT 
+	SELECT
 		uid_1, uid_2, value_2, value_3
-	FROM 
+	FROM
 		task_tracker_1
 	JOIN
 		task_tracker_2
-	ON 
+	ON
 		value_2 = value_3
 )
-SELECT 
-	uid_1, uid_2, cte.value_2, cte.value_3 
-FROM 
-	cte 
-JOIN 
+SELECT
+	uid_1, uid_2, cte.value_2, cte.value_3
+FROM
+	cte
+JOIN
 	events_table
 ON
 	cte.value_2 = events_table.event_type
-ORDER BY 
-	1, 2, 3, 4 
+ORDER BY
+	1, 2, 3, 4
 LIMIT 10;
-
 
 -- All combined
 WITH cte AS (
 	WITH task_tracker AS (
-		SELECT 
+		SELECT
 			users_table.user_id as uid_1, users_table.value_2 as val_2
-		FROM 
-			users_table 
+		FROM
+			users_table
 		JOIN
-			events_table 
-		ON 
+			events_table
+		ON
 			users_table.value_2=events_table.value_2
 	),
 	real_time AS (
@@ -170,13 +173,13 @@ WITH cte AS (
 		SELECT uid_1, time, value_3 FROM task_tracker JOIN real_time ON val_2=value_3
 	),
 	join_last_two AS (
-		SELECT 
-			router_exec.user_id, local_table.id 
-		FROM 
-			router_exec 
-		JOIN 
-			local_table 
-		ON 
+		SELECT
+			router_exec.user_id, local_table.id
+		FROM
+			router_exec
+		JOIN
+			local_table
+		ON
 			router_exec.user_id=local_table.id
 	)
 	SELECT * FROM join_first_two JOIN join_last_two ON id = value_3 ORDER BY 1,2,3,4,5 LIMIT 10
@@ -186,13 +189,13 @@ SELECT DISTINCT uid_1, time, value_3 FROM cte ORDER BY 1, 2, 3 LIMIT 20;
 -- All combined with outer join
 WITH cte AS (
 	WITH task_tracker AS (
-		SELECT 
+		SELECT
 			users_table.user_id as uid_1, users_table.value_2 as val_2
-		FROM 
-			users_table 
+		FROM
+			users_table
 		JOIN
-			events_table 
-		ON 
+			events_table
+		ON
 			users_table.value_2=events_table.value_2
 	),
 	real_time AS (
@@ -208,13 +211,13 @@ WITH cte AS (
 		SELECT uid_1, time, value_3 FROM task_tracker JOIN real_time ON val_2=value_3
 	),
 	join_last_two AS (
-		SELECT 
-			router_exec.user_id, local_table.id 
-		FROM 
-			router_exec 
-		JOIN 
-			local_table 
-		ON 
+		SELECT
+			router_exec.user_id, local_table.id
+		FROM
+			router_exec
+		JOIN
+			local_table
+		ON
 			router_exec.user_id=local_table.id
 	)
 	SELECT uid_1, value_3 as val_3 FROM join_first_two JOIN join_last_two ON id = value_3 ORDER BY 1,2 LIMIT 10
@@ -222,11 +225,31 @@ WITH cte AS (
 SELECT DISTINCT uid_1, val_3 FROM cte join events_table on cte.val_3=events_table.event_type ORDER BY 1, 2;
 
 
--- CTEs should not be able to terminate (the last SELECT) in a local query
+-- CTEs should be able to terminate (the last SELECT) in a local query
 WITH cte AS (
-	SELECT * FROM users_table
+	SELECT user_id FROM users_table
 )
-SELECT count(*) FROM cte JOIN local_table ON (user_id = id);
+SELECT min(user_id) FROM cte JOIN local_table ON (user_id = id);
+
+-- even if there are no distributed tables
+WITH cte AS (
+	SELECT user_id FROM users_table
+)
+SELECT min(user_id) FROM cte JOIN local_table ON (user_id = id) JOIN events_table USING (user_id);
+
+-- unless the distributed table is part of a recursively planned subquery
+WITH cte AS (
+	SELECT user_id FROM users_table
+)
+SELECT min(user_id) FROM cte JOIN local_table ON (user_id = id) JOIN (SELECT * FROM events_table OFFSET 0) e USING (user_id);
+
+-- joins between local and reference tables are allowed
+-- even when the coordinator is not in the metadata at this stage
+WITH cte AS (
+	SELECT user_id FROM users_table
+)
+SELECT count(*) FROM local_table JOIN ref_table USING (id)
+WHERE id IN (SELECT * FROM cte);
 
 -- CTEs should be able to terminate a router query
 WITH cte AS (
@@ -271,10 +294,8 @@ WITH cte AS (
 SELECT count(*) FROM cte, users_table where cte.count=user_id;
 
 
-SET citus.task_executor_type='task-tracker';
--- CTEs shouldn't be able to terminate a task-tracker query
 WITH cte_1 AS (
-	SELECT 
+	SELECT
 		u_table.user_id as u_id, e_table.event_type
 	FROM
 		users_table as u_table

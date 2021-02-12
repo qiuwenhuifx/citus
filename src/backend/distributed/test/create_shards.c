@@ -5,7 +5,7 @@
  * This file contains functions to exercise shard creation functionality
  * within Citus.
  *
- * Copyright (c) 2014-2016, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -43,10 +43,9 @@ sort_names(PG_FUNCTION_ARGS)
 							  (int (*)(const void *, const void *))(&CompareStrings));
 	StringInfo sortedNames = makeStringInfo();
 
-	ListCell *nameCell = NULL;
-	foreach(nameCell, nameList)
+	const char *name = NULL;
+	foreach_ptr(name, nameList)
 	{
-		char *name = lfirst(nameCell);
 		appendStringInfo(sortedNames, "%s\n", name);
 	}
 

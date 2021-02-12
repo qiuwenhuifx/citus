@@ -1,7 +1,12 @@
+-- We have two different output files for this failure test because the
+-- failure behaviour of SAVEPOINT and RELEASE commands are different if
+-- we use the executor. If we use it, these commands error out if any of
+-- the placement commands fail. Otherwise, we might mark the placement
+-- as invalid and continue with a WARNING.
 SELECT citus.mitmproxy('conn.allow()');
- mitmproxy 
------------
- 
+ mitmproxy
+---------------------------------------------------------------------
+
 (1 row)
 
 SET citus.shard_count = 2;
@@ -13,9 +18,9 @@ CREATE TABLE artists (
     name text NOT NULL
 );
 SELECT create_distributed_table('artists', 'id');
- create_distributed_table 
---------------------------
- 
+ create_distributed_table
+---------------------------------------------------------------------
+
 (1 row)
 
 -- add some data
@@ -25,68 +30,70 @@ INSERT INTO artists VALUES (3, 'Claude Monet');
 INSERT INTO artists VALUES (4, 'William Kurelek');
 -- simply fail at SAVEPOINT
 SELECT citus.mitmproxy('conn.onQuery(query="^SAVEPOINT").kill()');
- mitmproxy 
------------
- 
+ mitmproxy
+---------------------------------------------------------------------
+
 (1 row)
 
 BEGIN;
 INSERT INTO artists VALUES (5, 'Asher Lev');
 SAVEPOINT s1;
 WARNING:  connection not open
-CONTEXT:  while executing command on localhost:9060
+CONTEXT:  while executing command on localhost:xxxxx
+WARNING:  connection to the remote node localhost:xxxxx failed with the following error: connection not open
 WARNING:  connection not open
-CONTEXT:  while executing command on localhost:9060
+CONTEXT:  while executing command on localhost:xxxxx
+WARNING:  connection not open
+CONTEXT:  while executing command on localhost:xxxxx
+ERROR:  connection not open
+CONTEXT:  while executing command on localhost:xxxxx
 DELETE FROM artists WHERE id=4;
-WARNING:  could not issue cancel request
-DETAIL:  Client error: PQcancel() -- no cancel object supplied
-WARNING:  connection not open
-CONTEXT:  while executing command on localhost:9060
-WARNING:  connection error: localhost:9060
-DETAIL:  connection not open
-WARNING:  connection not open
-CONTEXT:  while executing command on localhost:9060
-WARNING:  connection not open
-CONTEXT:  while executing command on localhost:9060
-ERROR:  could not modify any active placements
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
 RELEASE SAVEPOINT s1;
 ERROR:  current transaction is aborted, commands ignored until end of transaction block
 COMMIT;
 SELECT * FROM artists WHERE id IN (4, 5);
- id |      name       
-----+-----------------
+ id |      name
+---------------------------------------------------------------------
   4 | William Kurelek
 (1 row)
 
 -- fail at RELEASE
 SELECT citus.mitmproxy('conn.onQuery(query="^RELEASE").kill()');
- mitmproxy 
------------
- 
+ mitmproxy
+---------------------------------------------------------------------
+
 (1 row)
 
 BEGIN;
-INSERT INTO artists VALUES (5, 'Asher Lev');
+UPDATE artists SET name='a';
 SAVEPOINT s1;
 DELETE FROM artists WHERE id=4;
 RELEASE SAVEPOINT s1;
+WARNING:  AbortSubTransaction while in COMMIT state
 WARNING:  connection not open
-CONTEXT:  while executing command on localhost:9060
+CONTEXT:  while executing command on localhost:xxxxx
+WARNING:  connection to the remote node localhost:xxxxx failed with the following error: connection not open
 WARNING:  connection not open
-CONTEXT:  while executing command on localhost:9060
-COMMIT;
-ERROR:  could not make changes to shard 100950 on any node
+CONTEXT:  while executing command on localhost:xxxxx
+WARNING:  connection not open
+CONTEXT:  while executing command on localhost:xxxxx
+WARNING:  savepoint "savepoint_2" does not exist
+CONTEXT:  while executing command on localhost:xxxxx
+ERROR:  connection not open
+CONTEXT:  while executing command on localhost:xxxxx
+ROLLBACK;
 SELECT * FROM artists WHERE id IN (4, 5);
- id |      name       
-----+-----------------
+ id |      name
+---------------------------------------------------------------------
   4 | William Kurelek
 (1 row)
 
 -- fail at ROLLBACK
 SELECT citus.mitmproxy('conn.onQuery(query="^ROLLBACK").kill()');
- mitmproxy 
------------
- 
+ mitmproxy
+---------------------------------------------------------------------
+
 (1 row)
 
 BEGIN;
@@ -95,22 +102,22 @@ SAVEPOINT s1;
 DELETE FROM artists WHERE id=4;
 ROLLBACK TO SAVEPOINT s1;
 WARNING:  connection not open
-CONTEXT:  while executing command on localhost:9060
+CONTEXT:  while executing command on localhost:xxxxx
 WARNING:  connection not open
-CONTEXT:  while executing command on localhost:9060
+CONTEXT:  while executing command on localhost:xxxxx
 COMMIT;
-ERROR:  could not make changes to shard 100950 on any node
+ERROR:  could not make changes to shard xxxxx on any node
 SELECT * FROM artists WHERE id IN (4, 5);
- id |      name       
-----+-----------------
+ id |      name
+---------------------------------------------------------------------
   4 | William Kurelek
 (1 row)
 
 -- fail at second RELEASE
 SELECT citus.mitmproxy('conn.onQuery(query="^RELEASE").after(1).kill()');
- mitmproxy 
------------
- 
+ mitmproxy
+---------------------------------------------------------------------
+
 (1 row)
 
 BEGIN;
@@ -120,23 +127,28 @@ RELEASE SAVEPOINT s1;
 SAVEPOINT s2;
 INSERT INTO artists VALUES (5, 'Jacob Kahn');
 RELEASE SAVEPOINT s2;
+WARNING:  AbortSubTransaction while in COMMIT state
 WARNING:  connection not open
-CONTEXT:  while executing command on localhost:9060
+CONTEXT:  while executing command on localhost:xxxxx
+WARNING:  connection to the remote node localhost:xxxxx failed with the following error: connection not open
 WARNING:  connection not open
-CONTEXT:  while executing command on localhost:9060
+CONTEXT:  while executing command on localhost:xxxxx
+WARNING:  connection not open
+CONTEXT:  while executing command on localhost:xxxxx
+ERROR:  connection not open
+CONTEXT:  while executing command on localhost:xxxxx
 COMMIT;
-ERROR:  could not make changes to shard 100950 on any node
 SELECT * FROM artists WHERE id IN (4, 5);
- id |      name       
-----+-----------------
+ id |      name
+---------------------------------------------------------------------
   4 | William Kurelek
 (1 row)
 
 -- fail at second ROLLBACK
 SELECT citus.mitmproxy('conn.onQuery(query="^ROLLBACK").after(1).kill()');
- mitmproxy 
------------
- 
+ mitmproxy
+---------------------------------------------------------------------
+
 (1 row)
 
 BEGIN;
@@ -147,21 +159,21 @@ SAVEPOINT s2;
 DELETE FROM artists WHERE id=5;
 ROLLBACK TO SAVEPOINT s2;
 WARNING:  connection not open
-CONTEXT:  while executing command on localhost:9060
+CONTEXT:  while executing command on localhost:xxxxx
 WARNING:  connection not open
-CONTEXT:  while executing command on localhost:9060
+CONTEXT:  while executing command on localhost:xxxxx
 COMMIT;
-ERROR:  could not make changes to shard 100950 on any node
+ERROR:  could not make changes to shard xxxxx on any node
 SELECT * FROM artists WHERE id IN (4, 5);
- id |      name       
-----+-----------------
+ id |      name
+---------------------------------------------------------------------
   4 | William Kurelek
 (1 row)
 
 SELECT citus.mitmproxy('conn.onQuery(query="^RELEASE").after(1).kill()');
- mitmproxy 
------------
- 
+ mitmproxy
+---------------------------------------------------------------------
+
 (1 row)
 
 -- Release after rollback
@@ -176,14 +188,14 @@ ROLLBACK TO s2;
 RELEASE SAVEPOINT s2;
 COMMIT;
 SELECT * FROM artists WHERE id=7;
- id | name 
-----+------
+ id | name
+---------------------------------------------------------------------
 (0 rows)
 
 SELECT citus.mitmproxy('conn.onQuery(query="^ROLLBACK").kill()');
- mitmproxy 
------------
- 
+ mitmproxy
+---------------------------------------------------------------------
+
 (1 row)
 
 -- Recover from errors
@@ -197,12 +209,15 @@ INSERT INTO artists VALUES (7, 'Emily Carr');
 ROLLBACK TO SAVEPOINT s1;
 WARNING:  connection not open
 WARNING:  connection not open
-WARNING:  could not issue cancel request
+WARNING:  connection not open
+WARNING:  connection to the remote node localhost:xxxxx failed with the following error: connection not open
+WARNING:  connection not open
+WARNING:  connection not open
 COMMIT;
-ERROR:  could not make changes to shard 100950 on any node
+ERROR:  could not make changes to shard xxxxx on any node
 SELECT * FROM artists WHERE id=6;
- id | name 
-----+------
+ id | name
+---------------------------------------------------------------------
 (0 rows)
 
 -- replication factor > 1
@@ -214,57 +229,53 @@ CREATE TABLE researchers (
 SET citus.shard_count = 1;
 SET citus.shard_replication_factor = 2; -- single shard, on both workers
 SELECT create_distributed_table('researchers', 'lab_id', 'hash');
- create_distributed_table 
---------------------------
- 
+ create_distributed_table
+---------------------------------------------------------------------
+
 (1 row)
 
 -- simply fail at SAVEPOINT
 SELECT citus.mitmproxy('conn.onQuery(query="^SAVEPOINT").kill()');
- mitmproxy 
------------
- 
+ mitmproxy
+---------------------------------------------------------------------
+
 (1 row)
 
 BEGIN;
 INSERT INTO researchers VALUES (7, 4, 'Jan Plaza');
 SAVEPOINT s1;
 WARNING:  connection not open
+WARNING:  connection to the remote node localhost:xxxxx failed with the following error: connection not open
 WARNING:  connection not open
+WARNING:  connection not open
+ERROR:  connection not open
 INSERT INTO researchers VALUES (8, 4, 'Alonzo Church');
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
 ROLLBACK TO s1;
-WARNING:  could not issue cancel request
-WARNING:  connection not open
-WARNING:  connection error: localhost:9060
-WARNING:  connection not open
-WARNING:  connection not open
+ERROR:  savepoint "s1" does not exist
 RELEASE SAVEPOINT s1;
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
 COMMIT;
-WARNING:  connection not open
-WARNING:  connection not open
-WARNING:  connection not open
 -- should see correct results from healthy placement and one bad placement
 SELECT * FROM researchers WHERE lab_id = 4;
- id | lab_id |   name    
-----+--------+-----------
-  7 |      4 | Jan Plaza
-(1 row)
+ id | lab_id | name
+---------------------------------------------------------------------
+(0 rows)
 
 UPDATE pg_dist_shard_placement SET shardstate = 1
 WHERE shardstate = 3 AND shardid IN (
   SELECT shardid FROM pg_dist_shard WHERE logicalrelid = 'researchers'::regclass
 ) RETURNING placementid;
- placementid 
--------------
-         152
-(1 row)
+ placementid
+---------------------------------------------------------------------
+(0 rows)
 
 TRUNCATE researchers;
 -- fail at rollback
 SELECT citus.mitmproxy('conn.onQuery(query="^ROLLBACK").kill()');
- mitmproxy 
------------
- 
+ mitmproxy
+---------------------------------------------------------------------
+
 (1 row)
 
 BEGIN;
@@ -276,31 +287,27 @@ WARNING:  connection not open
 WARNING:  connection not open
 RELEASE SAVEPOINT s1;
 COMMIT;
-WARNING:  connection not open
-WARNING:  connection not open
-WARNING:  connection not open
+ERROR:  failure on connection marked as essential: localhost:xxxxx
 -- should see correct results from healthy placement and one bad placement
 SELECT * FROM researchers WHERE lab_id = 4;
- id | lab_id |   name    
-----+--------+-----------
-  7 |      4 | Jan Plaza
-(1 row)
+ id | lab_id | name
+---------------------------------------------------------------------
+(0 rows)
 
 UPDATE pg_dist_shard_placement SET shardstate = 1
 WHERE shardstate = 3 AND shardid IN (
   SELECT shardid FROM pg_dist_shard WHERE logicalrelid = 'researchers'::regclass
 ) RETURNING placementid;
- placementid 
--------------
-         152
-(1 row)
+ placementid
+---------------------------------------------------------------------
+(0 rows)
 
 TRUNCATE researchers;
 -- fail at release
 SELECT citus.mitmproxy('conn.onQuery(query="^RELEASE").kill()');
- mitmproxy 
------------
- 
+ mitmproxy
+---------------------------------------------------------------------
+
 (1 row)
 
 BEGIN;
@@ -309,35 +316,69 @@ SAVEPOINT s1;
 INSERT INTO researchers VALUES (8, 4, 'Alonzo Church');
 ROLLBACK TO s1;
 RELEASE SAVEPOINT s1;
+WARNING:  AbortSubTransaction while in COMMIT state
+WARNING:  connection not open
+WARNING:  connection to the remote node localhost:xxxxx failed with the following error: connection not open
 WARNING:  connection not open
 WARNING:  connection not open
+WARNING:  savepoint "savepoint_3" does not exist
+ERROR:  connection not open
 COMMIT;
-WARNING:  connection not open
-WARNING:  connection not open
-WARNING:  connection not open
 -- should see correct results from healthy placement and one bad placement
 SELECT * FROM researchers WHERE lab_id = 4;
- id | lab_id |   name    
-----+--------+-----------
-  7 |      4 | Jan Plaza
-(1 row)
+ id | lab_id | name
+---------------------------------------------------------------------
+(0 rows)
 
 UPDATE pg_dist_shard_placement SET shardstate = 1
 WHERE shardstate = 3 AND shardid IN (
   SELECT shardid FROM pg_dist_shard WHERE logicalrelid = 'researchers'::regclass
 ) RETURNING placementid;
- placementid 
--------------
-         152
-(1 row)
+ placementid
+---------------------------------------------------------------------
+(0 rows)
 
 TRUNCATE researchers;
+-- test that we don't mark reference placements unhealthy
+CREATE TABLE ref(a int, b int);
+SELECT create_reference_table('ref');
+ create_reference_table
+---------------------------------------------------------------------
+
+(1 row)
+
+SELECT citus.mitmproxy('conn.onQuery(query="^ROLLBACK").kill()');
+ mitmproxy
+---------------------------------------------------------------------
+
+(1 row)
+
+BEGIN;
+SAVEPOINT start;
+INSERT INTO ref VALUES (1001,2);
+SELECT * FROM ref;
+  a   | b
+---------------------------------------------------------------------
+ 1001 | 2
+(1 row)
+
+ROLLBACK TO SAVEPOINT start;
+WARNING:  connection not open
+WARNING:  connection not open
+SELECT * FROM ref;
+WARNING:  connection not open
+WARNING:  connection to the remote node localhost:xxxxx failed with the following error: connection not open
+WARNING:  connection not open
+WARNING:  connection not open
+ERROR:  connection to the remote node localhost:xxxxx failed with the following error: connection not open
+END;
 -- clean up
 SELECT citus.mitmproxy('conn.allow()');
- mitmproxy 
------------
- 
+ mitmproxy
+---------------------------------------------------------------------
+
 (1 row)
 
 DROP TABLE artists;
 DROP TABLE researchers;
+DROP TABLE ref;

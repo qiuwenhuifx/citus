@@ -3,17 +3,18 @@
  * connection_configuration.c
  *   Functions for controlling configuration of Citus connections
  *
- * Copyright (c) 2018, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
 
+#include "distributed/citus_safe_lib.h"
 #include "distributed/connection_management.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/worker_manager.h"
-#include "distributed/task_tracker.h"
+
 #include "postmaster/postmaster.h"
 #include "mb/pg_wchar.h"
 #include "utils/builtins.h"
@@ -76,8 +77,7 @@ InitConnParams()
 void
 ResetConnParams()
 {
-	Index paramIdx = 0;
-	for (paramIdx = 0; paramIdx < ConnParams.size; paramIdx++)
+	for (Size paramIdx = 0; paramIdx < ConnParams.size; paramIdx++)
 	{
 		free((void *) ConnParams.keywords[paramIdx]);
 		free((void *) ConnParams.values[paramIdx]);
@@ -89,7 +89,7 @@ ResetConnParams()
 
 	InvalidateConnParamsHashEntries();
 
-	AddConnParam("fallback_application_name", "citus");
+	AddConnParam("fallback_application_name", CITUS_APPLICATION_NAME);
 }
 
 
@@ -122,22 +122,20 @@ AddConnParam(const char *keyword, const char *value)
  *
  *   - Not use a uri-prefix such as postgres:// (it must be only keys and values)
  *   - Parse using PQconninfoParse
- *   - Only set keywords contained in the provided whitelist
+ *   - Only set keywords contained in the provided allowedConninfoKeywords
  *
  * This function returns true if all of the above are satisfied, otherwise it
  * returns false. If the provided errmsg pointer is not NULL, it will be set
  * to an appropriate message if the check fails.
  *
- * The provided whitelist must be sorted in a manner usable by bsearch, though
- * this is only validated during assert-enabled builds.
+ * The provided allowedConninfoKeywords must be sorted in a manner usable by bsearch,
+ * though this is only validated during assert-enabled builds.
  */
 bool
-CheckConninfo(const char *conninfo, const char **whitelist,
-			  Size whitelistLength, char **errorMsg)
+CheckConninfo(const char *conninfo, const char **allowedConninfoKeywords,
+			  Size allowedConninfoKeywordsLength, char **errorMsg)
 {
-	PQconninfoOption *optionArray = NULL;
 	PQconninfoOption *option = NULL;
-	Index whitelistIdx PG_USED_FOR_ASSERTS_ONLY = 0;
 	char *errorMsgString = NULL;
 
 	/*
@@ -165,7 +163,7 @@ CheckConninfo(const char *conninfo, const char **whitelist,
 	}
 
 	/* this should at least parse */
-	optionArray = PQconninfoParse(conninfo, NULL);
+	PQconninfoOption *optionArray = PQconninfoParse(conninfo, NULL);
 	if (optionArray == NULL)
 	{
 		*errorMsg = "Provided string is not a valid libpq connection info string";
@@ -175,11 +173,11 @@ CheckConninfo(const char *conninfo, const char **whitelist,
 
 #ifdef USE_ASSERT_CHECKING
 
-	/* verify that the whitelist is in ascending order */
-	for (whitelistIdx = 1; whitelistIdx < whitelistLength; whitelistIdx++)
+	/* verify that the allowedConninfoKeywords is in ascending order */
+	for (Size keywordIdx = 1; keywordIdx < allowedConninfoKeywordsLength; keywordIdx++)
 	{
-		const char *prev = whitelist[whitelistIdx - 1];
-		const char *curr = whitelist[whitelistIdx];
+		const char *prev = allowedConninfoKeywords[keywordIdx - 1];
+		const char *curr = allowedConninfoKeywords[keywordIdx];
 
 		AssertArg(strcmp(prev, curr) < 0);
 	}
@@ -187,18 +185,17 @@ CheckConninfo(const char *conninfo, const char **whitelist,
 
 	for (option = optionArray; option->keyword != NULL; option++)
 	{
-		void *matchingKeyword = NULL;
-
 		if (option->val == NULL || option->val[0] == '\0')
 		{
 			continue;
 		}
 
-		matchingKeyword = bsearch(&option->keyword, whitelist, whitelistLength,
-								  sizeof(char *), pg_qsort_strcmp);
+		void *matchingKeyword = SafeBsearch(&option->keyword, allowedConninfoKeywords,
+											allowedConninfoKeywordsLength, sizeof(char *),
+											pg_qsort_strcmp);
 		if (matchingKeyword == NULL)
 		{
-			/* the whitelist lacks this keyword; error out! */
+			/* the allowedConninfoKeywords lacks this keyword; error out! */
 			StringInfoData msgString;
 			initStringInfo(&msgString);
 
@@ -229,12 +226,16 @@ void
 GetConnParams(ConnectionHashKey *key, char ***keywords, char ***values,
 			  Index *runtimeParamStart, MemoryContext context)
 {
-	/* make space for the port as a string: sign, 10 digits, NUL */
-	char *nodePortString = MemoryContextAlloc(context, 12 * sizeof(char *));
+	/*
+	 * make space for the port as a string: sign, 10 digits, NUL. We keep it on the stack
+	 * till we can later copy it to the right context. By having the declaration here
+	 * already we can add a pointer to the runtimeValues.
+	 */
+	char nodePortString[12] = "";
 
 	/*
 	 * This function has three sections:
-	 *   - Initialize the keywords and values with copies of global parameters
+	 *   - Initialize the keywords and values (to be copied later) of global parameters
 	 *   - Append user/host-specific parameters calculated from the given key
 	 *   - (Enterprise-only) append user/host-specific authentication params
 	 *
@@ -247,34 +248,44 @@ GetConnParams(ConnectionHashKey *key, char ***keywords, char ***values,
 	 * invalidated during config reloads.
 	 */
 	const char *runtimeKeywords[] = {
-		MemoryContextStrdup(context, "host"),
-		MemoryContextStrdup(context, "port"),
-		MemoryContextStrdup(context, "dbname"),
-		MemoryContextStrdup(context, "user"),
-		MemoryContextStrdup(context, "client_encoding")
+		"host",
+		"port",
+		"dbname",
+		"user",
+		"client_encoding"
 	};
 	const char *runtimeValues[] = {
-		MemoryContextStrdup(context, key->hostname),
+		key->hostname,
 		nodePortString,
-		MemoryContextStrdup(context, key->database),
-		MemoryContextStrdup(context, key->user),
-		MemoryContextStrdup(context, GetDatabaseEncodingName())
+		key->database,
+		key->user,
+		GetDatabaseEncodingName()
 	};
 
 	/*
-	 * Declare local params for readability; we'll assign to outparams at end.
+	 * remember where global/GUC params end and runtime ones start, all entries after this
+	 * point should be allocated in context and will be freed upon
+	 * FreeConnParamsHashEntryFields
+	 */
+	*runtimeParamStart = ConnParams.size;
+
+	/*
+	 * Declare local params for readability;
+	 *
+	 * assignment is done directly to not loose the pointers if any of the later
+	 * allocations cause an error. FreeConnParamsHashEntryFields knows about the
+	 * possibility of half initialized keywords or values and correctly reclaims them when
+	 * the cache is reused.
+	 *
 	 * Need to zero enough space for all possible libpq parameters.
 	 */
-	char **connKeywords = MemoryContextAllocZero(context, ConnParams.maxSize *
-												 sizeof(char *));
-	char **connValues = MemoryContextAllocZero(context, ConnParams.maxSize *
-											   sizeof(char *));
+	char **connKeywords = *keywords = MemoryContextAllocZero(context, ConnParams.maxSize *
+															 sizeof(char *));
+	char **connValues = *values = MemoryContextAllocZero(context, ConnParams.maxSize *
+														 sizeof(char *));
 
 	/* auth keywords will begin after global and runtime ones are appended */
 	Index authParamsIdx = ConnParams.size + lengthof(runtimeKeywords);
-
-	Index paramIndex = 0;
-	Index runtimeParamIndex = 0;
 
 	if (ConnParams.size + lengthof(runtimeKeywords) >= ConnParams.maxSize)
 	{
@@ -286,33 +297,27 @@ GetConnParams(ConnectionHashKey *key, char ***keywords, char ***values,
 	pg_ltoa(key->port, nodePortString); /* populate node port string with port */
 
 	/* first step: copy global parameters to beginning of array */
-	for (paramIndex = 0; paramIndex < ConnParams.size; paramIndex++)
+	for (Size paramIndex = 0; paramIndex < ConnParams.size; paramIndex++)
 	{
 		/* copy the keyword&value pointers to the new array */
 		connKeywords[paramIndex] = ConnParams.keywords[paramIndex];
 		connValues[paramIndex] = ConnParams.values[paramIndex];
 	}
 
-	/* remember where global/GUC params end and runtime ones start */
-	*runtimeParamStart = ConnParams.size;
-
-	/* second step: begin at end of global params and copy runtime ones */
-	for (runtimeParamIndex = 0;
+	/* second step: begin after global params and copy runtime params into our context */
+	for (Index runtimeParamIndex = 0;
 		 runtimeParamIndex < lengthof(runtimeKeywords);
 		 runtimeParamIndex++)
 	{
-		/* copy the keyword&value pointers to the new array */
+		/* copy the keyword & value into our context and append to the new array */
 		connKeywords[ConnParams.size + runtimeParamIndex] =
-			(char *) runtimeKeywords[runtimeParamIndex];
+			MemoryContextStrdup(context, runtimeKeywords[runtimeParamIndex]);
 		connValues[ConnParams.size + runtimeParamIndex] =
-			(char *) runtimeValues[runtimeParamIndex];
+			MemoryContextStrdup(context, runtimeValues[runtimeParamIndex]);
 	}
 
 	/* final step: add terminal NULL, required by libpq */
 	connKeywords[authParamsIdx] = connValues[authParamsIdx] = NULL;
-
-	*keywords = connKeywords;
-	*values = connValues;
 }
 
 
@@ -323,9 +328,7 @@ GetConnParams(ConnectionHashKey *key, char ***keywords, char ***values,
 const char *
 GetConnParam(const char *keyword)
 {
-	Index i = 0;
-
-	for (i = 0; i < ConnParams.size; i++)
+	for (Size i = 0; i < ConnParams.size; i++)
 	{
 		if (strcmp(keyword, ConnParams.keywords[i]) == 0)
 		{
@@ -346,10 +349,9 @@ static Size
 CalculateMaxSize()
 {
 	PQconninfoOption *defaults = PQconndefaults();
-	PQconninfoOption *option = NULL;
 	Size maxSize = 0;
 
-	for (option = defaults;
+	for (PQconninfoOption *option = defaults;
 		 option->keyword != NULL;
 		 option++, maxSize++)
 	{

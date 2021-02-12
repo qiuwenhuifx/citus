@@ -3,18 +3,26 @@
  * truncate.c
  *    Commands for truncating distributed tables.
  *
- * Copyright (c) 2018, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
+#include "miscadmin.h"
 
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
+#include "commands/tablecmds.h"
+#include "commands/trigger.h"
+#include "distributed/adaptive_executor.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/commands.h"
+#include "distributed/commands/utility_hook.h"
+#include "distributed/coordinator_protocol.h"
+#include "distributed/deparse_shard_query.h"
 #include "distributed/distributed_planner.h"
+#include "distributed/foreign_key_relationship.h"
 #include "distributed/listutils.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/metadata_sync.h"
@@ -25,11 +33,13 @@
 #include "distributed/transaction_management.h"
 #include "distributed/worker_transaction.h"
 #include "storage/lmgr.h"
+#include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/regproc.h"
 #include "utils/rel.h"
 
 
-#define LOCK_RELATION_IF_EXISTS "SELECT lock_relation_if_exists('%s', '%s');"
+#define LOCK_RELATION_IF_EXISTS "SELECT lock_relation_if_exists(%s, '%s');"
 
 
 /* Local functions forward declarations for unsupported command checks */
@@ -38,15 +48,203 @@ static void ExecuteTruncateStmtSequentialIfNecessary(TruncateStmt *command);
 static void EnsurePartitionTableNotReplicatedForTruncate(TruncateStmt *truncateStatement);
 static void LockTruncatedRelationMetadataInWorkers(TruncateStmt *truncateStatement);
 static void AcquireDistributedLockOnRelations(List *relationIdList, LOCKMODE lockMode);
+static List * TruncateTaskList(Oid relationId);
+
+
+/* exports for SQL callable functions */
+PG_FUNCTION_INFO_V1(citus_truncate_trigger);
+PG_FUNCTION_INFO_V1(truncate_local_data_after_distributing_table);
+
+void EnsureLocalTableCanBeTruncated(Oid relationId);
 
 
 /*
- * ProcessTruncateStatement handles few things that should be
+ * citus_truncate_trigger is called as a trigger when a distributed
+ * table is truncated.
+ */
+Datum
+citus_truncate_trigger(PG_FUNCTION_ARGS)
+{
+	if (!CALLED_AS_TRIGGER(fcinfo))
+	{
+		ereport(ERROR, (errcode(ERRCODE_E_R_I_E_TRIGGER_PROTOCOL_VIOLATED),
+						errmsg("must be called as trigger")));
+	}
+
+	TriggerData *triggerData = (TriggerData *) fcinfo->context;
+	Relation truncatedRelation = triggerData->tg_relation;
+	Oid relationId = RelationGetRelid(truncatedRelation);
+
+	if (!EnableDDLPropagation)
+	{
+		PG_RETURN_DATUM(PointerGetDatum(NULL));
+	}
+
+	/* we might be truncating multiple relations */
+	UseCoordinatedTransaction();
+
+	if (IsCitusTableType(relationId, APPEND_DISTRIBUTED))
+	{
+		Oid schemaId = get_rel_namespace(relationId);
+		char *schemaName = get_namespace_name(schemaId);
+		char *relationName = get_rel_name(relationId);
+
+		DirectFunctionCall3(citus_drop_all_shards,
+							ObjectIdGetDatum(relationId),
+							CStringGetTextDatum(relationName),
+							CStringGetTextDatum(schemaName));
+	}
+	else
+	{
+		List *taskList = TruncateTaskList(relationId);
+
+		/*
+		 * If it is a local placement of a distributed table or a reference table,
+		 * then execute TRUNCATE command locally.
+		 */
+		bool localExecutionSupported = true;
+		ExecuteUtilityTaskList(taskList, localExecutionSupported);
+	}
+
+	PG_RETURN_DATUM(PointerGetDatum(NULL));
+}
+
+
+/*
+ * TruncateTaskList returns a list of tasks to execute a TRUNCATE on a
+ * distributed table. This is handled separately from other DDL commands
+ * because we handle it via the TRUNCATE trigger, which is called whenever
+ * a truncate cascades.
+ */
+static List *
+TruncateTaskList(Oid relationId)
+{
+	/* resulting task list */
+	List *taskList = NIL;
+
+	/* enumerate the tasks when putting them to the taskList */
+	int taskId = 1;
+
+	Oid schemaId = get_rel_namespace(relationId);
+	char *schemaName = get_namespace_name(schemaId);
+	char *relationName = get_rel_name(relationId);
+
+	List *shardIntervalList = LoadShardIntervalList(relationId);
+
+	/* lock metadata before getting placement lists */
+	LockShardListMetadata(shardIntervalList, ShareLock);
+
+	ShardInterval *shardInterval = NULL;
+	foreach_ptr(shardInterval, shardIntervalList)
+	{
+		uint64 shardId = shardInterval->shardId;
+		char *shardRelationName = pstrdup(relationName);
+
+		/* build shard relation name */
+		AppendShardIdToName(&shardRelationName, shardId);
+
+		char *quotedShardName = quote_qualified_identifier(schemaName, shardRelationName);
+
+		StringInfo shardQueryString = makeStringInfo();
+		appendStringInfo(shardQueryString, "TRUNCATE TABLE %s CASCADE", quotedShardName);
+
+		Task *task = CitusMakeNode(Task);
+		task->jobId = INVALID_JOB_ID;
+		task->taskId = taskId++;
+		task->taskType = DDL_TASK;
+		SetTaskQueryString(task, shardQueryString->data);
+		task->dependentTaskList = NULL;
+		task->replicationModel = REPLICATION_MODEL_INVALID;
+		task->anchorShardId = shardId;
+		task->taskPlacementList = ActiveShardPlacementList(shardId);
+
+		taskList = lappend(taskList, task);
+	}
+
+	return taskList;
+}
+
+
+/*
+ * truncate_local_data_after_distributing_table truncates the local records of a distributed table.
+ *
+ * The main advantage of this function is to truncate all local records after creating a
+ * distributed table, and prevent constraints from failing due to outdated local records.
+ */
+Datum
+truncate_local_data_after_distributing_table(PG_FUNCTION_ARGS)
+{
+	Oid relationId = PG_GETARG_OID(0);
+
+	CheckCitusVersion(ERROR);
+	EnsureCoordinator();
+	EnsureLocalTableCanBeTruncated(relationId);
+
+	TruncateStmt *truncateStmt = makeNode(TruncateStmt);
+
+	char *relationName = generate_qualified_relation_name(relationId);
+	List *names = stringToQualifiedNameList(relationName);
+	truncateStmt->relations = list_make1(makeRangeVarFromNameList(names));
+	truncateStmt->restart_seqs = false;
+	truncateStmt->behavior = DROP_CASCADE;
+
+	set_config_option("citus.enable_ddl_propagation", "false",
+					  (superuser() ? PGC_SUSET : PGC_USERSET), PGC_S_SESSION,
+					  GUC_ACTION_LOCAL, true, 0, false);
+	ExecuteTruncate(truncateStmt);
+	set_config_option("citus.enable_ddl_propagation", "true",
+					  (superuser() ? PGC_SUSET : PGC_USERSET), PGC_S_SESSION,
+					  GUC_ACTION_LOCAL, true, 0, false);
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * EnsureLocalTableCanBeTruncated performs the necessary checks to make sure it
+ * is safe to truncate the local table of a distributed table
+ */
+void
+EnsureLocalTableCanBeTruncated(Oid relationId)
+{
+	/* error out if the relation is not a distributed table */
+	if (!IsCitusTable(relationId))
+	{
+		ereport(ERROR, (errmsg("supplied parameter is not a distributed relation"),
+						errdetail("This UDF only truncates local records of distributed "
+								  "tables.")));
+	}
+
+	/* make sure there are no foreign key references from a local table */
+	SetForeignConstraintRelationshipGraphInvalid();
+	List *referencingRelationList = ReferencingRelationIdList(relationId);
+
+	Oid referencingRelation = InvalidOid;
+	foreach_oid(referencingRelation, referencingRelationList)
+	{
+		/* we do not truncate a table if there is a local table referencing it */
+		if (!IsCitusTable(referencingRelation))
+		{
+			char *referencedRelationName = get_rel_name(relationId);
+			char *referencingRelationName = get_rel_name(referencingRelation);
+
+			ereport(ERROR, (errmsg("cannot truncate a table referenced in a "
+								   "foreign key constraint by a local table"),
+							errdetail("Table \"%s\" references \"%s\"",
+									  referencingRelationName,
+									  referencedRelationName)));
+		}
+	}
+}
+
+
+/*
+ * PreprocessTruncateStatement handles few things that should be
  * done before standard process utility is called for truncate
  * command.
  */
 void
-ProcessTruncateStatement(TruncateStmt *truncateStatement)
+PreprocessTruncateStatement(TruncateStmt *truncateStatement)
 {
 	ErrorIfUnsupportedTruncateStmt(truncateStatement);
 	EnsurePartitionTableNotReplicatedForTruncate(truncateStatement);
@@ -63,19 +261,18 @@ static void
 ErrorIfUnsupportedTruncateStmt(TruncateStmt *truncateStatement)
 {
 	List *relationList = truncateStatement->relations;
-	ListCell *relationCell = NULL;
-	foreach(relationCell, relationList)
+	RangeVar *rangeVar = NULL;
+	foreach_ptr(rangeVar, relationList)
 	{
-		RangeVar *rangeVar = (RangeVar *) lfirst(relationCell);
-		Oid relationId = RangeVarGetRelid(rangeVar, NoLock, true);
+		Oid relationId = RangeVarGetRelid(rangeVar, NoLock, false);
 		char relationKind = get_rel_relkind(relationId);
-		if (IsDistributedTable(relationId) &&
+		if (IsCitusTable(relationId) &&
 			relationKind == RELKIND_FOREIGN_TABLE)
 		{
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							errmsg("truncating distributed foreign tables is "
 								   "currently unsupported"),
-							errhint("Use master_drop_all_shards to remove "
+							errhint("Use citus_drop_all_shards to remove "
 									"foreign table's shards.")));
 		}
 	}
@@ -89,23 +286,17 @@ ErrorIfUnsupportedTruncateStmt(TruncateStmt *truncateStatement)
 static void
 EnsurePartitionTableNotReplicatedForTruncate(TruncateStmt *truncateStatement)
 {
-	ListCell *relationCell = NULL;
-
-	foreach(relationCell, truncateStatement->relations)
+	RangeVar *rangeVar = NULL;
+	foreach_ptr(rangeVar, truncateStatement->relations)
 	{
-		RangeVar *relationRV = (RangeVar *) lfirst(relationCell);
-		Relation relation = heap_openrv(relationRV, NoLock);
-		Oid relationId = RelationGetRelid(relation);
+		Oid relationId = RangeVarGetRelid(rangeVar, NoLock, false);
 
-		if (!IsDistributedTable(relationId))
+		if (!IsCitusTable(relationId))
 		{
-			heap_close(relation, NoLock);
 			continue;
 		}
 
 		EnsurePartitionTableNotReplicated(relationId);
-
-		heap_close(relation, NoLock);
 	}
 }
 
@@ -121,27 +312,25 @@ static void
 ExecuteTruncateStmtSequentialIfNecessary(TruncateStmt *command)
 {
 	List *relationList = command->relations;
-	ListCell *relationCell = NULL;
 	bool failOK = false;
 
-	foreach(relationCell, relationList)
+	RangeVar *rangeVar = NULL;
+	foreach_ptr(rangeVar, relationList)
 	{
-		RangeVar *rangeVar = (RangeVar *) lfirst(relationCell);
 		Oid relationId = RangeVarGetRelid(rangeVar, NoLock, failOK);
 
-		if (IsDistributedTable(relationId) &&
-			PartitionMethod(relationId) == DISTRIBUTE_BY_NONE &&
+		if (IsCitusTableType(relationId, CITUS_TABLE_WITH_NO_DIST_KEY) &&
 			TableReferenced(relationId))
 		{
 			char *relationName = get_rel_name(relationId);
 
 			ereport(DEBUG1, (errmsg("switching to sequential query execution mode"),
 							 errdetail(
-								 "Reference relation \"%s\" is modified, which might lead "
+								 "Table \"%s\" is modified, which might lead "
 								 "to data inconsistencies or distributed deadlocks via "
-								 "parallel accesses to hash distributed relations due to "
+								 "parallel accesses to hash distributed tables due to "
 								 "foreign keys. Any parallel modification to "
-								 "those hash distributed relations in the same "
+								 "those hash distributed tables in the same "
 								 "transaction can only be executed in sequential query "
 								 "execution mode", relationName)));
 
@@ -171,7 +360,6 @@ static void
 LockTruncatedRelationMetadataInWorkers(TruncateStmt *truncateStatement)
 {
 	List *distributedRelationList = NIL;
-	ListCell *relationCell = NULL;
 
 	/* nothing to do if there is no metadata at worker nodes */
 	if (!ClusterHasKnownMetadataWorkers())
@@ -179,41 +367,33 @@ LockTruncatedRelationMetadataInWorkers(TruncateStmt *truncateStatement)
 		return;
 	}
 
-	foreach(relationCell, truncateStatement->relations)
+	RangeVar *rangeVar = NULL;
+	foreach_ptr(rangeVar, truncateStatement->relations)
 	{
-		RangeVar *relationRV = (RangeVar *) lfirst(relationCell);
-		Relation relation = heap_openrv(relationRV, NoLock);
-		Oid relationId = RelationGetRelid(relation);
-		DistTableCacheEntry *cacheEntry = NULL;
-		List *referencingTableList = NIL;
-		ListCell *referencingTableCell = NULL;
+		Oid relationId = RangeVarGetRelid(rangeVar, NoLock, false);
+		Oid referencingRelationId = InvalidOid;
 
-		if (!IsDistributedTable(relationId))
+		if (!IsCitusTable(relationId))
 		{
-			heap_close(relation, NoLock);
 			continue;
 		}
 
 		if (list_member_oid(distributedRelationList, relationId))
 		{
-			heap_close(relation, NoLock);
 			continue;
 		}
 
 		distributedRelationList = lappend_oid(distributedRelationList, relationId);
 
-		cacheEntry = DistributedTableCacheEntry(relationId);
+		CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(relationId);
 		Assert(cacheEntry != NULL);
 
-		referencingTableList = cacheEntry->referencingRelationsViaForeignKey;
-		foreach(referencingTableCell, referencingTableList)
+		List *referencingTableList = cacheEntry->referencingRelationsViaForeignKey;
+		foreach_oid(referencingRelationId, referencingTableList)
 		{
-			Oid referencingRelationId = lfirst_oid(referencingTableCell);
 			distributedRelationList = list_append_unique_oid(distributedRelationList,
 															 referencingRelationId);
 		}
-
-		heap_close(relation, NoLock);
 	}
 
 	if (distributedRelationList != NIL)
@@ -237,8 +417,8 @@ LockTruncatedRelationMetadataInWorkers(TruncateStmt *truncateStatement)
 static void
 AcquireDistributedLockOnRelations(List *relationIdList, LOCKMODE lockMode)
 {
-	ListCell *relationIdCell = NULL;
-	List *workerNodeList = ActivePrimaryNodeList();
+	Oid relationId = InvalidOid;
+	List *workerNodeList = ActivePrimaryNodeList(NoLock);
 	const char *lockModeText = LockModeToLockModeText(lockMode);
 
 	/*
@@ -248,12 +428,12 @@ AcquireDistributedLockOnRelations(List *relationIdList, LOCKMODE lockMode)
 	relationIdList = SortList(relationIdList, CompareOids);
 	workerNodeList = SortList(workerNodeList, CompareWorkerNodes);
 
-	BeginOrContinueCoordinatedTransaction();
+	UseCoordinatedTransaction();
 
-	foreach(relationIdCell, relationIdList)
+	int32 localGroupId = GetLocalGroupId();
+
+	foreach_oid(relationId, relationIdList)
 	{
-		Oid relationId = lfirst_oid(relationIdCell);
-
 		/*
 		 * We only acquire distributed lock on relation if
 		 * the relation is sync'ed between mx nodes.
@@ -262,19 +442,19 @@ AcquireDistributedLockOnRelations(List *relationIdList, LOCKMODE lockMode)
 		{
 			char *qualifiedRelationName = generate_qualified_relation_name(relationId);
 			StringInfo lockRelationCommand = makeStringInfo();
-			ListCell *workerNodeCell = NULL;
 
 			appendStringInfo(lockRelationCommand, LOCK_RELATION_IF_EXISTS,
-							 qualifiedRelationName, lockModeText);
+							 quote_literal_cstr(qualifiedRelationName),
+							 lockModeText);
 
-			foreach(workerNodeCell, workerNodeList)
+			WorkerNode *workerNode = NULL;
+			foreach_ptr(workerNode, workerNodeList)
 			{
-				WorkerNode *workerNode = (WorkerNode *) lfirst(workerNodeCell);
-				char *nodeName = workerNode->workerName;
+				const char *nodeName = workerNode->workerName;
 				int nodePort = workerNode->workerPort;
 
 				/* if local node is one of the targets, acquire the lock locally */
-				if (workerNode->groupId == GetLocalGroupId())
+				if (workerNode->groupId == localGroupId)
 				{
 					LockRelationOid(relationId, lockMode);
 					continue;

@@ -8,7 +8,7 @@ SET citus.next_shard_id TO 1270000;
 ALTER SEQUENCE pg_catalog.pg_dist_groupid_seq RESTART 1370000;
 ALTER SEQUENCE pg_catalog.pg_dist_node_nodeid_seq RESTART 1370000;
 
--- Set the colocation id to a safe value so that 
+-- Set the colocation id to a safe value so that
 -- it is not affected by future changes to colocation id sequence
 SELECT nextval('pg_catalog.pg_dist_colocationid_seq') AS last_colocation_id \gset
 ALTER SEQUENCE pg_catalog.pg_dist_colocationid_seq RESTART 150000;
@@ -29,8 +29,8 @@ CREATE TABLE mx_ref_table (col_1 int, col_2 text);
 SELECT create_reference_table('mx_ref_table');
 
 -- Check that the created tables are colocated MX tables
-SELECT logicalrelid, repmodel, colocationid 
-FROM pg_dist_partition 
+SELECT logicalrelid, repmodel, colocationid
+FROM pg_dist_partition
 WHERE logicalrelid IN ('mx_table'::regclass, 'mx_table_2'::regclass)
 ORDER BY logicalrelid;
 
@@ -53,6 +53,25 @@ SELECT * FROM mx_table ORDER BY col_1;
 -- Try commands from metadata worker
 \c - - - :worker_1_port
 
+-- this function is dropped in Citus10, added here for tests
+CREATE OR REPLACE FUNCTION pg_catalog.master_create_distributed_table(table_name regclass,
+                                                                      distribution_column text,
+                                                                      distribution_method citus.distribution_type)
+    RETURNS void
+    LANGUAGE C STRICT
+    AS 'citus', $$master_create_distributed_table$$;
+COMMENT ON FUNCTION pg_catalog.master_create_distributed_table(table_name regclass,
+                                                               distribution_column text,
+                                                               distribution_method citus.distribution_type)
+    IS 'define the table distribution functions';
+
+-- this function is dropped in Citus10, added here for tests
+CREATE OR REPLACE FUNCTION pg_catalog.master_create_worker_shards(table_name text, shard_count integer,
+                                                                  replication_factor integer DEFAULT 2)
+    RETURNS void
+    AS 'citus', $$master_create_worker_shards$$
+    LANGUAGE C STRICT;
+
 CREATE TABLE mx_table_worker(col_1 text);
 
 -- master_create_distributed_table
@@ -68,7 +87,7 @@ SELECT count(*) FROM pg_dist_partition WHERE logicalrelid='mx_table_worker'::reg
 DROP TABLE mx_table_worker;
 
 -- master_create_worker_shards
-CREATE TEMP TABLE pg_dist_shard_temp AS 
+CREATE TEMP TABLE pg_dist_shard_temp AS
 SELECT * FROM pg_dist_shard WHERE logicalrelid = 'mx_table'::regclass;
 
 DELETE FROM pg_dist_shard WHERE logicalrelid = 'mx_table'::regclass;
@@ -84,6 +103,10 @@ DROP TABLE mx_ref_table;
 CREATE UNIQUE INDEX mx_test_uniq_index ON mx_table(col_1);
 \c - - - :worker_1_port
 
+-- changing isdatanode
+SELECT * from master_set_node_property('localhost', 8888, 'shouldhaveshards', false);
+SELECT * from master_set_node_property('localhost', 8888, 'shouldhaveshards', true);
+
 -- DDL commands
 SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.mx_table'::regclass;
 CREATE INDEX mx_test_index ON mx_table(col_2);
@@ -92,23 +115,23 @@ ALTER TABLE mx_table_2 ADD CONSTRAINT mx_fk_constraint FOREIGN KEY(col_1) REFERE
 SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.mx_table'::regclass;
 \d mx_test_index
 
--- master_drop_all_shards
-SELECT master_drop_all_shards('mx_table'::regclass, 'public', 'mx_table');
+-- citus_drop_all_shards
+SELECT citus_drop_all_shards('mx_table'::regclass, 'public', 'mx_table');
 SELECT count(*) FROM pg_dist_shard NATURAL JOIN pg_dist_shard_placement WHERE logicalrelid='mx_table'::regclass;
 
 -- master_apply_delete_command
 SELECT master_apply_delete_command('DELETE FROM mx_table');
 SELECT count(*) FROM mx_table;
 
--- master_add_node
+-- master_add_inactive_node
 
-SELECT 1 FROM master_add_node('localhost', 5432);
+SELECT 1 FROM master_add_inactive_node('localhost', 5432);
 SELECT count(1) FROM pg_dist_node WHERE nodename='localhost' AND nodeport=5432;
 
 -- master_remove_node
 \c - - - :master_port
 DROP INDEX mx_test_uniq_index;
-SELECT 1 FROM master_add_node('localhost', 5432);
+SELECT 1 FROM master_add_inactive_node('localhost', 5432);
 
 \c - - - :worker_1_port
 SELECT master_remove_node('localhost', 5432);
@@ -119,18 +142,17 @@ SELECT master_remove_node('localhost', 5432);
 
 \c - - - :worker_1_port
 
--- mark_tables_colocated
 UPDATE pg_dist_partition SET colocationid = 0 WHERE logicalrelid='mx_table_2'::regclass;
 
-SELECT mark_tables_colocated('mx_table', ARRAY['mx_table_2']);
+SELECT update_distributed_table_colocation('mx_table', colocate_with => 'mx_table_2');
 SELECT colocationid FROM pg_dist_partition WHERE logicalrelid='mx_table_2'::regclass;
 
 SELECT colocationid AS old_colocation_id
-FROM pg_dist_partition 
+FROM pg_dist_partition
 WHERE logicalrelid='mx_table'::regclass \gset
 
-UPDATE pg_dist_partition 
-SET colocationid = :old_colocation_id 
+UPDATE pg_dist_partition
+SET colocationid = :old_colocation_id
 WHERE logicalrelid='mx_table_2'::regclass;
 
 -- start_metadata_sync_to_node
@@ -154,7 +176,10 @@ DELETE FROM pg_dist_node;
 \c - - - :worker_1_port
 
 -- DROP TABLE
+-- terse verbosity because pg10 has slightly different output
+\set VERBOSITY terse
 DROP TABLE mx_table;
+\set VERBOSITY default
 SELECT count(*) FROM mx_table;
 
 -- master_drop_distributed_table_metadata
@@ -163,7 +188,7 @@ SELECT master_remove_partition_metadata('mx_table'::regclass, 'public', 'mx_tabl
 SELECT count(*) FROM mx_table;
 
 -- master_copy_shard_placement
-SELECT logicalrelid, shardid AS testshardid, nodename, nodeport 
+SELECT logicalrelid, shardid AS testshardid, nodename, nodeport
 FROM pg_dist_shard NATURAL JOIN pg_dist_shard_placement
 WHERE logicalrelid = 'mx_table'::regclass AND nodeport=:worker_1_port
 ORDER BY shardid
@@ -175,7 +200,7 @@ VALUES (:worker_2_group, :testshardid, 3, 0);
 
 SELECT master_copy_shard_placement(:testshardid, 'localhost', :worker_1_port, 'localhost', :worker_2_port);
 
-SELECT shardid, nodename, nodeport, shardstate 
+SELECT shardid, nodename, nodeport, shardstate
 FROM pg_dist_shard_placement
 WHERE shardid = :testshardid
 ORDER BY nodeport;

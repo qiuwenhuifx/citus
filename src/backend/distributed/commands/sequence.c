@@ -4,7 +4,7 @@
  *     This file contains implementation of CREATE and ALTER SEQUENCE
  *     statement functions to run in a distributed setting
  *
- * Copyright (c) 2018, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -15,6 +15,8 @@
 #include "catalog/namespace.h"
 #include "commands/defrem.h"
 #include "distributed/commands.h"
+#include "distributed/commands/sequence.h"
+#include "distributed/listutils.h"
 #include "distributed/metadata_cache.h"
 #include "nodes/parsenodes.h"
 
@@ -34,7 +36,7 @@ ErrorIfUnsupportedSeqStmt(CreateSeqStmt *createSeqStmt)
 	/* create is easy: just prohibit any distributed OWNED BY */
 	if (OptionsSpecifyOwnedBy(createSeqStmt->options, &ownedByTableId))
 	{
-		if (IsDistributedTable(ownedByTableId))
+		if (IsCitusTable(ownedByTableId))
 		{
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							errmsg("cannot create sequences that specify a distributed "
@@ -56,7 +58,6 @@ ErrorIfDistributedAlterSeqOwnedBy(AlterSeqStmt *alterSeqStmt)
 {
 	Oid sequenceId = RangeVarGetRelid(alterSeqStmt->sequence, AccessShareLock,
 									  alterSeqStmt->missing_ok);
-	bool sequenceOwned = false;
 	Oid ownedByTableId = InvalidOid;
 	Oid newOwnedByTableId = InvalidOid;
 	int32 ownedByColumnId = 0;
@@ -68,22 +69,18 @@ ErrorIfDistributedAlterSeqOwnedBy(AlterSeqStmt *alterSeqStmt)
 		return;
 	}
 
-#if (PG_VERSION_NUM >= 100000)
-	sequenceOwned = sequenceIsOwned(sequenceId, DEPENDENCY_AUTO, &ownedByTableId,
-									&ownedByColumnId);
+	bool sequenceOwned = sequenceIsOwned(sequenceId, DEPENDENCY_AUTO, &ownedByTableId,
+										 &ownedByColumnId);
 	if (!sequenceOwned)
 	{
 		sequenceOwned = sequenceIsOwned(sequenceId, DEPENDENCY_INTERNAL, &ownedByTableId,
 										&ownedByColumnId);
 	}
-#else
-	sequenceOwned = sequenceIsOwned(sequenceId, &ownedByTableId, &ownedByColumnId);
-#endif
 
 	/* see whether the sequence is already owned by a distributed table */
 	if (sequenceOwned)
 	{
-		hasDistributedOwner = IsDistributedTable(ownedByTableId);
+		hasDistributedOwner = IsCitusTable(ownedByTableId);
 	}
 
 	if (OptionsSpecifyOwnedBy(alterSeqStmt->options, &newOwnedByTableId))
@@ -95,7 +92,7 @@ ErrorIfDistributedAlterSeqOwnedBy(AlterSeqStmt *alterSeqStmt)
 							errmsg("cannot alter OWNED BY option of a sequence "
 								   "already owned by a distributed table")));
 		}
-		else if (!hasDistributedOwner && IsDistributedTable(newOwnedByTableId))
+		else if (!hasDistributedOwner && IsCitusTable(newOwnedByTableId))
 		{
 			/* and don't let local sequences get a distributed OWNED BY */
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -118,11 +115,9 @@ ErrorIfDistributedAlterSeqOwnedBy(AlterSeqStmt *alterSeqStmt)
 static bool
 OptionsSpecifyOwnedBy(List *optionList, Oid *ownedByTableId)
 {
-	ListCell *optionCell = NULL;
-
-	foreach(optionCell, optionList)
+	DefElem *defElem = NULL;
+	foreach_ptr(defElem, optionList)
 	{
-		DefElem *defElem = (DefElem *) lfirst(optionCell);
 		if (strcmp(defElem->defname, "owned_by") == 0)
 		{
 			List *ownedByNames = defGetQualifiedName(defElem);
@@ -152,4 +147,67 @@ OptionsSpecifyOwnedBy(List *optionList, Oid *ownedByTableId)
 	}
 
 	return false;
+}
+
+
+/*
+ * ExtractDefaultColumnsAndOwnedSequences finds each column of relation with
+ * relationId that has a DEFAULT expression and each sequence owned by such
+ * columns (if any). Then, appends the column name and id of the owned sequence
+ * -that the column defaults- to the lists passed as NIL initially.
+ */
+void
+ExtractDefaultColumnsAndOwnedSequences(Oid relationId, List **columnNameList,
+									   List **ownedSequenceIdList)
+{
+	Assert(*columnNameList == NIL && *ownedSequenceIdList == NIL);
+
+	Relation relation = relation_open(relationId, AccessShareLock);
+	TupleDesc tupleDescriptor = RelationGetDescr(relation);
+
+	for (int attributeIndex = 0; attributeIndex < tupleDescriptor->natts;
+		 attributeIndex++)
+	{
+		Form_pg_attribute attributeForm = TupleDescAttr(tupleDescriptor, attributeIndex);
+		if (attributeForm->attisdropped || !attributeForm->atthasdef)
+		{
+			/*
+			 * If this column has already been dropped or it has no DEFAULT
+			 * definition, skip it.
+			 */
+			continue;
+		}
+
+#if PG_VERSION_NUM >= PG_VERSION_12
+		if (attributeForm->attgenerated == ATTRIBUTE_GENERATED_STORED)
+		{
+			/* skip columns with GENERATED AS ALWAYS expressions */
+			continue;
+		}
+#endif
+
+		char *columnName = NameStr(attributeForm->attname);
+		*columnNameList = lappend(*columnNameList, columnName);
+
+		List *columnOwnedSequences =
+			GetSequencesOwnedByColumn(relationId, attributeIndex + 1);
+
+		Oid ownedSequenceId = InvalidOid;
+		if (list_length(columnOwnedSequences) != 0)
+		{
+			/*
+			 * A column might only own one sequence. We intentionally use
+			 * GetSequencesOwnedByColumn macro and pick initial oid from the
+			 * list instead of using getOwnedSequence. This is both because
+			 * getOwnedSequence is removed in pg13 and is also because it
+			 * errors out if column does not have any sequences.
+			 */
+			Assert(list_length(columnOwnedSequences) == 1);
+			ownedSequenceId = linitial_oid(columnOwnedSequences);
+		}
+
+		*ownedSequenceIdList = lappend_oid(*ownedSequenceIdList, ownedSequenceId);
+	}
+
+	relation_close(relation, NoLock);
 }

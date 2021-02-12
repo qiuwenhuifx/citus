@@ -2,7 +2,7 @@
  * errormessage.c
  *	  Error handling related support functionality.
  *
- * Copyright (c) 2017, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  */
 
 #include "postgres.h"
@@ -10,17 +10,7 @@
 
 #include "distributed/citus_nodes.h"
 #include "distributed/errormessage.h"
-
-
-/*
- * ApplyLogRedaction is only supported in Citus Enterprise
- */
-char *
-ApplyLogRedaction(const char *logText)
-{
-	return (char *) logText;
-}
-
+#include "distributed/log_utils.h"
 
 /*
  * DeferredErrorInternal is a helper function for DeferredError().
@@ -30,6 +20,8 @@ DeferredErrorInternal(int code, const char *message, const char *detail, const c
 					  const char *filename, int linenumber, const char *functionname)
 {
 	DeferredErrorMessage *error = CitusMakeNode(DeferredErrorMessage);
+
+	Assert(message != NULL);
 
 	error->code = code;
 	error->message = message;

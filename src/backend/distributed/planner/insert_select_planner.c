@@ -4,17 +4,23 @@
  *
  * Planning logic for INSERT..SELECT.
  *
- * Copyright (c) 2017, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
 
+#include "distributed/pg_version_constants.h"
+
 #include "catalog/pg_class.h"
+#include "catalog/pg_type.h"
 #include "distributed/citus_clauses.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/colocation_utils.h"
 #include "distributed/errormessage.h"
+#include "distributed/listutils.h"
+#include "distributed/log_utils.h"
+#include "distributed/insert_select_executor.h"
 #include "distributed/insert_select_planner.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_executor.h"
@@ -26,6 +32,7 @@
 #include "distributed/query_pushdown_planning.h"
 #include "distributed/recursive_planning.h"
 #include "distributed/resource_lock.h"
+#include "distributed/version_compat.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
@@ -33,23 +40,38 @@
 #include "optimizer/planner.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/tlist.h"
+#if PG_VERSION_NUM >= PG_VERSION_12
+#include "optimizer/optimizer.h"
+#else
 #include "optimizer/var.h"
+#endif
 #include "parser/parsetree.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_relation.h"
+#include "tcop/tcopprot.h"
+#include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
 
+static DistributedPlan * CreateInsertSelectPlanInternal(uint64 planId,
+														Query *originalQuery,
+														PlannerRestrictionContext *
+														plannerRestrictionContext,
+														ParamListInfo boundParams);
 static DistributedPlan * CreateDistributedInsertSelectPlan(Query *originalQuery,
 														   PlannerRestrictionContext *
 														   plannerRestrictionContext);
 static Task * RouterModifyTaskForShardInterval(Query *originalQuery,
+											   CitusTableCacheEntry *targetTableCacheEntry,
 											   ShardInterval *shardInterval,
 											   PlannerRestrictionContext *
 											   plannerRestrictionContext,
 											   uint32 taskIdIndex,
-											   bool allRelationsJoinedOnPartitionKey);
+											   bool allRelationsJoinedOnPartitionKey,
+											   DeferredErrorMessage **routerPlannerError);
+static Query * CreateCombineQueryForRouterPlan(DistributedPlan *distPlan);
+static List * CreateTargetListForCombineQuery(List *targetList);
 static DeferredErrorMessage * DistributedInsertSelectSupported(Query *queryTree,
 															   RangeTblEntry *insertRte,
 															   RangeTblEntry *subqueryRte,
@@ -62,31 +84,37 @@ static DeferredErrorMessage * InsertPartitionColumnMatchesSelect(Query *query,
 																 subqueryRte,
 																 Oid *
 																 selectPartitionColumnTableId);
-static DistributedPlan * CreateCoordinatorInsertSelectPlan(uint64 planId, Query *parse);
-static DeferredErrorMessage * CoordinatorInsertSelectSupported(Query *insertSelectQuery);
-static Query * WrapSubquery(Query *subquery);
-static bool CheckInsertSelectQuery(Query *query);
-static List * TwoPhaseInsertSelectTaskList(Oid targetRelationId, Query *insertSelectQuery,
-										   char *resultIdPrefix);
+static DistributedPlan * CreateNonPushableInsertSelectPlan(uint64 planId, Query *parse,
+														   ParamListInfo boundParams);
+static DeferredErrorMessage * NonPushableInsertSelectSupported(Query *insertSelectQuery);
+static void RelabelTargetEntryList(List *selectTargetList, List *insertTargetList);
+static List * AddInsertSelectCasts(List *insertTargetList, List *selectTargetList,
+								   Oid targetRelationId);
+static Expr * CastExpr(Expr *expr, Oid sourceType, Oid targetType, Oid targetCollation,
+					   int targetTypeMod);
+
+
+/* depth of current insert/select planner. */
+static int insertSelectPlannerLevel = 0;
 
 
 /*
- * InsertSelectIntoDistributedTable returns true when the input query is an
- * INSERT INTO ... SELECT kind of query and the target is a distributed
+ * InsertSelectIntoCitusTable returns true when the input query is an
+ * INSERT INTO ... SELECT kind of query and the target is a citus
  * table.
  *
  * Note that the input query should be the original parsetree of
  * the query (i.e., not passed trough the standard planner).
  */
 bool
-InsertSelectIntoDistributedTable(Query *query)
+InsertSelectIntoCitusTable(Query *query)
 {
 	bool insertSelectQuery = CheckInsertSelectQuery(query);
 
 	if (insertSelectQuery)
 	{
-		RangeTblEntry *insertRte = ExtractInsertRangeTableEntry(query);
-		if (IsDistributedTable(insertRte->relid))
+		RangeTblEntry *insertRte = ExtractResultRelationRTE(query);
+		if (IsCitusTable(insertRte->relid))
 		{
 			return true;
 		}
@@ -108,8 +136,8 @@ InsertSelectIntoLocalTable(Query *query)
 
 	if (insertSelectQuery)
 	{
-		RangeTblEntry *insertRte = ExtractInsertRangeTableEntry(query);
-		if (!IsDistributedTable(insertRte->relid))
+		RangeTblEntry *insertRte = ExtractResultRelationRTE(query);
+		if (!IsCitusTable(insertRte->relid))
 		{
 			return true;
 		}
@@ -126,13 +154,10 @@ InsertSelectIntoLocalTable(Query *query)
  * This function is inspired from getInsertSelectQuery() on
  * rewrite/rewriteManip.c.
  */
-static bool
+bool
 CheckInsertSelectQuery(Query *query)
 {
 	CmdType commandType = query->commandType;
-	List *fromList = NULL;
-	RangeTblRef *rangeTableReference = NULL;
-	RangeTblEntry *subqueryRte = NULL;
 
 	if (commandType != CMD_INSERT)
 	{
@@ -144,19 +169,19 @@ CheckInsertSelectQuery(Query *query)
 		return false;
 	}
 
-	fromList = query->jointree->fromlist;
+	List *fromList = query->jointree->fromlist;
 	if (list_length(fromList) != 1)
 	{
 		return false;
 	}
 
-	rangeTableReference = linitial(fromList);
+	RangeTblRef *rangeTableReference = linitial(fromList);
 	if (!IsA(rangeTableReference, RangeTblRef))
 	{
 		return false;
 	}
 
-	subqueryRte = rt_fetch(rangeTableReference->rtindex, query->rtable);
+	RangeTblEntry *subqueryRte = rt_fetch(rangeTableReference->rtindex, query->rtable);
 	if (subqueryRte->rtekind != RTE_SUBQUERY)
 	{
 		return false;
@@ -170,34 +195,66 @@ CheckInsertSelectQuery(Query *query)
 
 
 /*
+ * CoordinatorInsertSelectExecScan is a wrapper around
+ * CoordinatorInsertSelectExecScanInternal which also properly increments
+ * or decrements insertSelectExecutorLevel.
+ */
+DistributedPlan *
+CreateInsertSelectPlan(uint64 planId, Query *originalQuery,
+					   PlannerRestrictionContext *plannerRestrictionContext,
+					   ParamListInfo boundParams)
+{
+	DistributedPlan *result = NULL;
+	insertSelectPlannerLevel++;
+
+	PG_TRY();
+	{
+		result = CreateInsertSelectPlanInternal(planId, originalQuery,
+												plannerRestrictionContext, boundParams);
+	}
+	PG_CATCH();
+	{
+		insertSelectPlannerLevel--;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	insertSelectPlannerLevel--;
+	return result;
+}
+
+
+/*
  * CreateInsertSelectPlan tries to create a distributed plan for an
  * INSERT INTO distributed_table SELECT ... query by push down the
  * command to the workers and if that is not possible it creates a
  * plan for evaluating the SELECT on the coordinator.
  */
-DistributedPlan *
-CreateInsertSelectPlan(uint64 planId, Query *originalQuery,
-					   PlannerRestrictionContext *plannerRestrictionContext)
+static DistributedPlan *
+CreateInsertSelectPlanInternal(uint64 planId, Query *originalQuery,
+							   PlannerRestrictionContext *plannerRestrictionContext,
+							   ParamListInfo boundParams)
 {
-	DistributedPlan *distributedPlan = NULL;
-	DeferredErrorMessage *deferredError = NULL;
-
-	deferredError = ErrorIfOnConflictNotSupported(originalQuery);
+	DeferredErrorMessage *deferredError = ErrorIfOnConflictNotSupported(originalQuery);
 	if (deferredError != NULL)
 	{
 		/* raising the error as there is no possible solution for the unsupported on conflict statements */
 		RaiseDeferredError(deferredError, ERROR);
 	}
 
-	distributedPlan = CreateDistributedInsertSelectPlan(originalQuery,
-														plannerRestrictionContext);
+	DistributedPlan *distributedPlan = CreateDistributedInsertSelectPlan(originalQuery,
+																		 plannerRestrictionContext);
 
 	if (distributedPlan->planningError != NULL)
 	{
 		RaiseDeferredError(distributedPlan->planningError, DEBUG1);
 
-		/* if INSERT..SELECT cannot be distributed, pull to coordinator */
-		distributedPlan = CreateCoordinatorInsertSelectPlan(planId, originalQuery);
+		/*
+		 * If INSERT..SELECT cannot be distributed, pull to coordinator or use
+		 * repartitioning.
+		 */
+		distributedPlan = CreateNonPushableInsertSelectPlan(planId, originalQuery,
+															boundParams);
 	}
 
 	return distributedPlan;
@@ -206,7 +263,7 @@ CreateInsertSelectPlan(uint64 planId, Query *originalQuery,
 
 /*
  * CreateDistributedInsertSelectPlan creates a DistributedPlan for distributed
- * INSERT ... SELECT queries which could consists of multiple tasks.
+ * INSERT ... SELECT queries which could consist of multiple tasks.
  *
  * The function never returns NULL, it errors out if cannot create the DistributedPlan.
  */
@@ -214,23 +271,20 @@ static DistributedPlan *
 CreateDistributedInsertSelectPlan(Query *originalQuery,
 								  PlannerRestrictionContext *plannerRestrictionContext)
 {
-	int shardOffset = 0;
 	List *sqlTaskList = NIL;
 	uint32 taskIdIndex = 1;     /* 0 is reserved for invalid taskId */
-	Job *workerJob = NULL;
 	uint64 jobId = INVALID_JOB_ID;
 	DistributedPlan *distributedPlan = CitusMakeNode(DistributedPlan);
-	RangeTblEntry *insertRte = ExtractInsertRangeTableEntry(originalQuery);
+	RangeTblEntry *insertRte = ExtractResultRelationRTEOrError(originalQuery);
 	RangeTblEntry *subqueryRte = ExtractSelectRangeTableEntry(originalQuery);
 	Oid targetRelationId = insertRte->relid;
-	DistTableCacheEntry *targetCacheEntry = DistributedTableCacheEntry(targetRelationId);
+	CitusTableCacheEntry *targetCacheEntry = GetCitusTableCacheEntry(targetRelationId);
 	int shardCount = targetCacheEntry->shardIntervalArrayLength;
 	RelationRestrictionContext *relationRestrictionContext =
 		plannerRestrictionContext->relationRestrictionContext;
 	bool allReferenceTables = relationRestrictionContext->allReferenceTables;
-	bool allDistributionKeysInQueryAreEqual = false;
 
-	distributedPlan->operation = originalQuery->commandType;
+	distributedPlan->modLevel = RowModifyLevelForQuery(originalQuery);
 
 	/*
 	 * Error semantics for INSERT ... SELECT queries are different than regular
@@ -245,7 +299,7 @@ CreateDistributedInsertSelectPlan(Query *originalQuery,
 		return distributedPlan;
 	}
 
-	allDistributionKeysInQueryAreEqual =
+	bool allDistributionKeysInQueryAreEqual =
 		AllDistributionKeysInQueryAreEqual(originalQuery, plannerRestrictionContext);
 
 	/*
@@ -257,19 +311,24 @@ CreateDistributedInsertSelectPlan(Query *originalQuery,
 	 * the current shard boundaries. Finally, perform the normal shard pruning to
 	 * decide on whether to push the query to the current shard or not.
 	 */
-	for (shardOffset = 0; shardOffset < shardCount; shardOffset++)
+	for (int shardOffset = 0; shardOffset < shardCount; shardOffset++)
 	{
 		ShardInterval *targetShardInterval =
 			targetCacheEntry->sortedShardIntervalArray[shardOffset];
-		Task *modifyTask = NULL;
 
-		modifyTask = RouterModifyTaskForShardInterval(originalQuery, targetShardInterval,
-													  plannerRestrictionContext,
-													  taskIdIndex,
-													  allDistributionKeysInQueryAreEqual);
+		Task *modifyTask = RouterModifyTaskForShardInterval(originalQuery,
+															targetCacheEntry,
+															targetShardInterval,
+															plannerRestrictionContext,
+															taskIdIndex,
+															allDistributionKeysInQueryAreEqual,
+															&distributedPlan->
+															planningError);
 
-		/* Planning error gelmisse return et, ustteki fonksiyona */
-		/* distributed plan gecir */
+		if (distributedPlan->planningError != NULL)
+		{
+			return distributedPlan;
+		}
 
 		/* add the task if it could be created */
 		if (modifyTask != NULL)
@@ -279,30 +338,196 @@ CreateDistributedInsertSelectPlan(Query *originalQuery,
 			sqlTaskList = lappend(sqlTaskList, modifyTask);
 		}
 
-		++taskIdIndex;
+		taskIdIndex++;
 	}
 
 	/* Create the worker job */
-	workerJob = CitusMakeNode(Job);
+	Job *workerJob = CitusMakeNode(Job);
 	workerJob->taskList = sqlTaskList;
 	workerJob->subqueryPushdown = false;
-	workerJob->dependedJobList = NIL;
+	workerJob->dependentJobList = NIL;
 	workerJob->jobId = jobId;
 	workerJob->jobQuery = originalQuery;
-	workerJob->requiresMasterEvaluation = RequiresMasterEvaluation(originalQuery);
+	workerJob->requiresCoordinatorEvaluation =
+		RequiresCoordinatorEvaluation(originalQuery);
 
 	/* and finally the multi plan */
 	distributedPlan->workerJob = workerJob;
-	distributedPlan->masterQuery = NULL;
-	distributedPlan->routerExecutable = true;
-	distributedPlan->hasReturning = false;
-
-	if (list_length(originalQuery->returningList) > 0)
-	{
-		distributedPlan->hasReturning = true;
-	}
+	distributedPlan->combineQuery = NULL;
+	distributedPlan->expectResults = originalQuery->returningList != NIL;
+	distributedPlan->targetRelationId = targetRelationId;
 
 	return distributedPlan;
+}
+
+
+/*
+ * CreateInsertSelectIntoLocalTablePlan creates the plan for INSERT .. SELECT queries
+ * where the selected table is distributed and the inserted table is not.
+ *
+ * To create the plan, this function first creates a distributed plan for the SELECT
+ * part. Then puts it as a subquery to the original (non-distributed) INSERT query as
+ * a subquery. Finally, it puts this INSERT query, which now has a distributed SELECT
+ * subquery, in the combineQuery.
+ *
+ * If the SELECT query is a router query, whose distributed plan does not have a
+ * combineQuery, this function also creates a dummy combineQuery for that.
+ */
+DistributedPlan *
+CreateInsertSelectIntoLocalTablePlan(uint64 planId, Query *originalQuery, ParamListInfo
+									 boundParams, bool hasUnresolvedParams,
+									 PlannerRestrictionContext *plannerRestrictionContext)
+{
+	RangeTblEntry *selectRte = ExtractSelectRangeTableEntry(originalQuery);
+
+	Query *selectQuery = BuildSelectForInsertSelect(originalQuery);
+	originalQuery->cteList = NIL;
+	DistributedPlan *distPlan = CreateDistributedPlan(planId, selectQuery,
+													  copyObject(selectQuery),
+													  boundParams, hasUnresolvedParams,
+													  plannerRestrictionContext);
+
+	/*
+	 * We don't expect distPlan to be NULL here because hasUnresolvedParams is
+	 * already checked before this function and CreateDistributedPlan only returns
+	 * NULL when there are unresolved parameters.
+	 */
+	Assert(distPlan != NULL);
+
+	if (distPlan->planningError)
+	{
+		return distPlan;
+	}
+
+	if (distPlan->combineQuery == NULL)
+	{
+		/*
+		 * For router queries, we construct a synthetic master query that simply passes
+		 * on the results of the remote tasks, which we can then use as the select in
+		 * the INSERT .. SELECT.
+		 */
+		distPlan->combineQuery = CreateCombineQueryForRouterPlan(
+			distPlan);
+	}
+
+	/*
+	 * combineQuery of a distributed select is for combining the results from
+	 * worker nodes on the coordinator node. Putting it as a subquery to the
+	 * INSERT query, causes the INSERT query to insert the combined select value
+	 * from the workers. And making the resulting insert query the combineQuery
+	 * let's us execute this insert command.
+	 *
+	 * So this operation makes the master query insert the result of the
+	 * distributed select instead of returning it.
+	 */
+	selectRte->subquery = distPlan->combineQuery;
+	distPlan->combineQuery = originalQuery;
+
+	return distPlan;
+}
+
+
+/*
+ * CreateCombineQueryForRouterPlan is used for creating a dummy combineQuery
+ * for a router plan, since router plans normally don't have one.
+ */
+static Query *
+CreateCombineQueryForRouterPlan(DistributedPlan *distPlan)
+{
+	const Index insertTableId = 1;
+	List *tableIdList = list_make1(makeInteger(insertTableId));
+	Job *dependentJob = distPlan->workerJob;
+	List *dependentTargetList = dependentJob->jobQuery->targetList;
+
+	/* compute column names for the derived table */
+	uint32 columnCount = (uint32) list_length(dependentTargetList);
+	List *columnNameList = DerivedColumnNameList(columnCount,
+												 dependentJob->jobId);
+
+	List *funcColumnNames = NIL;
+	List *funcColumnTypes = NIL;
+	List *funcColumnTypeMods = NIL;
+	List *funcCollations = NIL;
+
+	TargetEntry *targetEntry = NULL;
+	foreach_ptr(targetEntry, dependentTargetList)
+	{
+		Node *expr = (Node *) targetEntry->expr;
+
+		char *name = targetEntry->resname;
+		if (name == NULL)
+		{
+			name = pstrdup("unnamed");
+		}
+
+		funcColumnNames = lappend(funcColumnNames, makeString(name));
+
+		funcColumnTypes = lappend_oid(funcColumnTypes, exprType(expr));
+		funcColumnTypeMods = lappend_int(funcColumnTypeMods, exprTypmod(expr));
+		funcCollations = lappend_oid(funcCollations, exprCollation(expr));
+	}
+
+	RangeTblEntry *rangeTableEntry = DerivedRangeTableEntry(NULL,
+															columnNameList,
+															tableIdList,
+															funcColumnNames,
+															funcColumnTypes,
+															funcColumnTypeMods,
+															funcCollations);
+
+	List *targetList = CreateTargetListForCombineQuery(dependentTargetList);
+
+	RangeTblRef *rangeTableRef = makeNode(RangeTblRef);
+	rangeTableRef->rtindex = 1;
+
+	FromExpr *joinTree = makeNode(FromExpr);
+	joinTree->quals = NULL;
+	joinTree->fromlist = list_make1(rangeTableRef);
+
+	Query *combineQuery = makeNode(Query);
+	combineQuery->commandType = CMD_SELECT;
+	combineQuery->querySource = QSRC_ORIGINAL;
+	combineQuery->canSetTag = true;
+	combineQuery->rtable = list_make1(rangeTableEntry);
+	combineQuery->targetList = targetList;
+	combineQuery->jointree = joinTree;
+	return combineQuery;
+}
+
+
+/*
+ * CreateTargetListForCombineQuery is used for creating a target list for
+ * master query.
+ */
+static List *
+CreateTargetListForCombineQuery(List *targetList)
+{
+	List *newTargetEntryList = NIL;
+	const uint32 masterTableId = 1;
+	int columnId = 1;
+
+	/* iterate over original target entries */
+	TargetEntry *originalTargetEntry = NULL;
+	foreach_ptr(originalTargetEntry, targetList)
+	{
+		TargetEntry *newTargetEntry = flatCopyTargetEntry(originalTargetEntry);
+
+		Var *column = makeVarFromTargetEntry(masterTableId, originalTargetEntry);
+		column->varattno = columnId;
+		column->varattnosyn = columnId;
+		columnId++;
+
+		if (column->vartype == RECORDOID || column->vartype == RECORDARRAYOID)
+		{
+			column->vartypmod = BlessRecordExpression(originalTargetEntry->expr);
+		}
+
+		Expr *newExpression = (Expr *) column;
+
+		newTargetEntry->expr = newExpression;
+		newTargetEntryList = lappend(newTargetEntryList, newTargetEntry);
+	}
+	return newTargetEntryList;
 }
 
 
@@ -314,17 +539,14 @@ static DeferredErrorMessage *
 DistributedInsertSelectSupported(Query *queryTree, RangeTblEntry *insertRte,
 								 RangeTblEntry *subqueryRte, bool allReferenceTables)
 {
-	Query *subquery = NULL;
 	Oid selectPartitionColumnTableId = InvalidOid;
 	Oid targetRelationId = insertRte->relid;
-	char targetPartitionMethod = PartitionMethod(targetRelationId);
 	ListCell *rangeTableCell = NULL;
-	DeferredErrorMessage *error = NULL;
 
 	/* we only do this check for INSERT ... SELECT queries */
-	AssertArg(InsertSelectIntoDistributedTable(queryTree));
+	AssertArg(InsertSelectIntoCitusTable(queryTree));
 
-	subquery = subqueryRte->subquery;
+	Query *subquery = subqueryRte->subquery;
 
 	if (!NeedsDistributedPlanning(subquery))
 	{
@@ -332,6 +554,40 @@ DistributedInsertSelectSupported(Query *queryTree, RangeTblEntry *insertRte,
 							 "distributed INSERT ... SELECT can only select from "
 							 "distributed tables",
 							 NULL, NULL);
+	}
+
+	RTEListProperties *subqueryRteListProperties = GetRTEListPropertiesForQuery(subquery);
+	if (subqueryRteListProperties->hasDistributedTable &&
+		(subqueryRteListProperties->hasCitusLocalTable ||
+		 subqueryRteListProperties->hasPostgresLocalTable))
+	{
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 "distributed INSERT ... SELECT cannot select from "
+							 "distributed tables and local tables at the same time",
+							 NULL, NULL);
+	}
+
+	if (subqueryRteListProperties->hasDistributedTable &&
+		IsCitusTableType(targetRelationId, CITUS_LOCAL_TABLE))
+	{
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 "distributed INSERT ... SELECT cannot insert into a "
+							 "local table that is added to metadata",
+							 NULL, NULL);
+	}
+
+	/*
+	 * In some cases, it might be possible to allow postgres local tables
+	 * in distributed insert select. However, we want to behave consistent
+	 * on all cases including Citus MX, and let insert select via coordinator
+	 * to kick-in.
+	 */
+	if (subqueryRteListProperties->hasPostgresLocalTable)
+	{
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 "distributed INSERT ... SELECT cannot select from "
+							 "a local table", NULL, NULL);
+		return NULL;
 	}
 
 	/* we do not expect to see a view in modify target */
@@ -347,7 +603,7 @@ DistributedInsertSelectSupported(Query *queryTree, RangeTblEntry *insertRte,
 		}
 	}
 
-	if (FindNodeCheck((Node *) queryTree, CitusIsVolatileFunction))
+	if (FindNodeMatchingCheckFunction((Node *) queryTree, CitusIsVolatileFunction))
 	{
 		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
 							 "volatile functions are not allowed in distributed "
@@ -356,18 +612,25 @@ DistributedInsertSelectSupported(Query *queryTree, RangeTblEntry *insertRte,
 	}
 
 	/* we don't support LIMIT, OFFSET and WINDOW functions */
-	error = MultiTaskRouterSelectQuerySupported(subquery);
+	DeferredErrorMessage *error = MultiTaskRouterSelectQuerySupported(subquery);
 	if (error)
 	{
 		return error;
 	}
 
-	/*
-	 * If we're inserting into a reference table, all participating tables
-	 * should be reference tables as well.
-	 */
-	if (targetPartitionMethod == DISTRIBUTE_BY_NONE)
+	if (IsCitusTableType(targetRelationId, CITUS_LOCAL_TABLE))
 	{
+		/*
+		 * If we're inserting into a citus local table, it is ok because we've
+		 * checked the non-existence of distributed tables in the subquery.
+		 */
+	}
+	else if (IsCitusTableType(targetRelationId, REFERENCE_TABLE))
+	{
+		/*
+		 * If we're inserting into a reference table, all participating tables
+		 * should be reference tables as well.
+		 */
 		if (!allReferenceTables)
 		{
 			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
@@ -416,39 +679,36 @@ DistributedInsertSelectSupported(Query *queryTree, RangeTblEntry *insertRte,
  * subqueries with non equi-joins.).
  */
 static Task *
-RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInterval,
+RouterModifyTaskForShardInterval(Query *originalQuery,
+								 CitusTableCacheEntry *targetTableCacheEntry,
+								 ShardInterval *shardInterval,
 								 PlannerRestrictionContext *plannerRestrictionContext,
 								 uint32 taskIdIndex,
-								 bool safeToPushdownSubquery)
+								 bool safeToPushdownSubquery,
+								 DeferredErrorMessage **routerPlannerError)
 {
 	Query *copiedQuery = copyObject(originalQuery);
-	RangeTblEntry *copiedInsertRte = ExtractInsertRangeTableEntry(copiedQuery);
+	RangeTblEntry *copiedInsertRte = ExtractResultRelationRTEOrError(copiedQuery);
 	RangeTblEntry *copiedSubqueryRte = ExtractSelectRangeTableEntry(copiedQuery);
 	Query *copiedSubquery = (Query *) copiedSubqueryRte->subquery;
 
 	uint64 shardId = shardInterval->shardId;
 	Oid distributedTableId = shardInterval->relationId;
-	DistTableCacheEntry *cacheEntry = DistributedTableCacheEntry(distributedTableId);
 
 	PlannerRestrictionContext *copyOfPlannerRestrictionContext = palloc0(
 		sizeof(PlannerRestrictionContext));
 
 	StringInfo queryString = makeStringInfo();
 	ListCell *restrictionCell = NULL;
-	Task *modifyTask = NULL;
 	List *selectPlacementList = NIL;
 	uint64 selectAnchorShardId = INVALID_SHARD_ID;
 	List *relationShardList = NIL;
+	List *prunedShardIntervalListList = NIL;
 	uint64 jobId = INVALID_JOB_ID;
-	List *insertShardPlacementList = NULL;
-	List *intersectedPlacementList = NULL;
-	bool upsertQuery = false;
-	bool replacePrunedQueryWithDummy = false;
 	bool allReferenceTables =
 		plannerRestrictionContext->relationRestrictionContext->allReferenceTables;
 	List *shardOpExpressions = NIL;
 	RestrictInfo *shardRestrictionList = NULL;
-	DeferredErrorMessage *planningError = NULL;
 	bool multiShardModifyQuery = false;
 	List *relationRestrictionList = NIL;
 
@@ -457,6 +717,9 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
 			plannerRestrictionContext->relationRestrictionContext);
 	copyOfPlannerRestrictionContext->joinRestrictionContext =
 		plannerRestrictionContext->joinRestrictionContext;
+	copyOfPlannerRestrictionContext->fastPathRestrictionContext =
+		plannerRestrictionContext->fastPathRestrictionContext;
+
 	relationRestrictionList =
 		copyOfPlannerRestrictionContext->relationRestrictionContext->
 		relationRestrictionList;
@@ -496,7 +759,7 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
 	}
 
 	/*
-	 * We also need to add  shard interval range to the subquery in case
+	 * We also need to add shard interval range to the subquery in case
 	 * the partition qual not distributed all tables such as some
 	 * subqueries in WHERE clause.
 	 *
@@ -504,32 +767,37 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
 	 * prevent shard pruning logic (i.e, namely UpdateRelationNames())
 	 * modifies range table entries, which makes hard to add the quals.
 	 */
-	if (!allReferenceTables)
+	RTEListProperties *subqueryRteListProperties = GetRTEListPropertiesForQuery(
+		copiedSubquery);
+	if (subqueryRteListProperties->hasDistributedTable)
 	{
-		AddShardIntervalRestrictionToSelect(copiedSubquery, shardInterval);
+		AddPartitionKeyNotNullFilterToSelect(copiedSubquery);
 	}
 
 	/* mark that we don't want the router planner to generate dummy hosts/queries */
-	replacePrunedQueryWithDummy = false;
+	bool replacePrunedQueryWithDummy = false;
 
 	/*
 	 * Use router planner to decide on whether we can push down the query or not.
 	 * If we can, we also rely on the side-effects that all RTEs have been updated
 	 * to point to the relevant nodes and selectPlacementList is determined.
 	 */
-	planningError = PlanRouterQuery(copiedSubquery, copyOfPlannerRestrictionContext,
-									&selectPlacementList, &selectAnchorShardId,
-									&relationShardList, replacePrunedQueryWithDummy,
-									&multiShardModifyQuery, NULL);
+	DeferredErrorMessage *planningError = PlanRouterQuery(copiedSubquery,
+														  copyOfPlannerRestrictionContext,
+														  &selectPlacementList,
+														  &selectAnchorShardId,
+														  &relationShardList,
+														  &prunedShardIntervalListList,
+														  replacePrunedQueryWithDummy,
+														  &multiShardModifyQuery, NULL,
+														  false);
 
 	Assert(!multiShardModifyQuery);
 
 	if (planningError)
 	{
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("cannot perform distributed planning for the given "
-							   "modification"),
-						errdetail("Select query cannot be pushed down to the worker.")));
+		*routerPlannerError = planningError;
+		return NULL;
 	}
 
 
@@ -544,9 +812,9 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
 	}
 
 	/* get the placements for insert target shard and its intersection with select */
-	insertShardPlacementList = FinalizedShardPlacementList(shardId);
-	intersectedPlacementList = IntersectPlacementList(insertShardPlacementList,
-													  selectPlacementList);
+	List *insertShardPlacementList = ActiveShardPlacementList(shardId);
+	List *intersectedPlacementList = IntersectPlacementList(insertShardPlacementList,
+															selectPlacementList);
 
 	/*
 	 * If insert target does not have exactly the same placements with the select,
@@ -565,12 +833,6 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
 	/* this is required for correct deparsing of the query */
 	ReorderInsertSelectTargetLists(copiedQuery, copiedInsertRte, copiedSubqueryRte);
 
-	/* set the upsert flag */
-	if (originalQuery->onConflict != NULL)
-	{
-		upsertQuery = true;
-	}
-
 	/* setting an alias simplifies deparsing of RETURNING */
 	if (copiedInsertRte->alias == NULL)
 	{
@@ -584,13 +846,13 @@ RouterModifyTaskForShardInterval(Query *originalQuery, ShardInterval *shardInter
 	ereport(DEBUG2, (errmsg("distributed statement: %s",
 							ApplyLogRedaction(queryString->data))));
 
-	modifyTask = CreateBasicTask(jobId, taskIdIndex, MODIFY_TASK, queryString->data);
-	modifyTask->dependedTaskList = NULL;
+	Task *modifyTask = CreateBasicTask(jobId, taskIdIndex, MODIFY_TASK,
+									   queryString->data);
+	modifyTask->dependentTaskList = NULL;
 	modifyTask->anchorShardId = shardId;
 	modifyTask->taskPlacementList = insertShardPlacementList;
-	modifyTask->upsertQuery = upsertQuery;
 	modifyTask->relationShardList = relationShardList;
-	modifyTask->replicationModel = cacheEntry->replicationModel;
+	modifyTask->replicationModel = targetTableCacheEntry->replicationModel;
 
 	return modifyTask;
 }
@@ -611,21 +873,18 @@ Query *
 ReorderInsertSelectTargetLists(Query *originalQuery, RangeTblEntry *insertRte,
 							   RangeTblEntry *subqueryRte)
 {
-	Query *subquery = NULL;
 	ListCell *insertTargetEntryCell;
 	List *newSubqueryTargetlist = NIL;
 	List *newInsertTargetlist = NIL;
 	int resno = 1;
 	Index insertTableId = 1;
-	Oid insertRelationId = InvalidOid;
-	int subqueryTargetLength = 0;
 	int targetEntryIndex = 0;
 
-	AssertArg(InsertSelectIntoDistributedTable(originalQuery));
+	AssertArg(InsertSelectIntoCitusTable(originalQuery));
 
-	subquery = subqueryRte->subquery;
+	Query *subquery = subqueryRte->subquery;
 
-	insertRelationId = insertRte->relid;
+	Oid insertRelationId = insertRte->relid;
 
 	/*
 	 * We implement the following algorithm for the reoderding:
@@ -641,11 +900,7 @@ ReorderInsertSelectTargetLists(Query *originalQuery, RangeTblEntry *insertRte,
 	foreach(insertTargetEntryCell, originalQuery->targetList)
 	{
 		TargetEntry *oldInsertTargetEntry = lfirst(insertTargetEntryCell);
-		TargetEntry *newInsertTargetEntry = NULL;
-		Var *newInsertVar = NULL;
 		TargetEntry *newSubqueryTargetEntry = NULL;
-		List *targetVarList = NULL;
-		int targetVarCount = 0;
 		AttrNumber originalAttrNo = get_attnum(insertRelationId,
 											   oldInsertTargetEntry->resname);
 
@@ -664,10 +919,10 @@ ReorderInsertSelectTargetLists(Query *originalQuery, RangeTblEntry *insertRte,
 		 * It is safe to pull Var clause and ignore the coercions since that
 		 * are already going to be added on the workers implicitly.
 		 */
-		targetVarList = pull_var_clause((Node *) oldInsertTargetEntry->expr,
-										PVC_RECURSE_AGGREGATES);
+		List *targetVarList = pull_var_clause((Node *) oldInsertTargetEntry->expr,
+											  PVC_RECURSE_AGGREGATES);
 
-		targetVarCount = list_length(targetVarList);
+		int targetVarCount = list_length(targetVarList);
 
 		/* a single INSERT target entry cannot have more than one Var */
 		Assert(targetVarCount <= 1);
@@ -701,14 +956,15 @@ ReorderInsertSelectTargetLists(Query *originalQuery, RangeTblEntry *insertRte,
 		 */
 		Assert(!newSubqueryTargetEntry->resjunk);
 
-		newInsertVar = makeVar(insertTableId, originalAttrNo,
-							   exprType((Node *) newSubqueryTargetEntry->expr),
-							   exprTypmod((Node *) newSubqueryTargetEntry->expr),
-							   exprCollation((Node *) newSubqueryTargetEntry->expr),
-							   0);
-		newInsertTargetEntry = makeTargetEntry((Expr *) newInsertVar, originalAttrNo,
-											   oldInsertTargetEntry->resname,
-											   oldInsertTargetEntry->resjunk);
+		Var *newInsertVar = makeVar(insertTableId, originalAttrNo,
+									exprType((Node *) newSubqueryTargetEntry->expr),
+									exprTypmod((Node *) newSubqueryTargetEntry->expr),
+									exprCollation((Node *) newSubqueryTargetEntry->expr),
+									0);
+		TargetEntry *newInsertTargetEntry = makeTargetEntry((Expr *) newInsertVar,
+															originalAttrNo,
+															oldInsertTargetEntry->resname,
+															oldInsertTargetEntry->resjunk);
 
 		newInsertTargetlist = lappend(newInsertTargetlist, newInsertTargetEntry);
 		resno++;
@@ -718,12 +974,11 @@ ReorderInsertSelectTargetLists(Query *originalQuery, RangeTblEntry *insertRte,
 	 * if there are any remaining target list entries (i.e., GROUP BY column not on the
 	 * target list of subquery), update the remaining resnos.
 	 */
-	subqueryTargetLength = list_length(subquery->targetList);
+	int subqueryTargetLength = list_length(subquery->targetList);
 	for (; targetEntryIndex < subqueryTargetLength; ++targetEntryIndex)
 	{
 		TargetEntry *oldSubqueryTle = list_nth(subquery->targetList,
 											   targetEntryIndex);
-		TargetEntry *newSubqueryTargetEntry = NULL;
 
 		/*
 		 * Skip non-junk entries since we've already processed them above and this
@@ -734,7 +989,7 @@ ReorderInsertSelectTargetLists(Query *originalQuery, RangeTblEntry *insertRte,
 			continue;
 		}
 
-		newSubqueryTargetEntry = copyObject(oldSubqueryTle);
+		TargetEntry *newSubqueryTargetEntry = copyObject(oldSubqueryTle);
 
 		newSubqueryTargetEntry->resno = resno;
 		newSubqueryTargetlist = lappend(newSubqueryTargetlist,
@@ -770,7 +1025,7 @@ MultiTaskRouterSelectQuerySupported(Query *query)
 		Assert(subquery->commandType == CMD_SELECT);
 
 		/* pushing down rtes without relations yields (shardCount * expectedRows) */
-		if (subquery->rtable == NIL)
+		if (HasEmptyJoinTree(subquery))
 		{
 			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
 								 "Subqueries without relations are not allowed in "
@@ -919,13 +1174,8 @@ InsertPartitionColumnMatchesSelect(Query *query, RangeTblEntry *insertRte,
 	{
 		TargetEntry *targetEntry = (TargetEntry *) lfirst(targetEntryCell);
 		List *insertTargetEntryColumnList = pull_var_clause_default((Node *) targetEntry);
-		Var *insertVar = NULL;
-		AttrNumber originalAttrNo = InvalidAttrNumber;
-		TargetEntry *subqueryTargetEntry = NULL;
-		Expr *selectTargetExpr = NULL;
 		Oid subqueryPartitionColumnRelationId = InvalidOid;
 		Var *subqueryPartitionColumn = NULL;
-		List *parentQueryList = NIL;
 
 		/*
 		 * We only consider target entries that include a single column. Note that this
@@ -940,8 +1190,8 @@ InsertPartitionColumnMatchesSelect(Query *query, RangeTblEntry *insertRte,
 			continue;
 		}
 
-		insertVar = (Var *) linitial(insertTargetEntryColumnList);
-		originalAttrNo = targetEntry->resno;
+		Var *insertVar = (Var *) linitial(insertTargetEntryColumnList);
+		AttrNumber originalAttrNo = targetEntry->resno;
 
 		/* skip processing of target table non-partition columns */
 		if (originalAttrNo != insertPartitionColumn->varattno)
@@ -952,11 +1202,11 @@ InsertPartitionColumnMatchesSelect(Query *query, RangeTblEntry *insertRte,
 		/* INSERT query includes the partition column */
 		targetTableHasPartitionColumn = true;
 
-		subqueryTargetEntry = list_nth(subquery->targetList,
-									   insertVar->varattno - 1);
-		selectTargetExpr = subqueryTargetEntry->expr;
+		TargetEntry *subqueryTargetEntry = list_nth(subquery->targetList,
+													insertVar->varattno - 1);
+		Expr *selectTargetExpr = subqueryTargetEntry->expr;
 
-		parentQueryList = list_make2(query, subquery);
+		List *parentQueryList = list_make2(query, subquery);
 		FindReferencedTableColumn(selectTargetExpr,
 								  parentQueryList, subquery,
 								  &subqueryPartitionColumnRelationId,
@@ -1127,95 +1377,73 @@ InsertPartitionColumnMatchesSelect(Query *query, RangeTblEntry *insertRte,
 
 
 /*
- * CreateCoordinatorInsertSelectPlan creates a query plan for a SELECT into a
+ * CreateNonPushableInsertSelectPlan creates a query plan for a SELECT into a
  * distributed table. The query plan can also be executed on a worker in MX.
  */
 static DistributedPlan *
-CreateCoordinatorInsertSelectPlan(uint64 planId, Query *parse)
+CreateNonPushableInsertSelectPlan(uint64 planId, Query *parse, ParamListInfo boundParams)
 {
 	Query *insertSelectQuery = copyObject(parse);
-	Query *selectQuery = NULL;
 
 	RangeTblEntry *selectRte = ExtractSelectRangeTableEntry(insertSelectQuery);
-	RangeTblEntry *insertRte = ExtractInsertRangeTableEntry(insertSelectQuery);
+	RangeTblEntry *insertRte = ExtractResultRelationRTEOrError(insertSelectQuery);
 	Oid targetRelationId = insertRte->relid;
 
 	DistributedPlan *distributedPlan = CitusMakeNode(DistributedPlan);
-	distributedPlan->operation = CMD_INSERT;
+	distributedPlan->modLevel = RowModifyLevelForQuery(insertSelectQuery);
 
 	distributedPlan->planningError =
-		CoordinatorInsertSelectSupported(insertSelectQuery);
+		NonPushableInsertSelectSupported(insertSelectQuery);
 
 	if (distributedPlan->planningError != NULL)
 	{
 		return distributedPlan;
 	}
 
-	selectQuery = selectRte->subquery;
-
-	/*
-	 * Wrap the SELECT as a subquery if the INSERT...SELECT has CTEs or the SELECT
-	 * has top-level set operations.
-	 *
-	 * We could simply wrap all queries, but that might create a subquery that is
-	 * not supported by the logical planner. Since the logical planner also does
-	 * not support CTEs and top-level set operations, we can wrap queries containing
-	 * those without breaking anything.
-	 */
-	if (list_length(insertSelectQuery->cteList) > 0)
-	{
-		selectQuery = WrapSubquery(selectRte->subquery);
-
-		/* copy CTEs from the INSERT ... SELECT statement into outer SELECT */
-		selectQuery->cteList = copyObject(insertSelectQuery->cteList);
-		selectQuery->hasModifyingCTE = insertSelectQuery->hasModifyingCTE;
-	}
-	else if (selectQuery->setOperations != NULL)
-	{
-		/* top-level set operations confuse the ReorderInsertSelectTargetLists logic */
-		selectQuery = WrapSubquery(selectRte->subquery);
-	}
+	Query *selectQuery = BuildSelectForInsertSelect(insertSelectQuery);
 
 	selectRte->subquery = selectQuery;
-
 	ReorderInsertSelectTargetLists(insertSelectQuery, insertRte, selectRte);
 
-	if (insertSelectQuery->onConflict || insertSelectQuery->returningList != NIL)
-	{
-		/*
-		 * We cannot perform a COPY operation with RETURNING or ON CONFLICT.
-		 * We therefore perform the INSERT...SELECT in two phases. First we
-		 * copy the result of the SELECT query in a set of intermediate
-		 * results, one for each shard placement in the destination table.
-		 * Second, we perform an INSERT..SELECT..ON CONFLICT/RETURNING from
-		 * the intermediate results into the destination table. This is
-		 * represented in the plan by simply having both an
-		 * insertSelectSubuery and a workerJob to execute afterwards.
-		 */
-		uint64 jobId = INVALID_JOB_ID;
-		Job *workerJob = NULL;
-		List *taskList = NIL;
-		char *resultIdPrefix = InsertSelectResultIdPrefix(planId);
+	/*
+	 * Cast types of insert target list and select projection list to
+	 * match the column types of the target relation.
+	 */
+	selectQuery->targetList =
+		AddInsertSelectCasts(insertSelectQuery->targetList,
+							 selectQuery->targetList,
+							 targetRelationId);
 
-		/* generate tasks for the INSERT..SELECT phase */
-		taskList = TwoPhaseInsertSelectTaskList(targetRelationId, insertSelectQuery,
-												resultIdPrefix);
+	/*
+	 * Later we might need to call WrapTaskListForProjection(), which requires
+	 * that select target list has unique names, otherwise the outer query
+	 * cannot select columns unambiguously. So we relabel select columns to
+	 * match target columns.
+	 */
+	List *insertTargetList = insertSelectQuery->targetList;
+	RelabelTargetEntryList(selectQuery->targetList, insertTargetList);
 
-		workerJob = CitusMakeNode(Job);
-		workerJob->taskList = taskList;
-		workerJob->subqueryPushdown = false;
-		workerJob->dependedJobList = NIL;
-		workerJob->jobId = jobId;
-		workerJob->jobQuery = insertSelectQuery;
-		workerJob->requiresMasterEvaluation = false;
+	/*
+	 * Make a copy of the select query, since following code scribbles it
+	 * but we need to keep the original for EXPLAIN.
+	 */
+	Query *selectQueryCopy = copyObject(selectQuery);
 
-		distributedPlan->workerJob = workerJob;
-		distributedPlan->hasReturning = insertSelectQuery->returningList != NIL;
-		distributedPlan->intermediateResultIdPrefix = resultIdPrefix;
-	}
+	/* plan the subquery, this may be another distributed query */
+	int cursorOptions = CURSOR_OPT_PARALLEL_OK;
+	PlannedStmt *selectPlan = pg_plan_query_compat(selectQueryCopy, NULL, cursorOptions,
+												   boundParams);
 
-	distributedPlan->insertSelectSubquery = selectQuery;
-	distributedPlan->insertTargetList = insertSelectQuery->targetList;
+	bool repartitioned = IsRedistributablePlan(selectPlan->planTree) &&
+						 IsSupportedRedistributionTarget(targetRelationId);
+
+	distributedPlan->insertSelectQuery = insertSelectQuery;
+	distributedPlan->selectPlanForInsertSelect = selectPlan;
+	distributedPlan->insertSelectMethod = repartitioned ?
+										  INSERT_SELECT_REPARTITION :
+										  INSERT_SELECT_VIA_COORDINATOR;
+	distributedPlan->expectResults = insertSelectQuery->returningList != NIL;
+	distributedPlan->intermediateResultIdPrefix = InsertSelectResultIdPrefix(planId);
 	distributedPlan->targetRelationId = targetRelationId;
 
 	return distributedPlan;
@@ -1223,235 +1451,30 @@ CreateCoordinatorInsertSelectPlan(uint64 planId, Query *parse)
 
 
 /*
- * CoordinatorInsertSelectSupported returns an error if executing an
+ * NonPushableInsertSelectSupported returns an error if executing an
  * INSERT ... SELECT command by pulling results of the SELECT to the coordinator
- * is unsupported because it needs to generate sequence values or insert into an
- * append-distributed table.
+ * or with repartitioning is unsupported because it needs to generate sequence
+ * values or insert into an append-distributed table.
  */
 static DeferredErrorMessage *
-CoordinatorInsertSelectSupported(Query *insertSelectQuery)
+NonPushableInsertSelectSupported(Query *insertSelectQuery)
 {
-	RangeTblEntry *insertRte = NULL;
-	RangeTblEntry *subqueryRte = NULL;
-	Query *subquery = NULL;
-	DeferredErrorMessage *deferredError = NULL;
-
-	deferredError = ErrorIfOnConflictNotSupported(insertSelectQuery);
+	DeferredErrorMessage *deferredError = ErrorIfOnConflictNotSupported(
+		insertSelectQuery);
 	if (deferredError)
 	{
 		return deferredError;
 	}
 
-	insertRte = ExtractInsertRangeTableEntry(insertSelectQuery);
-	if (PartitionMethod(insertRte->relid) == DISTRIBUTE_BY_APPEND)
+	RangeTblEntry *insertRte = ExtractResultRelationRTE(insertSelectQuery);
+	if (IsCitusTableType(insertRte->relid, APPEND_DISTRIBUTED))
 	{
 		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
 							 "INSERT ... SELECT into an append-distributed table is "
 							 "not supported", NULL, NULL);
 	}
 
-	subqueryRte = ExtractSelectRangeTableEntry(insertSelectQuery);
-	subquery = (Query *) subqueryRte->subquery;
-
-	if (NeedsDistributedPlanning(subquery) &&
-		contain_nextval_expression_walker((Node *) insertSelectQuery->targetList, NULL))
-	{
-		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-							 "INSERT ... SELECT cannot generate sequence values when "
-							 "selecting from a distributed table",
-							 NULL, NULL);
-	}
-
 	return NULL;
-}
-
-
-/*
- * WrapSubquery wraps the given query as a subquery in a newly constructed
- * "SELECT * FROM (...subquery...) citus_insert_select_subquery" query.
- */
-static Query *
-WrapSubquery(Query *subquery)
-{
-	Query *outerQuery = NULL;
-	ParseState *pstate = make_parsestate(NULL);
-	Alias *selectAlias = NULL;
-	RangeTblEntry *newRangeTableEntry = NULL;
-	RangeTblRef *newRangeTableRef = NULL;
-	ListCell *selectTargetCell = NULL;
-	List *newTargetList = NIL;
-
-	outerQuery = makeNode(Query);
-	outerQuery->commandType = CMD_SELECT;
-
-	/* create range table entries */
-	selectAlias = makeAlias("citus_insert_select_subquery", NIL);
-	newRangeTableEntry = addRangeTableEntryForSubquery(pstate, subquery,
-													   selectAlias, false, true);
-	outerQuery->rtable = list_make1(newRangeTableEntry);
-
-	/* set the FROM expression to the subquery */
-	newRangeTableRef = makeNode(RangeTblRef);
-	newRangeTableRef->rtindex = 1;
-	outerQuery->jointree = makeFromExpr(list_make1(newRangeTableRef), NULL);
-
-	/* create a target list that matches the SELECT */
-	foreach(selectTargetCell, subquery->targetList)
-	{
-		TargetEntry *selectTargetEntry = (TargetEntry *) lfirst(selectTargetCell);
-		Var *newSelectVar = NULL;
-		TargetEntry *newSelectTargetEntry = NULL;
-
-		/* exactly 1 entry in FROM */
-		int indexInRangeTable = 1;
-
-		if (selectTargetEntry->resjunk)
-		{
-			continue;
-		}
-
-		newSelectVar = makeVar(indexInRangeTable, selectTargetEntry->resno,
-							   exprType((Node *) selectTargetEntry->expr),
-							   exprTypmod((Node *) selectTargetEntry->expr),
-							   exprCollation((Node *) selectTargetEntry->expr), 0);
-
-		newSelectTargetEntry = makeTargetEntry((Expr *) newSelectVar,
-											   selectTargetEntry->resno,
-											   selectTargetEntry->resname,
-											   selectTargetEntry->resjunk);
-
-		newTargetList = lappend(newTargetList, newSelectTargetEntry);
-	}
-
-	outerQuery->targetList = newTargetList;
-
-	return outerQuery;
-}
-
-
-/*
- * TwoPhaseInsertSelectTaskList generates a list of tasks for a query that
- * inserts into a target relation and selects from a set of co-located
- * intermediate results.
- */
-static List *
-TwoPhaseInsertSelectTaskList(Oid targetRelationId, Query *insertSelectQuery,
-							 char *resultIdPrefix)
-{
-	List *taskList = NIL;
-
-	/*
-	 * Make a copy of the INSERT ... SELECT. We'll repeatedly replace the
-	 * subquery of insertResultQuery for different intermediate results and
-	 * then deparse it.
-	 */
-	Query *insertResultQuery = copyObject(insertSelectQuery);
-	RangeTblEntry *insertRte = ExtractInsertRangeTableEntry(insertResultQuery);
-	RangeTblEntry *selectRte = ExtractSelectRangeTableEntry(insertResultQuery);
-
-	DistTableCacheEntry *targetCacheEntry = DistributedTableCacheEntry(targetRelationId);
-	int shardCount = targetCacheEntry->shardIntervalArrayLength;
-	int shardOffset = 0;
-	uint32 taskIdIndex = 1;
-	uint64 jobId = INVALID_JOB_ID;
-
-	ListCell *targetEntryCell = NULL;
-	Relation distributedRelation = NULL;
-	TupleDesc destTupleDescriptor = NULL;
-
-	distributedRelation = heap_open(targetRelationId, RowExclusiveLock);
-	destTupleDescriptor = RelationGetDescr(distributedRelation);
-
-	/*
-	 * If the type of insert column and target table's column type is
-	 * different from each other. Cast insert column't type to target
-	 * table's column
-	 */
-	foreach(targetEntryCell, insertSelectQuery->targetList)
-	{
-		TargetEntry *targetEntry = (TargetEntry *) lfirst(targetEntryCell);
-		Var *insertColumn = (Var *) targetEntry->expr;
-		Form_pg_attribute attr = TupleDescAttr(destTupleDescriptor, targetEntry->resno -
-											   1);
-
-		if (insertColumn->vartype != attr->atttypid)
-		{
-			CoerceViaIO *coerceExpr = makeNode(CoerceViaIO);
-			coerceExpr->arg = (Expr *) copyObject(insertColumn);
-			coerceExpr->resulttype = attr->atttypid;
-			coerceExpr->resultcollid = attr->attcollation;
-			coerceExpr->coerceformat = COERCE_IMPLICIT_CAST;
-			coerceExpr->location = -1;
-
-			targetEntry->expr = (Expr *) coerceExpr;
-		}
-	}
-
-	for (shardOffset = 0; shardOffset < shardCount; shardOffset++)
-	{
-		ShardInterval *targetShardInterval =
-			targetCacheEntry->sortedShardIntervalArray[shardOffset];
-		uint64 shardId = targetShardInterval->shardId;
-		List *columnAliasList = NIL;
-		List *insertShardPlacementList = NIL;
-		Query *resultSelectQuery = NULL;
-		StringInfo queryString = makeStringInfo();
-		RelationShard *relationShard = NULL;
-		Task *modifyTask = NULL;
-		StringInfo resultId = makeStringInfo();
-
-		/* during COPY, the shard ID is appended to the result name */
-		appendStringInfo(resultId, "%s_" UINT64_FORMAT, resultIdPrefix, shardId);
-
-		/* generate the query on the intermediate result */
-		resultSelectQuery = BuildSubPlanResultQuery(insertSelectQuery->targetList,
-													columnAliasList, resultId->data);
-
-		/* put the intermediate result query in the INSERT..SELECT */
-		selectRte->subquery = resultSelectQuery;
-
-		/* setting an alias simplifies deparsing of RETURNING */
-		if (insertRte->alias == NULL)
-		{
-			Alias *alias = makeAlias(CITUS_TABLE_ALIAS, NIL);
-			insertRte->alias = alias;
-		}
-
-		/*
-		 * Generate a query string for the query that inserts into a shard and reads
-		 * from an intermediate result.
-		 *
-		 * Since CTEs have already been converted to intermediate results, they need
-		 * to removed from the query. Otherwise, worker queries include both
-		 * intermediate results and CTEs in the query.
-		 */
-		insertResultQuery->cteList = NIL;
-		deparse_shard_query(insertResultQuery, targetRelationId, shardId, queryString);
-		ereport(DEBUG2, (errmsg("distributed statement: %s", queryString->data)));
-
-		LockShardDistributionMetadata(shardId, ShareLock);
-		insertShardPlacementList = FinalizedShardPlacementList(shardId);
-
-		relationShard = CitusMakeNode(RelationShard);
-		relationShard->relationId = targetShardInterval->relationId;
-		relationShard->shardId = targetShardInterval->shardId;
-
-		modifyTask = CreateBasicTask(jobId, taskIdIndex, MODIFY_TASK, queryString->data);
-		modifyTask->dependedTaskList = NULL;
-		modifyTask->anchorShardId = shardId;
-		modifyTask->taskPlacementList = insertShardPlacementList;
-		modifyTask->upsertQuery = insertResultQuery->onConflict != NULL;
-		modifyTask->relationShardList = list_make1(relationShard);
-		modifyTask->replicationModel = targetCacheEntry->replicationModel;
-
-		taskList = lappend(taskList, modifyTask);
-
-		taskIdIndex++;
-	}
-
-	heap_close(distributedRelation, NoLock);
-
-	return taskList;
 }
 
 
@@ -1468,4 +1491,225 @@ InsertSelectResultIdPrefix(uint64 planId)
 	appendStringInfo(resultIdPrefix, "insert_select_" UINT64_FORMAT, planId);
 
 	return resultIdPrefix->data;
+}
+
+
+/*
+ * RelabelTargetEntryList relabels select target list to have matching names with
+ * insert target list.
+ */
+static void
+RelabelTargetEntryList(List *selectTargetList, List *insertTargetList)
+{
+	ListCell *selectTargetCell = NULL;
+	ListCell *insertTargetCell = NULL;
+
+	forboth(selectTargetCell, selectTargetList, insertTargetCell, insertTargetList)
+	{
+		TargetEntry *selectTargetEntry = lfirst(selectTargetCell);
+		TargetEntry *insertTargetEntry = lfirst(insertTargetCell);
+
+		selectTargetEntry->resname = insertTargetEntry->resname;
+	}
+}
+
+
+/*
+ * AddInsertSelectCasts makes sure that the types in columns in the given
+ * target lists have the same type as the columns of the given relation.
+ * It might add casts to ensure that.
+ *
+ * It returns the updated selectTargetList.
+ */
+static List *
+AddInsertSelectCasts(List *insertTargetList, List *selectTargetList,
+					 Oid targetRelationId)
+{
+	ListCell *insertEntryCell = NULL;
+	ListCell *selectEntryCell = NULL;
+	List *projectedEntries = NIL;
+	List *nonProjectedEntries = NIL;
+
+	/*
+	 * ReorderInsertSelectTargetLists() makes sure that first few columns of
+	 * the SELECT query match the insert targets. It might contain additional
+	 * items for GROUP BY, etc.
+	 */
+	Assert(list_length(insertTargetList) <= list_length(selectTargetList));
+
+	Relation distributedRelation = table_open(targetRelationId, RowExclusiveLock);
+	TupleDesc destTupleDescriptor = RelationGetDescr(distributedRelation);
+
+	int targetEntryIndex = 0;
+	forboth(insertEntryCell, insertTargetList, selectEntryCell, selectTargetList)
+	{
+		TargetEntry *insertEntry = (TargetEntry *) lfirst(insertEntryCell);
+		TargetEntry *selectEntry = (TargetEntry *) lfirst(selectEntryCell);
+		Var *insertColumn = (Var *) insertEntry->expr;
+		Form_pg_attribute attr = TupleDescAttr(destTupleDescriptor,
+											   insertEntry->resno - 1);
+
+		Oid sourceType = insertColumn->vartype;
+		Oid targetType = attr->atttypid;
+		if (sourceType != targetType)
+		{
+			insertEntry->expr = CastExpr((Expr *) insertColumn, sourceType, targetType,
+										 attr->attcollation, attr->atttypmod);
+
+			/*
+			 * We cannot modify the selectEntry in-place, because ORDER BY or
+			 * GROUP BY clauses might be pointing to it with comparison types
+			 * of the source type. So instead we keep the original one as a
+			 * non-projected entry, so GROUP BY and ORDER BY are happy, and
+			 * create a duplicated projected entry with the coerced expression.
+			 */
+			TargetEntry *coercedEntry = copyObject(selectEntry);
+			coercedEntry->expr = CastExpr((Expr *) selectEntry->expr, sourceType,
+										  targetType, attr->attcollation,
+										  attr->atttypmod);
+			coercedEntry->ressortgroupref = 0;
+
+			/*
+			 * The only requirement is that users don't use this name in ORDER BY
+			 * or GROUP BY, and it should be unique across the same query.
+			 */
+			StringInfo resnameString = makeStringInfo();
+			appendStringInfo(resnameString, "auto_coerced_by_citus_%d", targetEntryIndex);
+			coercedEntry->resname = resnameString->data;
+
+			projectedEntries = lappend(projectedEntries, coercedEntry);
+
+			if (selectEntry->ressortgroupref != 0)
+			{
+				selectEntry->resjunk = true;
+
+				/*
+				 * This entry might still end up in the SELECT output list, so
+				 * rename it to avoid ambiguity.
+				 *
+				 * See https://github.com/citusdata/citus/pull/3470.
+				 */
+				resnameString = makeStringInfo();
+				appendStringInfo(resnameString, "discarded_target_item_%d",
+								 targetEntryIndex);
+				selectEntry->resname = resnameString->data;
+
+				nonProjectedEntries = lappend(nonProjectedEntries, selectEntry);
+			}
+		}
+		else
+		{
+			projectedEntries = lappend(projectedEntries, selectEntry);
+		}
+
+		targetEntryIndex++;
+	}
+
+	for (int entryIndex = list_length(insertTargetList);
+		 entryIndex < list_length(selectTargetList);
+		 entryIndex++)
+	{
+		nonProjectedEntries = lappend(nonProjectedEntries, list_nth(selectTargetList,
+																	entryIndex));
+	}
+
+	/* selectEntry->resno must be the ordinal number of the entry */
+	selectTargetList = list_concat(projectedEntries, nonProjectedEntries);
+	int entryResNo = 1;
+	TargetEntry *selectTargetEntry = NULL;
+	foreach_ptr(selectTargetEntry, selectTargetList)
+	{
+		selectTargetEntry->resno = entryResNo++;
+	}
+
+	table_close(distributedRelation, NoLock);
+
+	return selectTargetList;
+}
+
+
+/*
+ * CastExpr returns an expression which casts the given expr from sourceType to
+ * the given targetType.
+ */
+static Expr *
+CastExpr(Expr *expr, Oid sourceType, Oid targetType, Oid targetCollation,
+		 int targetTypeMod)
+{
+	Oid coercionFuncId = InvalidOid;
+	CoercionPathType coercionType = find_coercion_pathway(targetType, sourceType,
+														  COERCION_EXPLICIT,
+														  &coercionFuncId);
+
+	if (coercionType == COERCION_PATH_FUNC)
+	{
+		FuncExpr *coerceExpr = makeNode(FuncExpr);
+		coerceExpr->funcid = coercionFuncId;
+		coerceExpr->args = list_make1(copyObject(expr));
+		coerceExpr->funccollid = targetCollation;
+		coerceExpr->funcresulttype = targetType;
+
+		return (Expr *) coerceExpr;
+	}
+	else if (coercionType == COERCION_PATH_RELABELTYPE)
+	{
+		RelabelType *coerceExpr = makeNode(RelabelType);
+		coerceExpr->arg = copyObject(expr);
+		coerceExpr->resulttype = targetType;
+		coerceExpr->resulttypmod = targetTypeMod;
+		coerceExpr->resultcollid = targetCollation;
+		coerceExpr->relabelformat = COERCE_IMPLICIT_CAST;
+		coerceExpr->location = -1;
+
+		return (Expr *) coerceExpr;
+	}
+	else if (coercionType == COERCION_PATH_ARRAYCOERCE)
+	{
+		Oid sourceBaseType = get_base_element_type(sourceType);
+		Oid targetBaseType = get_base_element_type(targetType);
+
+		CaseTestExpr *elemExpr = makeNode(CaseTestExpr);
+		elemExpr->collation = targetCollation;
+		elemExpr->typeId = sourceBaseType;
+		elemExpr->typeMod = -1;
+
+		Expr *elemCastExpr = CastExpr((Expr *) elemExpr, sourceBaseType,
+									  targetBaseType, targetCollation,
+									  targetTypeMod);
+
+		ArrayCoerceExpr *coerceExpr = makeNode(ArrayCoerceExpr);
+		coerceExpr->arg = copyObject(expr);
+		coerceExpr->elemexpr = elemCastExpr;
+		coerceExpr->resultcollid = targetCollation;
+		coerceExpr->resulttype = targetType;
+		coerceExpr->resulttypmod = targetTypeMod;
+		coerceExpr->location = -1;
+		coerceExpr->coerceformat = COERCE_IMPLICIT_CAST;
+
+		return (Expr *) coerceExpr;
+	}
+	else if (coercionType == COERCION_PATH_COERCEVIAIO)
+	{
+		CoerceViaIO *coerceExpr = makeNode(CoerceViaIO);
+		coerceExpr->arg = (Expr *) copyObject(expr);
+		coerceExpr->resulttype = targetType;
+		coerceExpr->resultcollid = targetCollation;
+		coerceExpr->coerceformat = COERCE_IMPLICIT_CAST;
+		coerceExpr->location = -1;
+
+		return (Expr *) coerceExpr;
+	}
+	else
+	{
+		ereport(ERROR, (errmsg("could not find a conversion path from type %d to %d",
+							   sourceType, targetType)));
+	}
+}
+
+
+/* PlanningInsertSelect returns true if we are planning an INSERT ...SELECT query */
+bool
+PlanningInsertSelect(void)
+{
+	return insertSelectPlannerLevel > 0;
 }

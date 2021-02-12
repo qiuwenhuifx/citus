@@ -19,6 +19,8 @@ SELECT COUNT(*) FROM limit_orders_mx WHERE id = 32744;
 
 -- now singe-row INSERT to the other worker
 \c - - - :worker_2_port
+\set VERBOSITY terse
+
 INSERT INTO limit_orders_mx VALUES (32745, 'AAPL', 9580, '2004-10-19 10:23:54', 'buy',
 								 20.69);
 SELECT COUNT(*) FROM limit_orders_mx WHERE id = 32745;
@@ -299,6 +301,6 @@ INSERT INTO app_analytics_events_mx (app_id, name) VALUES (102, 'Wayz') RETURNIN
 INSERT INTO app_analytics_events_mx (app_id, name) VALUES (103, 'Mynt') RETURNING *;
 
 -- clean up
-SELECT setval('app_analytics_events_mx_id_seq'::regclass, :last_value);
+SELECT 1 FROM setval('app_analytics_events_mx_id_seq'::regclass, :last_value);
 ALTER SEQUENCE app_analytics_events_mx_id_seq
   MINVALUE :min_value MAXVALUE :max_value;

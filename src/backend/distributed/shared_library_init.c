@@ -3,7 +3,7 @@
  * shared_library_init.c
  *	  Functionality related to the initialization of the Citus extension.
  *
- * Copyright (c) 2012-2016, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *-------------------------------------------------------------------------
  */
 
@@ -13,79 +13,128 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+/* necessary to get alloca on illumos */
+#ifdef __sun
+#include <alloca.h>
+#endif
+
 #include "fmgr.h"
 #include "miscadmin.h"
+
+#include "safe_lib.h"
 
 #include "citus_version.h"
 #include "commands/explain.h"
 #include "executor/executor.h"
 #include "distributed/backend_data.h"
 #include "distributed/citus_nodefuncs.h"
+#include "distributed/citus_safe_lib.h"
+#include "distributed/commands.h"
 #include "distributed/commands/multi_copy.h"
 #include "distributed/commands/utility_hook.h"
 #include "distributed/connection_management.h"
+#include "distributed/cte_inline.h"
 #include "distributed/distributed_deadlock_detection.h"
+#include "distributed/insert_select_executor.h"
+#include "distributed/intermediate_result_pruning.h"
+#include "distributed/local_multi_copy.h"
+#include "distributed/local_executor.h"
+#include "distributed/local_distributed_join_planner.h"
+#include "distributed/locally_reserved_shared_connections.h"
 #include "distributed/maintenanced.h"
-#include "distributed/master_metadata_utility.h"
-#include "distributed/master_protocol.h"
+#include "distributed/metadata_utility.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/metadata_sync.h"
+#include "distributed/multi_physical_planner.h"
+#include "distributed/multi_executor.h"
 #include "distributed/multi_explain.h"
 #include "distributed/multi_join_order.h"
 #include "distributed/multi_logical_optimizer.h"
 #include "distributed/distributed_planner.h"
-#include "distributed/multi_router_executor.h"
+#include "distributed/combine_query_planner.h"
 #include "distributed/multi_router_planner.h"
 #include "distributed/multi_server_executor.h"
 #include "distributed/pg_dist_partition.h"
 #include "distributed/placement_connection.h"
+#include "distributed/recursive_planning.h"
+#include "distributed/reference_table_utils.h"
 #include "distributed/relation_access_tracking.h"
 #include "distributed/run_from_same_connection.h"
+#include "distributed/shard_cleaner.h"
+#include "distributed/shared_connection_stats.h"
 #include "distributed/query_pushdown_planning.h"
+#include "distributed/time_constants.h"
 #include "distributed/query_stats.h"
 #include "distributed/remote_commands.h"
 #include "distributed/shared_library_init.h"
 #include "distributed/statistics_collection.h"
 #include "distributed/subplan_execution.h"
-#include "distributed/task_tracker.h"
+
 #include "distributed/transaction_management.h"
 #include "distributed/transaction_recovery.h"
+#include "distributed/worker_log_messages.h"
 #include "distributed/worker_manager.h"
 #include "distributed/worker_protocol.h"
 #include "distributed/worker_shard_visibility.h"
+#include "distributed/adaptive_executor.h"
+#include "libpq/auth.h"
 #include "port/atomics.h"
 #include "postmaster/postmaster.h"
+#include "storage/ipc.h"
 #include "optimizer/planner.h"
 #include "optimizer/paths.h"
 #include "tcop/tcopprot.h"
 #include "utils/guc.h"
 #include "utils/guc_tables.h"
+#include "utils/varlena.h"
+
+#include "columnar/mod.h"
 
 /* marks shared object as one loadable by the postgres version compiled against */
 PG_MODULE_MAGIC;
 
+#define DUMMY_REAL_TIME_EXECUTOR_ENUM_VALUE 9999999
 static char *CitusVersion = CITUS_VERSION;
 
-void _PG_init(void);
 
+void _PG_init(void);
+void _PG_fini(void);
+
+static void DoInitialCleanup(void);
 static void ResizeStackToMaximumDepth(void);
 static void multi_log_hook(ErrorData *edata);
+static void RegisterConnectionCleanup(void);
+static void RegisterClientBackendCounterDecrement(void);
+static void CitusCleanupConnectionsAtExit(int code, Datum arg);
+static void DecrementClientBackendCounterAtExit(int code, Datum arg);
 static void CreateRequiredDirectories(void);
 static void RegisterCitusConfigVariables(void);
 static bool ErrorIfNotASuitableDeadlockFactor(double *newval, void **extra,
 											  GucSource source);
-static void NormalizeWorkerListPath(void);
+static bool WarnIfDeprecatedExecutorUsed(int *newval, void **extra, GucSource source);
+static bool NoticeIfSubqueryPushdownEnabled(bool *newval, void **extra, GucSource source);
 static bool NodeConninfoGucCheckHook(char **newval, void **extra, GucSource source);
 static void NodeConninfoGucAssignHook(const char *newval, void *extra);
+static const char * MaxSharedPoolSizeGucShowHook(void);
+static const char * LocalPoolSizeGucShowHook(void);
 static bool StatisticsCollectionGucCheckHook(bool *newval, void **extra, GucSource
 											 source);
+static void CitusAuthHook(Port *port, int status);
 
-/* static variable to hold value of deprecated GUC variable */
-static bool ExpireCachedShards = false;
-static int LargeTableShardCount = 0;
-static int CitusSSLMode = 0;
+
+static ClientAuthentication_hook_type original_client_auth_hook = NULL;
+
 
 /* *INDENT-OFF* */
 /* GUC enum definitions */
+static const struct config_enum_entry propagate_set_commands_options[] = {
+	{"none", PROPSETCMD_NONE, false},
+	{"local", PROPSETCMD_LOCAL, false},
+	{NULL, 0, false}
+};
+
+
 static const struct config_enum_entry task_assignment_policy_options[] = {
 	{ "greedy", TASK_ASSIGNMENT_GREEDY, false },
 	{ "first-replica", TASK_ASSIGNMENT_FIRST_REPLICA, false },
@@ -100,8 +149,9 @@ static const struct config_enum_entry replication_model_options[] = {
 };
 
 static const struct config_enum_entry task_executor_type_options[] = {
-	{ "real-time", MULTI_EXECUTOR_REAL_TIME, false },
-	{ "task-tracker", MULTI_EXECUTOR_TASK_TRACKER, false },
+	{ "adaptive", MULTI_EXECUTOR_ADAPTIVE, false },
+	{ "real-time", DUMMY_REAL_TIME_EXECUTOR_ENUM_VALUE, false }, /* keep it for backward comp. */
+	{ "task-tracker", MULTI_EXECUTOR_ADAPTIVE, false },
 	{ NULL, 0, false }
 };
 
@@ -118,25 +168,53 @@ static const struct config_enum_entry use_secondary_nodes_options[] = {
 	{ NULL, 0, false }
 };
 
-static const struct config_enum_entry multi_shard_commit_protocol_options[] = {
+static const struct config_enum_entry coordinator_aggregation_options[] = {
+	{ "disabled", COORDINATOR_AGGREGATION_DISABLED, false },
+	{ "row-gather", COORDINATOR_AGGREGATION_ROW_GATHER, false },
+	{ NULL, 0, false }
+};
+
+static const struct config_enum_entry shard_commit_protocol_options[] = {
 	{ "1pc", COMMIT_PROTOCOL_1PC, false },
 	{ "2pc", COMMIT_PROTOCOL_2PC, false },
 	{ NULL, 0, false }
 };
 
-static const struct config_enum_entry multi_task_query_log_level_options[] = {
-	{ "off", MULTI_TASK_QUERY_INFO_OFF, false },
-	{ "debug", DEBUG2, false },
-	{ "log", LOG, false },
-	{ "notice", NOTICE, false },
-	{ "warning", WARNING, false },
-	{ "error", ERROR, false },
-	{ NULL, 0, false }
+static const struct config_enum_entry log_level_options[] = {
+	{ "off", CITUS_LOG_LEVEL_OFF, false },
+	{ "debug5", DEBUG5, false},
+	{ "debug4", DEBUG4, false},
+	{ "debug3", DEBUG3, false},
+	{ "debug2", DEBUG2, false},
+	{ "debug1", DEBUG1, false},
+	{ "debug", DEBUG2, true},
+	{ "log", LOG, false},
+	{ "info", INFO, true},
+	{ "notice", NOTICE, false},
+	{ "warning", WARNING, false},
+	{ "error", ERROR, false},
+	{ NULL, 0, false}
 };
+
+
+static const struct config_enum_entry local_table_join_policies[] = {
+	{ "never", LOCAL_JOIN_POLICY_NEVER, false},
+	{ "prefer-local", LOCAL_JOIN_POLICY_PREFER_LOCAL, false},
+	{ "prefer-distributed", LOCAL_JOIN_POLICY_PREFER_DISTRIBUTED, false},
+	{ "auto", LOCAL_JOIN_POLICY_AUTO, false},
+	{ NULL, 0, false}
+};
+
 
 static const struct config_enum_entry multi_shard_modify_connection_options[] = {
 	{ "parallel", PARALLEL_CONNECTION, false },
 	{ "sequential", SEQUENTIAL_CONNECTION, false },
+	{ NULL, 0, false }
+};
+
+static const struct config_enum_entry explain_analyze_sort_method_options[] = {
+	{ "execution-time", EXPLAIN_ANALYZE_SORT_BY_TIME, false },
+	{ "taskId", EXPLAIN_ANALYZE_SORT_BY_TASK_ID, false },
 	{ NULL, 0, false }
 };
 
@@ -157,6 +235,14 @@ _PG_init(void)
 	}
 
 	/*
+	 * Register contstraint_handler hooks of safestringlib first. This way
+	 * loading the extension will error out if one of these constraints are hit
+	 * during load.
+	 */
+	set_str_constraint_handler_s(ereport_constraint_handler);
+	set_mem_constraint_handler_s(ereport_constraint_handler);
+
+	/*
 	 * Perform checks before registering any hooks, to avoid erroring out in a
 	 * partial state.
 	 *
@@ -165,9 +251,9 @@ _PG_init(void)
 	 * (thus as the innermost/last running hook) to be able to do our
 	 * duties. For simplicity insist that all hooks are previously unused.
 	 */
-	if (planner_hook != NULL || ProcessUtility_hook != NULL || ExecutorStart_hook !=
-		NULL ||
-		ExecutorRun_hook != NULL)
+	if (planner_hook != NULL || ProcessUtility_hook != NULL ||
+		ExecutorStart_hook != NULL || ExecutorRun_hook != NULL ||
+		ExplainOneQuery_hook != NULL)
 	{
 		ereport(ERROR, (errmsg("Citus has to be loaded first"),
 						errhint("Place citus at the beginning of "
@@ -213,14 +299,20 @@ _PG_init(void)
 	set_join_pathlist_hook = multi_join_restriction_hook;
 	ExecutorStart_hook = CitusExecutorStart;
 	ExecutorRun_hook = CitusExecutorRun;
+	ExplainOneQuery_hook = CitusExplainOneQuery;
 
 	/* register hook for error messages */
 	emit_log_hook = multi_log_hook;
 
-	InitializeMaintenanceDaemon();
 
-	/* organize that task tracker is started once server is up */
-	TaskTrackerRegister();
+	/*
+	 * Register hook for counting client backends that
+	 * are successfully authenticated.
+	 */
+	original_client_auth_hook = ClientAuthentication_hook;
+	ClientAuthentication_hook = CitusAuthHook;
+
+	InitializeMaintenanceDaemon();
 
 	/* initialize coordinated transaction management */
 	InitializeTransactionManagement();
@@ -228,6 +320,8 @@ _PG_init(void)
 	InitializeConnectionManagement();
 	InitPlacementConnectionManagement();
 	InitializeCitusQueryStats();
+	InitializeSharedConnectionStats();
+	InitializeLocallyReservedSharedConnections();
 
 	/* enable modification of pg_catalog tables during pg_upgrade */
 	if (IsBinaryUpgrade)
@@ -235,6 +329,38 @@ _PG_init(void)
 		SetConfigOption("allow_system_table_mods", "true", PGC_POSTMASTER,
 						PGC_S_OVERRIDE);
 	}
+
+	/*
+	 * In postmasters execution of _PG_init, IsUnderPostmaster will be false and
+	 * we want to do the cleanup at that time only, otherwise there is a chance that
+	 * there will be parallel queries and we might do a cleanup for things that are
+	 * already in use. This is only needed in Windows.
+	 */
+	if (!IsUnderPostmaster)
+	{
+		DoInitialCleanup();
+	}
+	columnar_init();
+}
+
+
+/* shared library deconstruction function */
+void
+_PG_fini(void)
+{
+	columnar_fini();
+}
+
+
+/*
+ * DoInitialCleanup does cleanup at start time.
+ * Currently it:
+ * - Removes repartition directories ( in case there are any leftovers)
+ */
+static void
+DoInitialCleanup(void)
+{
+	RepartitionCleanupJobDirectories();
 }
 
 
@@ -258,10 +384,15 @@ static void
 ResizeStackToMaximumDepth(void)
 {
 #ifndef WIN32
-	volatile char *stack_resizer = NULL;
 	long max_stack_depth_bytes = max_stack_depth * 1024L;
 
-	stack_resizer = alloca(max_stack_depth_bytes);
+	/*
+	 * Explanation of IGNORE-BANNED:
+	 * alloca is safe to use here since we limit the allocated size. We cannot
+	 * use malloc as a replacement, since we actually want to grow the stack
+	 * here.
+	 */
+	volatile char *stack_resizer = alloca(max_stack_depth_bytes); /* IGNORE-BANNED */
 
 	/*
 	 * Different architectures might have different directions while
@@ -293,10 +424,12 @@ multi_log_hook(ErrorData *edata)
 {
 	/*
 	 * Show the user a meaningful error message when a backend is cancelled
-	 * by the distributed deadlock detection.
+	 * by the distributed deadlock detection. Also reset the state for this,
+	 * since the next cancelation of the backend might have another reason.
 	 */
+	bool clearState = true;
 	if (edata->elevel == ERROR && edata->sqlerrcode == ERRCODE_QUERY_CANCELED &&
-		MyBackendGotCancelledDueToDeadlock())
+		MyBackendGotCancelledDueToDeadlock(clearState))
 	{
 		edata->sqlerrcode = ERRCODE_T_R_DEADLOCK_DETECTED;
 		edata->message = "canceling the transaction since it was "
@@ -318,6 +451,72 @@ StartupCitusBackend(void)
 {
 	InitializeMaintenanceDaemonBackend();
 	InitializeBackendData();
+	RegisterConnectionCleanup();
+}
+
+
+/*
+ * RegisterConnectionCleanup cleans up any resources left at the end of the
+ * session. We prefer to cleanup before shared memory exit to make sure that
+ * this session properly releases anything hold in the shared memory.
+ */
+static void
+RegisterConnectionCleanup(void)
+{
+	static bool registeredCleanup = false;
+	if (registeredCleanup == false)
+	{
+		before_shmem_exit(CitusCleanupConnectionsAtExit, 0);
+
+		registeredCleanup = true;
+	}
+}
+
+
+/*
+ * RegisterClientBackendCounterDecrement is called when the backend terminates.
+ * For all client backends, we register a callback that will undo
+ */
+static void
+RegisterClientBackendCounterDecrement(void)
+{
+	static bool registeredCleanup = false;
+	if (registeredCleanup == false)
+	{
+		before_shmem_exit(DecrementClientBackendCounterAtExit, 0);
+
+		registeredCleanup = true;
+	}
+}
+
+
+/*
+ * CitusCleanupConnectionsAtExit is called before_shmem_exit() of the
+ * backend for the purposes of any clean-up needed.
+ */
+static void
+CitusCleanupConnectionsAtExit(int code, Datum arg)
+{
+	/* properly close all the cached connections */
+	ShutdownAllConnections();
+
+	/*
+	 * Make sure that we give the shared connections back to the shared
+	 * pool if any. This operation is a no-op if the reserved connections
+	 * are already given away.
+	 */
+	DeallocateReservedConnections();
+}
+
+
+/*
+ * DecrementClientBackendCounterAtExit is called before_shmem_exit() of the
+ * backend for the purposes decrementing
+ */
+static void
+DecrementClientBackendCounterAtExit(int code, Datum arg)
+{
+	DecrementClientBackendCounter();
 }
 
 
@@ -330,14 +529,13 @@ StartupCitusBackend(void)
 static void
 CreateRequiredDirectories(void)
 {
-	int dirNo = 0;
 	const char *subdirs[] = {
 		"pg_foreign_file",
 		"pg_foreign_file/cached",
-		"base/pgsql_job_cache"
+		"base/" PG_JOB_CACHE_DIR
 	};
 
-	for (dirNo = 0; dirNo < lengthof(subdirs); dirNo++)
+	for (int dirNo = 0; dirNo < lengthof(subdirs); dirNo++)
 	{
 		int ret = mkdir(subdirs[dirNo], S_IRWXU);
 
@@ -360,43 +558,9 @@ RegisterCitusConfigVariables(void)
 		gettext_noop("Sets the maximum duration to connect to worker nodes."),
 		NULL,
 		&NodeConnectionTimeout,
-		5000, 10, 60 * 60 * 1000,
+		30 * MS_PER_SECOND, 10 * MS, MS_PER_HOUR,
 		PGC_USERSET,
-		GUC_UNIT_MS,
-		NULL, NULL, NULL);
-
-	/* keeping temporarily for updates from pre-6.0 versions */
-	DefineCustomStringVariable(
-		"citus.worker_list_file",
-		gettext_noop("Sets the server's \"worker_list\" configuration file."),
-		NULL,
-		&WorkerListFileName,
-		NULL,
-		PGC_POSTMASTER,
-		GUC_SUPERUSER_ONLY | GUC_NO_SHOW_ALL,
-		NULL, NULL, NULL);
-	NormalizeWorkerListPath();
-
-	DefineCustomIntVariable(
-		"citus.sslmode",
-		gettext_noop("This variable has been deprecated. Use the citus.node_conninfo "
-					 "GUC instead."),
-		NULL,
-		&CitusSSLMode,
-		0, 0, 32,
-		PGC_POSTMASTER,
-		GUC_SUPERUSER_ONLY | GUC_NO_SHOW_ALL,
-		NULL, NULL, NULL);
-
-	DefineCustomBoolVariable(
-		"citus.binary_master_copy_format",
-		gettext_noop("Use the binary master copy format."),
-		gettext_noop("When enabled, data is copied from workers to the master "
-					 "in PostgreSQL's binary serialization format."),
-		&BinaryMasterCopyFormat,
-		false,
-		PGC_USERSET,
-		0,
+		GUC_UNIT_MS | GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -408,18 +572,47 @@ RegisterCitusConfigVariables(void)
 		&BinaryWorkerCopyFormat,
 		false,
 		PGC_SIGHUP,
-		0,
+		GUC_STANDARD,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"citus.copy_switchover_threshold",
+		gettext_noop("Sets the threshold for copy to be switched "
+					 "over per connection."),
+		gettext_noop("Data size threshold to switch over the active placement for "
+					 "a connection. If this is too low, overhead of starting COPY "
+					 "commands will hurt the performance. If this is too high, "
+					 "buffered data will use lots of memory. 4MB is a good balance "
+					 "between memory usage and performance. Note that this is irrelevant "
+					 "in the common case where we open one connection per placement."),
+		&CopySwitchOverThresholdBytes,
+		4 * 1024 * 1024, 1, INT_MAX,
+		PGC_USERSET,
+		GUC_UNIT_BYTE | GUC_NO_SHOW_ALL,
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
-		"citus.expire_cached_shards",
-		gettext_noop("This GUC variable has been deprecated."),
+		"citus.enable_local_execution",
+		gettext_noop("Enables queries on shards that are local to the current node "
+					 "to be planned and executed locally."),
 		NULL,
-		&ExpireCachedShards,
-		false,
-		PGC_SIGHUP,
-		0,
+		&EnableLocalExecution,
+		true,
+		PGC_USERSET,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"citus.enable_local_reference_table_foreign_keys",
+		gettext_noop("Enables foreign keys from/to local tables"),
+		gettext_noop("When enabled, foreign keys between local tables and reference "
+					 "tables supported."),
+		&EnableLocalReferenceForeignKeys,
+		true,
+		PGC_USERSET,
+		GUC_STANDARD,
+		NULL, NULL, NULL);
+
 
 	DefineCustomBoolVariable(
 		"citus.enable_single_hash_repartition_joins",
@@ -433,6 +626,16 @@ RegisterCitusConfigVariables(void)
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
+		"citus.enable_repartitioned_insert_select",
+		gettext_noop("Enables repartitioned INSERT/SELECTs"),
+		NULL,
+		&EnableRepartitionedInsertSelect,
+		true,
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
 		"citus.enable_fast_path_router_planner",
 		gettext_noop("Enables fast path router planner"),
 		NULL,
@@ -440,6 +643,17 @@ RegisterCitusConfigVariables(void)
 		true,
 		PGC_USERSET,
 		GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"citus.enable_binary_protocol",
+		gettext_noop(
+			"Enables communication between nodes using binary protocol when possible"),
+		NULL,
+		&EnableBinaryProtocol,
+		false,
+		PGC_USERSET,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -471,12 +685,63 @@ RegisterCitusConfigVariables(void)
 
 	DefineCustomBoolVariable(
 		"citus.subquery_pushdown",
-		gettext_noop("Enables supported subquery pushdown to workers."),
-		NULL,
+		gettext_noop("Usage of this GUC is highly discouraged, please read the long "
+					 "description"),
+		gettext_noop("When enabled, the planner skips many correctness checks "
+					 "for subqueries and pushes down the queries to shards as-is. "
+					 "It means that the queries are likely to return wrong results "
+					 "unless the user is absolutely sure that pushing down the "
+					 "subquery is safe. This GUC is maintained only for backward "
+					 "compatibility, no new users are supposed to use it. The planner"
+					 "is capable of pushing down as much computation as possible to the "
+					 "shards depending on the query."),
 		&SubqueryPushdown,
 		false,
 		PGC_USERSET,
-		0,
+		GUC_NO_SHOW_ALL,
+		NoticeIfSubqueryPushdownEnabled, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"citus.local_copy_flush_threshold",
+		gettext_noop("Sets the threshold for local copy to be flushed."),
+		NULL,
+		&LocalCopyFlushThresholdByte,
+		512 * 1024, 1, INT_MAX,
+		PGC_USERSET,
+		GUC_UNIT_BYTE | GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"citus.local_shared_pool_size",
+		gettext_noop(
+			"Sets the maximum number of connections allowed for the shards on the "
+			"local node across all the backends from this node. Setting to -1 disables "
+			"connections throttling. Setting to 0 makes it auto-adjust, meaning "
+			"equal to the half of max_connections on the coordinator."),
+		gettext_noop("As a rule of thumb, the value should be at most equal to the "
+					 "max_connections on the local node."),
+		&LocalSharedPoolSize,
+		0, -1, INT_MAX,
+		PGC_SIGHUP,
+		GUC_SUPERUSER_ONLY,
+		NULL, NULL, LocalPoolSizeGucShowHook);
+
+	DefineCustomEnumVariable(
+		"citus.local_table_join_policy",
+		gettext_noop("defines the behaviour when a distributed table "
+					 "is joined with a local table"),
+		gettext_noop(
+			"There are 4 values available. The default, 'auto' will recursively plan"
+			"distributed tables if there is a constant filter on a unique index."
+			"'prefer-local' will choose local tables if possible."
+			"'prefer-distributed' will choose distributed tables if possible"
+			"'never' will basically skip local table joins."
+			),
+		&LocalTableJoinPolicy,
+		LOCAL_JOIN_POLICY_AUTO,
+		local_table_join_policies,
+		PGC_USERSET,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -497,7 +762,28 @@ RegisterCitusConfigVariables(void)
 		&LogRemoteCommands,
 		false,
 		PGC_USERSET,
-		0,
+		GUC_STANDARD,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"citus.log_local_commands",
+		gettext_noop("Log queries that are executed locally, can be overriden by "
+					 "citus.log_remote_commands"),
+		NULL,
+		&LogLocalCommands,
+		false,
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"citus.log_intermediate_results",
+		gettext_noop("Log intermediate results sent to other nodes"),
+		NULL,
+		&LogIntermediateResults,
+		false,
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL,
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -509,6 +795,18 @@ RegisterCitusConfigVariables(void)
 		false,
 		PGC_SIGHUP,
 		GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomEnumVariable(
+		"citus.worker_min_messages",
+		gettext_noop("Log messages from workers only if their log level is at or above "
+					 "the configured level"),
+		NULL,
+		&WorkerMinMessages,
+		NOTICE,
+		log_level_options,
+		PGC_USERSET,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -533,7 +831,7 @@ RegisterCitusConfigVariables(void)
 		&ExplainAllTasks,
 		false,
 		PGC_USERSET,
-		0,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -543,7 +841,7 @@ RegisterCitusConfigVariables(void)
 		&AllModificationsCommutative,
 		false,
 		PGC_USERSET,
-		0,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomRealVariable(
@@ -556,7 +854,7 @@ RegisterCitusConfigVariables(void)
 		&DistributedDeadlockDetectionTimeoutFactor,
 		2.0, -1.0, 1000.0,
 		PGC_SIGHUP,
-		0,
+		GUC_STANDARD,
 		ErrorIfNotASuitableDeadlockFactor, NULL, NULL);
 
 	DefineCustomIntVariable(
@@ -568,7 +866,63 @@ RegisterCitusConfigVariables(void)
 					 "determines how often recovery should run, "
 					 "use -1 to disable."),
 		&Recover2PCInterval,
-		60000, -1, 7 * 24 * 3600 * 1000,
+		60 * MS_PER_SECOND, -1, 7 * MS_PER_DAY,
+		PGC_SIGHUP,
+		GUC_UNIT_MS | GUC_STANDARD,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"citus.metadata_sync_interval",
+		gettext_noop("Sets the time to wait between metadata syncs."),
+		gettext_noop("metadata sync needs to run every so often "
+					 "to synchronize metadata to metadata nodes "
+					 "that are out of sync."),
+		&MetadataSyncInterval,
+		60 * MS_PER_SECOND, 1, 7 * MS_PER_DAY,
+		PGC_SIGHUP,
+		GUC_UNIT_MS | GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"citus.metadata_sync_retry_interval",
+		gettext_noop("Sets the interval to retry failed metadata syncs."),
+		gettext_noop("metadata sync needs to run every so often "
+					 "to synchronize metadata to metadata nodes "
+					 "that are out of sync."),
+		&MetadataSyncRetryInterval,
+		5 * MS_PER_SECOND, 1, 7 * MS_PER_DAY,
+		PGC_SIGHUP,
+		GUC_UNIT_MS | GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"citus.defer_drop_after_shard_move",
+		gettext_noop("When enabled a shard move will mark old shards for deletion"),
+		gettext_noop("The deletion of a shard can sometimes run into a conflict with a "
+					 "long running transactions on a the shard during the drop phase of "
+					 "the shard move. This causes some moves to be rolled back after "
+					 "resources have been spend on moving the shard. To prevent "
+					 "conflicts this feature lets you skip the actual deletion till a "
+					 "later point in time. When used one should set "
+					 "citus.defer_shard_delete_interval to make sure defered deletions "
+					 "will be executed"),
+		&DeferShardDeleteOnMove,
+		false,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"citus.defer_shard_delete_interval",
+		gettext_noop("Sets the time to wait between background deletion for shards."),
+		gettext_noop("Shards that are marked for deferred deletion need to be deleted in "
+					 "the background at a later time. This is done at a regular interval "
+					 "configured here. The deletion is executed optimistically, it tries "
+					 "to take a lock on a shard to clean, if the lock can't be acquired "
+					 "the background worker moves on. When set to -1 this background "
+					 "process is skipped."),
+		&DeferShardDeleteInterval,
+		-1, -1, 7 * 24 * 3600 * 1000,
 		PGC_SIGHUP,
 		GUC_UNIT_MS,
 		NULL, NULL, NULL);
@@ -604,6 +958,37 @@ RegisterCitusConfigVariables(void)
 		GUC_NO_SHOW_ALL,
 		NULL, NULL, NULL);
 
+	DefineCustomBoolVariable(
+		"citus.force_max_query_parallelization",
+		gettext_noop("Open as many connections as possible to maximize query "
+					 "parallelization"),
+		gettext_noop("When enabled, Citus will force the executor to use "
+					 "as many connections as possible while executing a "
+					 "parallel distributed query. If not enabled, the executor"
+					 "might choose to use less connections to optimize overall "
+					 "query execution throughput. Internally, setting this true "
+					 "will end up with using one connection per task."),
+		&ForceMaxQueryParallelization,
+		false,
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"citus.executor_slow_start_interval",
+		gettext_noop("Time to wait between opening connections to the same worker node"),
+		gettext_noop("When the individual tasks of a multi-shard query take very "
+					 "little time, they can often be finished over a single (often "
+					 "already cached) connection. To avoid redundantly opening "
+					 "additional connections, the executor waits between connection "
+					 "attempts for the configured number of milliseconds. At the end "
+					 "of the interval, it increases the number of connections it is "
+					 "allowed to open next time."),
+		&ExecutorSlowStartInterval,
+		10, 0, INT_MAX,
+		PGC_USERSET,
+		GUC_UNIT_MS | GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
 		"citus.enable_deadlock_prevention",
@@ -617,7 +1002,7 @@ RegisterCitusConfigVariables(void)
 		&EnableDeadlockPrevention,
 		true,
 		PGC_USERSET,
-		0,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -627,7 +1012,78 @@ RegisterCitusConfigVariables(void)
 		&EnableDDLPropagation,
 		true,
 		PGC_USERSET,
-		0,
+		GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"citus.enable_object_propagation",
+		gettext_noop("Enables propagating object creation for more complex objects, "
+					 "schema's will always be created"),
+		NULL,
+		&EnableDependencyCreation,
+		true,
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"citus.enable_create_type_propagation",
+		gettext_noop("Enables propagating of CREATE TYPE statements to workers"),
+		NULL,
+		&EnableCreateTypePropagation,
+		true,
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"citus.enable_alter_role_propagation",
+		gettext_noop("Enables propagating ALTER ROLE statements to workers (excluding "
+					 "ALTER ROLE SET)"),
+		NULL,
+		&EnableAlterRolePropagation,
+		true,
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"citus.enable_alter_role_set_propagation",
+		gettext_noop("Enables propagating ALTER ROLE SET statements to workers"),
+		NULL,
+		&EnableAlterRoleSetPropagation,
+		true,
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	/*
+	 * We shouldn't need this variable after we drop support to PostgreSQL 11 and
+	 * below. So, noting it here with PG_VERSION_NUM < PG_VERSION_12
+	 */
+	DefineCustomBoolVariable(
+		"citus.enable_cte_inlining",
+		gettext_noop("When set to false, CTE inlining feature is disabled"),
+		gettext_noop("This feature is not intended for users. It is developed "
+					 "to get consistent regression test outputs between Postgres 11"
+					 "and Postgres 12. In Postgres 12+, the user can control the behaviour"
+					 "by [NOT] MATERIALIZED keyword on CTEs. However, in PG 11, we cannot do "
+					 "that."),
+		&EnableCTEInlining,
+		true,
+		PGC_SUSET,
+		GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
+
+	DefineCustomEnumVariable(
+		"citus.propagate_set_commands",
+		gettext_noop("Sets which SET commands are propagated to workers."),
+		NULL,
+		&PropagateSetCommands,
+		PROPSETCMD_NONE,
+		propagate_set_commands_options,
+		PGC_USERSET,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -646,9 +1102,9 @@ RegisterCitusConfigVariables(void)
 					 "created with create_distributed_table()."),
 		NULL,
 		&ShardCount,
-		32, 1, 64000,
+		32, 1, MAX_SHARD_COUNT,
 		PGC_USERSET,
-		0,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
@@ -659,9 +1115,9 @@ RegisterCitusConfigVariables(void)
 					 "configuration value at sharded table creation time, "
 					 "and later reuse the initially read value."),
 		&ShardReplicationFactor,
-		1, 1, 100,
+		1, 1, MAX_SHARD_REPLICATION_FACTOR,
 		PGC_USERSET,
-		0,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
@@ -676,7 +1132,7 @@ RegisterCitusConfigVariables(void)
 		&ShardMaxSize,
 		1048576, 256, INT_MAX, /* max allowed size not set to MAX_KILOBYTES on purpose */
 		PGC_USERSET,
-		GUC_UNIT_KB,
+		GUC_UNIT_KB | GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -701,8 +1157,40 @@ RegisterCitusConfigVariables(void)
 		&MaxIntermediateResult,
 		1048576, -1, MAX_KILOBYTES,
 		PGC_USERSET,
-		GUC_UNIT_KB,
+		GUC_UNIT_KB | GUC_STANDARD,
 		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"citus.max_adaptive_executor_pool_size",
+		gettext_noop("Sets the maximum number of connections per worker node used by "
+					 "the adaptive executor to execute a multi-shard command"),
+		gettext_noop("The adaptive executor may open multiple connections per worker "
+					 "node when running multi-shard commands to parallelize the command "
+					 "across multiple cores on the worker. This setting specifies the "
+					 "maximum number of connections it will open. The number of "
+					 "connections is also bounded by the number of shards on the node. "
+					 "This setting can be used to reduce the memory usage of a query "
+					 "and allow a higher degree of concurrency when concurrent "
+					 "multi-shard queries open too many connections to a worker."),
+		&MaxAdaptiveExecutorPoolSize,
+		16, 1, INT_MAX,
+		PGC_USERSET,
+		GUC_STANDARD,
+		NULL, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"citus.max_shared_pool_size",
+		gettext_noop("Sets the maximum number of connections allowed per worker node "
+					 "across all the backends from this node. Setting to -1 disables "
+					 "connections throttling. Setting to 0 makes it auto-adjust, meaning "
+					 "equal to max_connections on the coordinator."),
+		gettext_noop("As a rule of thumb, the value should be at most equal to the "
+					 "max_connections on the remote nodes."),
+		&MaxSharedPoolSize,
+		0, -1, INT_MAX,
+		PGC_SIGHUP,
+		GUC_SUPERUSER_ONLY,
+		NULL, NULL, MaxSharedPoolSizeGucShowHook);
 
 	DefineCustomIntVariable(
 		"citus.max_worker_nodes_tracked",
@@ -711,11 +1199,16 @@ RegisterCitusConfigVariables(void)
 					 "health status are tracked in a shared hash table on "
 					 "the master node. This configuration value limits the "
 					 "size of the hash table, and consequently the maximum "
-					 "number of worker nodes that can be tracked."),
+					 "number of worker nodes that can be tracked."
+					 "Citus keeps some information about the worker nodes "
+					 "in the shared memory for certain optimizations. The "
+					 "optimizations are enforced up to this number of worker "
+					 "nodes. Any additional worker nodes may not benefit from"
+					 "the optimizations."),
 		&MaxWorkerNodesTracked,
-		2048, 8, INT_MAX,
+		2048, 1024, INT_MAX,
 		PGC_POSTMASTER,
-		0,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
@@ -728,62 +1221,32 @@ RegisterCitusConfigVariables(void)
 		&RemoteTaskCheckInterval,
 		10, 1, INT_MAX,
 		PGC_USERSET,
-		GUC_UNIT_MS,
+		GUC_UNIT_MS | GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
-		"citus.task_tracker_delay",
-		gettext_noop("Task tracker sleep time between task management rounds."),
-		gettext_noop("The task tracker process wakes up regularly, walks over "
-					 "all tasks assigned to it, and schedules and executes these "
-					 "tasks. Then, the task tracker sleeps for a time period "
-					 "before walking over these tasks again. This configuration "
-					 "value determines the length of that sleeping period."),
-		&TaskTrackerDelay,
-		200, 1, 100000,
-		PGC_SIGHUP,
-		GUC_UNIT_MS,
-		NULL, NULL, NULL);
-
-	DefineCustomIntVariable(
-		"citus.max_assign_task_batch_size",
-		gettext_noop("Sets the maximum number of tasks to assign per round."),
-		gettext_noop("The master node synchronously assigns tasks to workers in "
-					 "batches. Bigger batches allow for faster task assignment, "
-					 "but it may take longer for all workers to get tasks "
-					 "if the number of workers is large. This configuration "
-					 "value controls the maximum batch size."),
-		&MaxAssignTaskBatchSize,
-		64, 1, INT_MAX,
+		"citus.max_cached_conns_per_worker",
+		gettext_noop("Sets the maximum number of connections to cache per worker."),
+		gettext_noop("Each backend opens connections to the workers to query the "
+					 "shards. At the end of the transaction, the configurated number "
+					 "of connections is kept open to speed up subsequent commands. "
+					 "Increasing this value will reduce the latency of multi-shard "
+					 "queries, but increases overhead on the workers"),
+		&MaxCachedConnectionsPerWorker,
+		1, 0, INT_MAX,
 		PGC_USERSET,
-		0,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
-		"citus.max_tracked_tasks_per_node",
-		gettext_noop("Sets the maximum number of tracked tasks per node."),
-		gettext_noop("The task tracker processes keeps all assigned tasks in "
-					 "a shared hash table, and schedules and executes these "
-					 "tasks as appropriate. This configuration value limits "
-					 "the size of the hash table, and therefore the maximum "
-					 "number of tasks that can be tracked at any given time."),
-		&MaxTrackedTasksPerNode,
-		1024, 8, INT_MAX,
-		PGC_POSTMASTER,
-		0,
-		NULL, NULL, NULL);
-
-	DefineCustomIntVariable(
-		"citus.max_running_tasks_per_node",
-		gettext_noop("Sets the maximum number of tasks to run concurrently per node."),
-		gettext_noop("The task tracker process schedules and executes the tasks "
-					 "assigned to it as appropriate. This configuration value "
-					 "sets the maximum number of tasks to execute concurrently "
-					 "on one node at any given time."),
-		&MaxRunningTasksPerNode,
-		8, 1, INT_MAX,
+		"citus.repartition_join_bucket_count_per_node",
+		gettext_noop("Sets the bucket size for repartition joins per node"),
+		gettext_noop("Repartition joins create buckets in each node and "
+					 "uses those to shuffle data around nodes. "),
+		&RepartitionJoinBucketCountPerNode,
+		4, 1, INT_MAX,
 		PGC_SIGHUP,
-		0,
+		GUC_STANDARD | GUC_NO_SHOW_ALL,
 		NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
@@ -797,17 +1260,7 @@ RegisterCitusConfigVariables(void)
 		&PartitionBufferSize,
 		8192, 0, (INT_MAX / 1024), /* result stored in int variable */
 		PGC_USERSET,
-		GUC_UNIT_KB,
-		NULL, NULL, NULL);
-
-	DefineCustomIntVariable(
-		"citus.large_table_shard_count",
-		gettext_noop("This variable has been deprecated."),
-		gettext_noop("Consider reference tables instead"),
-		&LargeTableShardCount,
-		4, 1, 10000,
-		PGC_USERSET,
-		GUC_NO_SHOW_ALL,
+		GUC_UNIT_KB | GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomIntVariable(
@@ -822,7 +1275,7 @@ RegisterCitusConfigVariables(void)
 		&LimitClauseRowFetchCount,
 		-1, -1, INT_MAX,
 		PGC_USERSET,
-		0,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomRealVariable(
@@ -835,7 +1288,20 @@ RegisterCitusConfigVariables(void)
 		&CountDistinctErrorRate,
 		0.0, 0.0, 1.0,
 		PGC_USERSET,
-		0,
+		GUC_STANDARD,
+		NULL, NULL, NULL);
+
+	DefineCustomEnumVariable(
+		"citus.coordinator_aggregation_strategy",
+		gettext_noop("Sets the strategy for when an aggregate cannot be pushed down. "
+					 "'row-gather' will pull up intermediate rows to the coordinator, "
+					 "while 'disabled' will error if coordinator aggregation is necessary"),
+		NULL,
+		&CoordinatorAggregationStrategy,
+		COORDINATOR_AGGREGATION_ROW_GATHER,
+		coordinator_aggregation_options,
+		PGC_USERSET,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomEnumVariable(
@@ -847,9 +1313,24 @@ RegisterCitusConfigVariables(void)
 					 "performance benefits."),
 		&MultiShardCommitProtocol,
 		COMMIT_PROTOCOL_2PC,
-		multi_shard_commit_protocol_options,
+		shard_commit_protocol_options,
 		PGC_USERSET,
-		0,
+		GUC_STANDARD,
+		NULL, NULL, NULL);
+
+	DefineCustomEnumVariable(
+		"citus.single_shard_commit_protocol",
+		gettext_noop(
+			"Sets the commit protocol for commands modifying a single shards with multiple replicas."),
+		gettext_noop("When a failure occurs during commands that modify multiple "
+					 "replicas, two-phase commit is required to ensure data is never lost "
+					 "and this is the default. However, changing to 1pc may give small "
+					 "performance benefits."),
+		&SingleShardCommitProtocol,
+		COMMIT_PROTOCOL_2PC,
+		shard_commit_protocol_options,
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL,
 		NULL, NULL, NULL);
 
 	DefineCustomEnumVariable(
@@ -866,7 +1347,7 @@ RegisterCitusConfigVariables(void)
 		TASK_ASSIGNMENT_GREEDY,
 		task_assignment_policy_options,
 		PGC_USERSET,
-		0,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomEnumVariable(
@@ -887,27 +1368,24 @@ RegisterCitusConfigVariables(void)
 		"citus.task_executor_type",
 		gettext_noop("Sets the executor type to be used for distributed queries."),
 		gettext_noop("The master node chooses between two different executor types "
-					 "when executing a distributed query.The real-time executor is "
+					 "when executing a distributed query.The adaptive executor is "
 					 "optimal for simple key-value lookup queries and queries that "
-					 "involve aggregations and/or co-located joins on multiple shards. "
-					 "The task-tracker executor is optimal for long-running, complex "
-					 "queries that touch thousands of shards and/or that involve table "
-					 "repartitioning."),
+					 "involve aggregations and/or co-located joins on multiple shards. "),
 		&TaskExecutorType,
-		MULTI_EXECUTOR_REAL_TIME,
+		MULTI_EXECUTOR_ADAPTIVE,
 		task_executor_type_options,
 		PGC_USERSET,
-		0,
-		NULL, NULL, NULL);
+		GUC_STANDARD,
+		WarnIfDeprecatedExecutorUsed, NULL, NULL);
 
 	DefineCustomBoolVariable(
 		"citus.enable_repartition_joins",
-		gettext_noop("Allows Citus to use task-tracker executor when necessary."),
+		gettext_noop("Allows Citus to repartition data between nodes."),
 		NULL,
 		&EnableRepartitionJoins,
 		false,
 		PGC_USERSET,
-		0,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomEnumVariable(
@@ -923,7 +1401,7 @@ RegisterCitusConfigVariables(void)
 		&ShardPlacementPolicy,
 		SHARD_PLACEMENT_ROUND_ROBIN, shard_placement_policy_options,
 		PGC_USERSET,
-		0,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomEnumVariable(
@@ -933,7 +1411,7 @@ RegisterCitusConfigVariables(void)
 		&ReadFromSecondaries,
 		USE_SECONDARY_NODES_NEVER, use_secondary_nodes_options,
 		PGC_SU_BACKEND,
-		0,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomEnumVariable(
@@ -941,9 +1419,9 @@ RegisterCitusConfigVariables(void)
 		gettext_noop("Sets the level of multi task query execution log messages"),
 		NULL,
 		&MultiTaskQueryLogLevel,
-		MULTI_TASK_QUERY_INFO_OFF, multi_task_query_log_level_options,
+		CITUS_LOG_LEVEL_OFF, log_level_options,
 		PGC_USERSET,
-		0,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomEnumVariable(
@@ -953,7 +1431,7 @@ RegisterCitusConfigVariables(void)
 		&MultiShardConnectionType,
 		PARALLEL_CONNECTION, multi_shard_modify_connection_options,
 		PGC_USERSET,
-		0,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomStringVariable(
@@ -963,7 +1441,7 @@ RegisterCitusConfigVariables(void)
 		&CitusVersion,
 		CITUS_VERSION,
 		PGC_INTERNAL,
-		0,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomStringVariable(
@@ -973,7 +1451,7 @@ RegisterCitusConfigVariables(void)
 		&CurrentCluster,
 		"default",
 		PGC_SU_BACKEND,
-		0,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -983,7 +1461,7 @@ RegisterCitusConfigVariables(void)
 		&WritableStandbyCoordinator,
 		false,
 		PGC_USERSET,
-		0,
+		GUC_STANDARD,
 		NULL, NULL, NULL);
 
 	DefineCustomBoolVariable(
@@ -1038,19 +1516,6 @@ RegisterCitusConfigVariables(void)
 		GUC_NO_SHOW_ALL,
 		NULL, NULL, NULL);
 
-	DefineCustomIntVariable(
-		"citus.max_task_string_size",
-		gettext_noop("Sets the maximum size (in bytes) of a worker task call string."),
-		gettext_noop("Active worker tasks' are tracked in a shared hash table "
-					 "on the master node. This configuration value limits the "
-					 "maximum size of an individual worker task, and "
-					 "affects the size of pre-allocated shared memory."),
-		&MaxTaskStringSize,
-		12288, 8192, 65536,
-		PGC_POSTMASTER,
-		0,
-		NULL, NULL, NULL);
-
 	DefineCustomBoolVariable(
 		"citus.enable_statistics_collection",
 		gettext_noop("Enables sending basic usage statistics to Citus."),
@@ -1059,13 +1524,13 @@ RegisterCitusConfigVariables(void)
 					 "and operating system name. This configuration value controls "
 					 "whether these reports are sent."),
 		&EnableStatisticsCollection,
-#ifdef HAVE_LIBCURL
+#if defined(HAVE_LIBCURL) && defined(ENABLE_CITUS_STATISTICS_COLLECTION)
 		true,
 #else
 		false,
 #endif
 		PGC_SIGHUP,
-		GUC_SUPERUSER_ONLY | GUC_NO_SHOW_ALL,
+		GUC_SUPERUSER_ONLY,
 		&StatisticsCollectionGucCheckHook,
 		NULL, NULL);
 
@@ -1105,8 +1570,30 @@ RegisterCitusConfigVariables(void)
 		GUC_NO_SHOW_ALL,
 		NULL, NULL, NULL);
 
-	NormalizeWorkerListPath();
+	DefineCustomBoolVariable(
+		"citus.replicate_reference_tables_on_activate",
+		NULL,
+		NULL,
+		&ReplicateReferenceTablesOnActivate,
+		true,
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
 
+	DefineCustomEnumVariable(
+		"citus.explain_analyze_sort_method",
+		gettext_noop("Sets the sorting method for EXPLAIN ANALYZE queries."),
+		gettext_noop("This parameter is intended for testing. It is developed "
+					 "to get consistent regression test outputs. When it is set "
+					 "to 'time', EXPLAIN ANALYZE output is sorted by execution "
+					 "duration on workers. When it is set to 'taskId', it is "
+					 "sorted by task id. By default, it is set to 'time'; but "
+					 "in regression tests, it's set to 'taskId' for consistency."),
+		&ExplainAnalyzeSortMethod,
+		EXPLAIN_ANALYZE_SORT_BY_TIME, explain_analyze_sort_method_options,
+		PGC_USERSET,
+		GUC_NO_SHOW_ALL,
+		NULL, NULL, NULL);
 
 	/* warn about config items in the citus namespace that are not registered above */
 	EmitWarningsOnPlaceholders("citus");
@@ -1135,60 +1622,67 @@ ErrorIfNotASuitableDeadlockFactor(double *newval, void **extra, GucSource source
 
 
 /*
- * NormalizeWorkerListPath converts the path configured via
- * citus.worker_list_file into an absolute path, falling back to the default
- * value if necessary. The previous value of the config variable is
- * overwritten with the normalized value.
- *
- * NB: This has to be called before ChangeToDataDir() is called as otherwise
- * the relative paths won't make much sense to the user anymore.
+ * WarnIfDeprecatedExecutorUsed prints a warning and sets the config value to
+ * adaptive executor (a.k.a., ignores real-time executor).
  */
-static void
-NormalizeWorkerListPath(void)
+static bool
+WarnIfDeprecatedExecutorUsed(int *newval, void **extra, GucSource source)
 {
-	char *absoluteFileName = NULL;
+	if (*newval == DUMMY_REAL_TIME_EXECUTOR_ENUM_VALUE)
+	{
+		ereport(WARNING, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						  errmsg("Ignoring the setting, real-time executor is "
+								 "deprecated")));
 
-	if (WorkerListFileName != NULL)
-	{
-		absoluteFileName = make_absolute_path(WorkerListFileName);
-	}
-	else if (DataDir != NULL)
-	{
-		absoluteFileName = malloc(strlen(DataDir) + strlen(WORKER_LIST_FILENAME) + 2);
-		if (absoluteFileName == NULL)
-		{
-			ereport(FATAL, (errcode(ERRCODE_OUT_OF_MEMORY),
-							errmsg("out of memory")));
-		}
-
-		sprintf(absoluteFileName, "%s/%s", DataDir, WORKER_LIST_FILENAME);
-	}
-	else
-	{
-		ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						errmsg("%s does not know where to find the \"worker_list_file\" "
-							   "configuration file.\n"
-							   "This can be specified as \"citus.worker_list_file\" in "
-							   "\"%s\", or by the -D invocation option, or by the PGDATA "
-							   "environment variable.\n", progname, ConfigFileName)));
+		/* adaptive executor is superset of real-time, so switch to that */
+		*newval = MULTI_EXECUTOR_ADAPTIVE;
 	}
 
-	SetConfigOption("citus.worker_list_file", absoluteFileName, PGC_POSTMASTER,
-					PGC_S_OVERRIDE);
-	free(absoluteFileName);
+	return true;
+}
+
+
+/*
+ * NoticeIfSubqueryPushdownEnabled prints a notice when a user sets
+ * citus.subquery_pushdown to ON. It doesn't print the notice if the
+ * value is already true.
+ */
+static bool
+NoticeIfSubqueryPushdownEnabled(bool *newval, void **extra, GucSource source)
+{
+	/* notice only when the value changes */
+	if (*newval == true && SubqueryPushdown == false)
+	{
+		ereport(NOTICE, (errcode(ERRCODE_WARNING_DEPRECATED_FEATURE),
+						 errmsg("Setting citus.subquery_pushdown flag is "
+								"discouraged becuase it forces the planner "
+								"to pushdown certain queries, skipping "
+								"relevant correctness checks."),
+						 errdetail(
+							 "When enabled, the planner skips many correctness checks "
+							 "for subqueries and pushes down the queries to shards as-is. "
+							 "It means that the queries are likely to return wrong results "
+							 "unless the user is absolutely sure that pushing down the "
+							 "subquery is safe. This GUC is maintained only for backward "
+							 "compatibility, no new users are supposed to use it. The planner "
+							 "is capable of pushing down as much computation as possible to the "
+							 "shards depending on the query.")));
+	}
+
+	return true;
 }
 
 
 /*
  * NodeConninfoGucCheckHook ensures conninfo settings are in the expected form
- * and that the keywords of all non-null settings are on a whitelist devised to
+ * and that the keywords of all non-null settings are on a allowlist devised to
  * keep users from setting options that may result in confusion.
  */
 static bool
 NodeConninfoGucCheckHook(char **newval, void **extra, GucSource source)
 {
 	/* this array _must_ be kept in an order usable by bsearch */
-	const char *whitelist[] = {
+	const char *allowedConninfoKeywords[] = {
 		"application_name",
 		"connect_timeout",
 			#if defined(ENABLE_GSS) && defined(ENABLE_SSPI)
@@ -1207,8 +1701,8 @@ NodeConninfoGucCheckHook(char **newval, void **extra, GucSource source)
 		"sslrootcert"
 	};
 	char *errorMsg = NULL;
-	bool conninfoValid = CheckConninfo(*newval, whitelist, lengthof(whitelist),
-									   &errorMsg);
+	bool conninfoValid = CheckConninfo(*newval, allowedConninfoKeywords,
+									   lengthof(allowedConninfoKeywords), &errorMsg);
 
 	if (!conninfoValid)
 	{
@@ -1228,15 +1722,18 @@ NodeConninfoGucCheckHook(char **newval, void **extra, GucSource source)
 static void
 NodeConninfoGucAssignHook(const char *newval, void *extra)
 {
-	PQconninfoOption *optionArray = NULL;
-	PQconninfoOption *option = NULL;
-
 	if (newval == NULL)
 	{
 		newval = "";
 	}
 
-	optionArray = PQconninfoParse(newval, NULL);
+	if (strcmp(newval, NodeConninfo) == 0)
+	{
+		/* It did not change, no need to do anything */
+		return;
+	}
+
+	PQconninfoOption *optionArray = PQconninfoParse(newval, NULL);
 	if (optionArray == NULL)
 	{
 		ereport(FATAL, (errmsg("cannot parse node_conninfo value"),
@@ -1246,7 +1743,7 @@ NodeConninfoGucAssignHook(const char *newval, void *extra)
 
 	ResetConnParams();
 
-	for (option = optionArray; option->keyword != NULL; option++)
+	for (PQconninfoOption *option = optionArray; option->keyword != NULL; option++)
 	{
 		if (option->val == NULL || option->val[0] == '\0')
 		{
@@ -1257,6 +1754,51 @@ NodeConninfoGucAssignHook(const char *newval, void *extra)
 	}
 
 	PQconninfoFree(optionArray);
+
+	/*
+	 * Mark all connections for shutdown, since they have been opened using old
+	 * connection settings. This is mostly important when changing SSL
+	 * parameters, otherwise these would not be applied and connections could
+	 * be unencrypted when the user doesn't want that.
+	 */
+	CloseAllConnectionsAfterTransaction();
+}
+
+
+/*
+ * MaxSharedPoolSizeGucShowHook overrides the value that is shown to the
+ * user when the default value has not been set.
+ */
+static const char *
+MaxSharedPoolSizeGucShowHook(void)
+{
+	StringInfo newvalue = makeStringInfo();
+
+	if (MaxSharedPoolSize == 0)
+	{
+		appendStringInfo(newvalue, "%d", GetMaxSharedPoolSize());
+	}
+	else
+	{
+		appendStringInfo(newvalue, "%d", MaxSharedPoolSize);
+	}
+
+	return (const char *) newvalue->data;
+}
+
+
+/*
+ * LocalPoolSizeGucShowHook overrides the value that is shown to the
+ * user when the default value has not been set.
+ */
+static const char *
+LocalPoolSizeGucShowHook(void)
+{
+	StringInfo newvalue = makeStringInfo();
+
+	appendStringInfo(newvalue, "%d", GetLocalSharedPoolSize());
+
+	return (const char *) newvalue->data;
 }
 
 
@@ -1279,4 +1821,22 @@ StatisticsCollectionGucCheckHook(bool *newval, void **extra, GucSource source)
 		return true;
 	}
 #endif
+}
+
+
+/*
+ * CitusAuthHook is a callback for client authentication that Postgres provides.
+ * Citus uses this hook to count the number of active backends.
+ */
+static void
+CitusAuthHook(Port *port, int status)
+{
+	/* let other authentication hooks to kick in first */
+	if (original_client_auth_hook)
+	{
+		original_client_auth_hook(port, status);
+	}
+
+	RegisterClientBackendCounterDecrement();
+	IncrementClientBackendCounter();
 }

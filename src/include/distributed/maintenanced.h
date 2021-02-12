@@ -4,7 +4,7 @@
  *	  Background worker run for each citus using database in a postgres
  *    cluster.
  *
- * Copyright (c) 2017, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -22,8 +22,10 @@
 extern double DistributedDeadlockDetectionTimeoutFactor;
 
 extern void StopMaintenanceDaemon(Oid databaseId);
+extern void TriggerMetadataSync(Oid databaseId);
 extern void InitializeMaintenanceDaemon(void);
 extern void InitializeMaintenanceDaemonBackend(void);
+extern bool LockCitusExtension(void);
 
 extern void CitusMaintenanceDaemonMain(Datum main_arg);
 

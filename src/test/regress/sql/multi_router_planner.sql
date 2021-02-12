@@ -10,6 +10,10 @@ SET citus.next_shard_id TO 840000;
 -- other tests that triggers fast-path-router planner
 SET citus.enable_fast_path_router_planner TO false;
 
+-- prevent PG 11 - PG 12 outputs to diverge
+-- and CTE inlining is not relevant to router plannery anyway
+SET citus.enable_cte_inlining TO false;
+
 CREATE TABLE articles_hash (
 	id bigint NOT NULL,
 	author_id bigint NOT NULL,
@@ -107,7 +111,6 @@ INSERT INTO articles_hash VALUES (50, 10, 'anjanette', 19519);
 
 
 
-SET citus.task_executor_type TO 'real-time';
 SET client_min_messages TO 'DEBUG2';
 
 -- insert a single row for the test
@@ -159,12 +162,39 @@ SELECT author_id, sum(word_count) AS corpus_size FROM articles_hash
 
 -- query is a single shard query but can't do shard pruning,
 -- not router-plannable due to <= and IN
-SELECT * FROM articles_hash WHERE author_id <= 1; 
-SELECT * FROM articles_hash WHERE author_id IN (1, 3); 
+SELECT * FROM articles_hash WHERE author_id <= 1 ORDER BY id;
+SELECT * FROM articles_hash WHERE author_id IN (1, 3) ORDER BY id;
+SELECT * FROM articles_hash WHERE author_id IN (1, NULL) ORDER BY id;
 
 -- queries with CTEs are supported
 WITH first_author AS ( SELECT id FROM articles_hash WHERE author_id = 1)
 SELECT * FROM first_author;
+
+-- SELECT FOR UPDATE is supported if not involving reference table
+BEGIN;
+WITH first_author AS (
+    SELECT articles_hash.id, auref.name FROM articles_hash, authors_reference auref
+    WHERE author_id = 2 AND auref.id = author_id
+    FOR UPDATE
+)
+UPDATE articles_hash SET title = first_author.name
+FROM first_author WHERE articles_hash.author_id = 2 AND articles_hash.id = first_author.id;
+
+WITH first_author AS (
+    SELECT id, word_count FROM articles_hash WHERE author_id = 2
+    FOR UPDATE
+)
+UPDATE articles_hash SET title = first_author.word_count::text
+FROM first_author WHERE articles_hash.author_id = 2 AND articles_hash.id = first_author.id;
+
+-- Without FOR UPDATE this is router plannable
+WITH first_author AS (
+    SELECT articles_hash.id, auref.name FROM articles_hash, authors_reference auref
+    WHERE author_id = 2 AND auref.id = author_id
+)
+UPDATE articles_hash SET title = first_author.name
+FROM first_author WHERE articles_hash.author_id = 2 AND articles_hash.id = first_author.id;
+ROLLBACK;
 
 -- queries with CTEs are supported even if CTE is not referenced inside query
 WITH first_author AS ( SELECT id FROM articles_hash WHERE author_id = 1)
@@ -185,7 +215,7 @@ id_title AS (SELECT id, title from articles_hash WHERE author_id = 2)
 SELECT * FROM id_author, id_title WHERE id_author.id = id_title.id;
 
 -- recursive CTEs are supported when filtered on partition column
-CREATE TABLE company_employees (company_id int, employee_id int, manager_id int); 
+CREATE TABLE company_employees (company_id int, employee_id int, manager_id int);
 SELECT master_create_distributed_table('company_employees', 'company_id', 'hash');
 SELECT master_create_worker_shards('company_employees', 4, 1);
 
@@ -203,7 +233,7 @@ INSERT INTO company_employees values(3, 3, 1);
 WITH RECURSIVE hierarchy as (
 	SELECT *, 1 AS level
 		FROM company_employees
-		WHERE company_id = 1 and manager_id = 0 
+		WHERE company_id = 1 and manager_id = 0
 	UNION
 	SELECT ce.*, (h.level+1)
 		FROM hierarchy h JOIN company_employees ce
@@ -217,7 +247,7 @@ SELECT * FROM hierarchy WHERE LEVEL <= 2;
 WITH RECURSIVE hierarchy as (
 	SELECT *, 1 AS level
 		FROM company_employees
-		WHERE company_id = 1 and manager_id = 0 
+		WHERE company_id = 1 and manager_id = 0
 	UNION
 	SELECT ce.*, (h.level+1)
 		FROM hierarchy h JOIN company_employees ce
@@ -230,7 +260,7 @@ SELECT * FROM hierarchy WHERE LEVEL <= 2;
 WITH RECURSIVE hierarchy as (
 	SELECT *, 1 AS level
 		FROM company_employees
-		WHERE company_id = 3 and manager_id = 0 
+		WHERE company_id = 3 and manager_id = 0
 	UNION
 	SELECT ce.*, (h.level+1)
 		FROM hierarchy h JOIN company_employees ce
@@ -308,7 +338,7 @@ ORDER BY test.word_count DESC, articles_hash.id LIMIT 5;
 
 
 SELECT articles_hash.id,test.word_count
-FROM articles_hash, (SELECT id, word_count FROM articles_hash) AS test 
+FROM articles_hash, (SELECT id, word_count FROM articles_hash) AS test
 WHERE test.id = articles_hash.id and articles_hash.author_id = 1
 ORDER BY articles_hash.id;
 
@@ -344,13 +374,13 @@ SELECT a.author_id as first_author, b.word_count as second_word_count
 	WHERE a.author_id = 10 and a.author_id = b.author_id
 	LIMIT 3;
 
--- following join is router plannable since the same worker 
+-- following join is router plannable since the same worker
 -- has both shards
 SELECT a.author_id as first_author, b.word_count as second_word_count
 	FROM articles_hash a, articles_single_shard_hash b
 	WHERE a.author_id = 10 and a.author_id = b.author_id
 	LIMIT 3;
-	
+
 -- following join is not router plannable since there are no
 -- workers containing both shards, but will work through recursive
 -- planning
@@ -380,7 +410,7 @@ SELECT *
 	ORDER BY id desc
 	LIMIT 2
 	OFFSET 1;
-	
+
 -- single shard select with group by on non-partition column is router plannable
 SELECT id
 	FROM articles_hash
@@ -476,7 +506,6 @@ SELECT *
 	WHERE author_id >= 1 AND author_id <= 3
 ORDER BY 1,2,3,4;
 
-SET citus.task_executor_type TO 'real-time';
 
 -- Test various filtering options for router plannable check
 SET client_min_messages to 'DEBUG2';
@@ -491,7 +520,7 @@ SELECT *
 SELECT *
 	FROM articles_hash
 	WHERE author_id = 1 or id = 1;
-	
+
 -- router plannable
 SELECT *
 	FROM articles_hash
@@ -511,7 +540,7 @@ SELECT *
 SELECT *
 	FROM articles_hash
 	WHERE author_id = 1 or id = 1;
-	
+
 -- router plannable due to abs(-1) getting converted to 1 by postgresql
 SELECT *
 	FROM articles_hash
@@ -567,12 +596,11 @@ SELECT *
 	FROM articles_hash
 	WHERE (title like '%s' or title like 'a%') and (author_id = 1) and (word_count < 3000 or word_count > 8000);
 
--- window functions are supported if query is router plannable
-SELECT LAG(title, 1) over (ORDER BY word_count) prev, title, word_count 
+SELECT LAG(title, 1) over (ORDER BY word_count) prev, title, word_count
 	FROM articles_hash
 	WHERE author_id = 5;
 
-SELECT LAG(title, 1) over (ORDER BY word_count) prev, title, word_count 
+SELECT LAG(title, 1) over (ORDER BY word_count) prev, title, word_count
 	FROM articles_hash
 	WHERE author_id = 5
 	ORDER BY word_count DESC;
@@ -585,29 +613,30 @@ SELECT id, word_count, AVG(word_count) over (order by word_count)
 	FROM articles_hash
 	WHERE author_id = 1;
 
-SELECT word_count, rank() OVER (PARTITION BY author_id ORDER BY word_count)  
-	FROM articles_hash 
+SELECT word_count, rank() OVER (PARTITION BY author_id ORDER BY word_count)
+	FROM articles_hash
 	WHERE author_id = 1;
 
--- window functions are not supported for not router plannable queries
 SELECT id, MIN(id) over (order by word_count)
 	FROM articles_hash
-	WHERE author_id = 1 or author_id = 2;
+	WHERE author_id = 1 or author_id = 2
+    ORDER BY 1;
 
-SELECT LAG(title, 1) over (ORDER BY word_count) prev, title, word_count 
+SELECT LAG(title, 1) over (ORDER BY word_count) prev, title, word_count
 	FROM articles_hash
-	WHERE author_id = 5 or author_id = 2;
+	WHERE author_id = 5 or author_id = 2
+    ORDER BY 2;
 
 -- where false queries are router plannable
-SELECT * 
+SELECT *
 	FROM articles_hash
 	WHERE false;
 
-SELECT * 
+SELECT *
 	FROM articles_hash
 	WHERE author_id = 1 and false;
 
-SELECT * 
+SELECT *
 	FROM articles_hash
 	WHERE author_id = 1 and 1=0;
 
@@ -615,16 +644,16 @@ SELECT a.author_id as first_author, b.word_count as second_word_count
 	FROM articles_hash a, articles_single_shard_hash b
 	WHERE a.author_id = 10 and a.author_id = b.author_id and false;
 
-SELECT * 
+SELECT *
 	FROM articles_hash
 	WHERE null;
 
 -- where false with immutable function returning false
-SELECT * 
+SELECT *
 	FROM articles_hash a
 	WHERE a.author_id = 10 and int4eq(1, 2);
 
-SELECT * 
+SELECT *
 	FROM articles_hash a
 	WHERE int4eq(1, 2);
 
@@ -638,18 +667,18 @@ SELECT a.author_id as first_author, b.word_count as second_word_count
 
 -- partition_column is null clause does not prune out any shards,
 -- all shards remain after shard pruning, not router plannable
-SELECT * 
+SELECT *
 	FROM articles_hash a
 	WHERE a.author_id is null;
 
 -- partition_column equals to null clause prunes out all shards
 -- no shards after shard pruning, router plannable
-SELECT * 
+SELECT *
 	FROM articles_hash a
 	WHERE a.author_id = null;
 
 -- stable function returning bool
-SELECT * 
+SELECT *
 	FROM articles_hash a
 	WHERE date_ne_timestamp('1954-04-11', '1954-04-11'::timestamp);
 
@@ -680,7 +709,52 @@ ORDER BY id;
 INTERSECT
 (SELECT * FROM articles_hash WHERE author_id = 2 and 1=0);
 
+-- if these queries get routed, they would fail since number1() does not exist
+-- on workers. This tests an exceptional case in which some local tables bypass
+-- checks.
+CREATE OR REPLACE FUNCTION number1(OUT datid int)
+RETURNS SETOF int
+AS $$
+DECLARE
+BEGIN
+    RETURN QUERY SELECT 1;
+END;
+$$ LANGUAGE plpgsql;
+
+SELECT 1 FROM authors_reference  r JOIN (
+  SELECT s.datid FROM number1() s LEFT JOIN pg_database d ON s.datid = d.oid
+) num_db ON (r.id = num_db.datid) LIMIT 1;
+
+-- same scenario with a view
+CREATE VIEW num_db AS
+SELECT s.datid FROM number1() s LEFT JOIN pg_database d ON s.datid = d.oid;
+
+SELECT 1 FROM authors_reference r JOIN num_db ON (r.id = num_db.datid) LIMIT 1;
+
+-- with a CTE in a view
+WITH cte AS (SELECT * FROM num_db)
+SELECT 1 FROM authors_reference r JOIN cte ON (r.id = cte.datid) LIMIT 1;
+
+-- hide changes between major versions
+RESET client_min_messages;
+
+-- with pg_stat_activity view
+WITH pg_stat_activity AS (
+  SELECT
+    pg_stat_activity.datid,
+    pg_stat_activity.application_name,
+    pg_stat_activity.query
+  FROM pg_catalog.pg_stat_activity
+)
+SELECT 1 FROM authors_reference  r LEFT JOIN pg_stat_activity ON (r.id = pg_stat_activity.datid) LIMIT 1;
+
+SET client_min_messages TO DEBUG2;
+
 -- CTEs with where false
+-- terse because distribution column inference varies between pg11 & pg12
+\set VERBOSITY terse
+RESET client_min_messages;
+
 WITH id_author AS ( SELECT id, author_id FROM articles_hash WHERE author_id = 1),
 id_title AS (SELECT id, title from articles_hash WHERE author_id = 1 and 1=0)
 SELECT * FROM id_author, id_title WHERE id_author.id = id_title.id;
@@ -689,10 +763,13 @@ WITH id_author AS ( SELECT id, author_id FROM articles_hash WHERE author_id = 1)
 id_title AS (SELECT id, title from articles_hash WHERE author_id = 1)
 SELECT * FROM id_author, id_title WHERE id_author.id = id_title.id and 1=0;
 
+SET client_min_messages TO DEBUG2;
+\set VERBOSITY DEFAULT
+
 WITH RECURSIVE hierarchy as (
 	SELECT *, 1 AS level
 		FROM company_employees
-		WHERE company_id = 1 and manager_id = 0 
+		WHERE company_id = 1 and manager_id = 0
 	UNION
 	SELECT ce.*, (h.level+1)
 		FROM hierarchy h JOIN company_employees ce
@@ -704,7 +781,7 @@ SELECT * FROM hierarchy WHERE LEVEL <= 2 and 1=0;
 WITH RECURSIVE hierarchy as (
 	SELECT *, 1 AS level
 		FROM company_employees
-		WHERE company_id = 1 and manager_id = 0 
+		WHERE company_id = 1 and manager_id = 0
 	UNION
 	SELECT ce.*, (h.level+1)
 		FROM hierarchy h JOIN company_employees ce
@@ -727,13 +804,13 @@ SELECT * FROM hierarchy WHERE LEVEL <= 2;
 
 
 -- window functions with where false
-SELECT word_count, rank() OVER (PARTITION BY author_id ORDER BY word_count)  
-	FROM articles_hash 
+SELECT word_count, rank() OVER (PARTITION BY author_id ORDER BY word_count)
+	FROM articles_hash
 	WHERE author_id = 1 and 1=0;
 
 -- function calls in WHERE clause with non-relational arguments
 SELECT author_id FROM articles_hash
-	WHERE 
+	WHERE
 		substring('hello world', 1, 5) = 'hello'
 	ORDER BY
 		author_id
@@ -741,15 +818,15 @@ SELECT author_id FROM articles_hash
 
 -- when expression evaluates to false
 SELECT author_id FROM articles_hash
-	WHERE 
+	WHERE
 		substring('hello world', 1, 4) = 'hello'
 	ORDER BY
 		author_id
 	LIMIT 1;
 
-	
+
 -- verify range partitioned tables can be used in router plannable queries
--- just 4 shards to be created for each table to make sure 
+-- just 4 shards to be created for each table to make sure
 -- they are 'co-located' pairwise
 SET citus.shard_replication_factor TO 1;
 SELECT master_create_distributed_table('authors_range', 'id', 'range');
@@ -759,10 +836,10 @@ SELECT master_create_empty_shard('authors_range') as shard_id \gset
 UPDATE pg_dist_shard SET shardminvalue = 1, shardmaxvalue=10 WHERE shardid = :shard_id;
 
 SELECT master_create_empty_shard('authors_range') as shard_id \gset
-UPDATE pg_dist_shard SET shardminvalue = 11, shardmaxvalue=30 WHERE shardid = :shard_id;
+UPDATE pg_dist_shard SET shardminvalue = 11, shardmaxvalue=20 WHERE shardid = :shard_id;
 
 SELECT master_create_empty_shard('authors_range') as shard_id \gset
-UPDATE pg_dist_shard SET shardminvalue = 21, shardmaxvalue=40 WHERE shardid = :shard_id;
+UPDATE pg_dist_shard SET shardminvalue = 21, shardmaxvalue=30 WHERE shardid = :shard_id;
 
 SELECT master_create_empty_shard('authors_range') as shard_id \gset
 UPDATE pg_dist_shard SET shardminvalue = 31, shardmaxvalue=40 WHERE shardid = :shard_id;
@@ -771,13 +848,15 @@ SELECT master_create_empty_shard('articles_range') as shard_id \gset
 UPDATE pg_dist_shard SET shardminvalue = 1, shardmaxvalue=10 WHERE shardid = :shard_id;
 
 SELECT master_create_empty_shard('articles_range') as shard_id \gset
-UPDATE pg_dist_shard SET shardminvalue = 11, shardmaxvalue=30 WHERE shardid = :shard_id;
+UPDATE pg_dist_shard SET shardminvalue = 11, shardmaxvalue=20 WHERE shardid = :shard_id;
 
 SELECT master_create_empty_shard('articles_range') as shard_id \gset
-UPDATE pg_dist_shard SET shardminvalue = 21, shardmaxvalue=40 WHERE shardid = :shard_id;
+UPDATE pg_dist_shard SET shardminvalue = 21, shardmaxvalue=30 WHERE shardid = :shard_id;
 
 SELECT master_create_empty_shard('articles_range') as shard_id \gset
 UPDATE pg_dist_shard SET shardminvalue = 31, shardmaxvalue=40 WHERE shardid = :shard_id;
+
+SET citus.log_remote_commands TO on;
 
 -- single shard select queries are router plannable
 SELECT * FROM articles_range where author_id = 1;
@@ -787,28 +866,29 @@ SELECT * FROM articles_range where author_id = 1 or author_id = 5;
 SELECT * FROM articles_range where author_id = 1 and author_id = 2;
 
 -- single shard joins on range partitioned table are router plannable
-SELECT * FROM articles_range ar join authors_range au on (ar.author_id = au.id) 
+SELECT * FROM articles_range ar join authors_range au on (ar.author_id = au.id)
 	WHERE ar.author_id = 1;
 
 -- zero shard join is router plannable
 SELECT * FROM articles_range ar join authors_range au on (ar.author_id = au.id)
 	WHERE ar.author_id = 1 and au.id = 2;
 
+RESET citus.log_remote_commands;
+
 -- This query was intended to test "multi-shard join is not router plannable"
 -- To run it using repartition join logic we change the join columns
-SET citus.task_executor_type to "task-tracker";
+SET citus.enable_repartition_joins to ON;
 SELECT * FROM articles_range ar join authors_range au on (ar.title = au.name)
 	WHERE ar.author_id = 35;
 
 -- This query was intended to test "this is a bug, it is a single shard join
 -- query but not router plannable". To run it using repartition join logic we
 -- change the join columns.
-SELECT * FROM articles_range ar join authors_range au on (ar.title = au.name) 
+SELECT * FROM articles_range ar join authors_range au on (ar.title = au.name)
 	WHERE ar.author_id = 1 or au.id = 5;
-RESET citus.task_executor_type;
 
 -- bogus query, join on non-partition column, but router plannable due to filters
-SELECT * FROM articles_range ar join authors_range au on (ar.id = au.id) 
+SELECT * FROM articles_range ar join authors_range au on (ar.id = au.id)
 	WHERE ar.author_id = 1 and au.id < 10;
 
 -- join between hash and range partition tables are router plannable
@@ -821,7 +901,6 @@ SELECT * FROM articles_hash ar join authors_range au on (ar.author_id = au.id)
 -- not router plannable
 SELECT * FROM articles_hash ar join authors_range au on (ar.author_id = au.id)
 	WHERE ar.author_id = 3;
-
 -- join between a range partitioned table and reference table is router plannable
 SELECT * FROM articles_range ar join authors_reference au on (ar.author_id = au.id)
 	WHERE ar.author_id = 1;
@@ -833,7 +912,7 @@ SELECT * FROM articles_range ar join authors_reference au on (ar.author_id = au.
 -- it is not router plannable if hit multiple shards
 SELECT * FROM articles_range ar join authors_reference au on (ar.author_id = au.id)
 	WHERE ar.author_id = 1 or ar.author_id = 15;
-	
+
 -- following is a bug, function should have been
 -- evaluated at master before going to worker
 -- need to use a append distributed table here
@@ -842,36 +921,63 @@ SET citus.shard_replication_factor TO 1;
 SELECT master_create_empty_shard('articles_append') AS shard_id \gset
 UPDATE pg_dist_shard SET shardmaxvalue = 100, shardminvalue=1 WHERE shardid = :shard_id;
 
-SELECT author_id FROM articles_append
-	WHERE 
-		substring('articles_append'::regclass::text, 1, 5) = 'hello'
-	ORDER BY
-		author_id
-	LIMIT 1;
+-- we execute the query within a function to consolidate the error messages
+-- between different executors
+CREATE FUNCTION raise_failed_execution_router(query text) RETURNS void AS $$
+BEGIN
+        EXECUTE query;
+        EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%failed to execute task%' THEN
+                RAISE 'Task failed to execute';
+        ELSIF SQLERRM LIKE '%does not exist%' THEN
+          RAISE 'Task failed to execute';
+        ELSIF SQLERRM LIKE '%could not receive query results%' THEN
+          	RAISE 'Task failed to execute';
+        END IF;
+END;
+$$LANGUAGE plpgsql;
+
+SET client_min_messages TO ERROR;
+\set VERBOSITY terse
+
+SELECT raise_failed_execution_router($$
+	SELECT author_id FROM articles_append
+		WHERE
+			substring('articles_append'::regclass::text, 1, 5) = 'hello'
+		ORDER BY
+			author_id
+		LIMIT 1;
+$$);
 
 -- same query with where false but evaluation left to worker
-SELECT author_id FROM articles_append
-	WHERE 
-		substring('articles_append'::regclass::text, 1, 4) = 'hello'
-	ORDER BY
-		author_id
-	LIMIT 1;
+SELECT raise_failed_execution_router($$
+	SELECT author_id FROM articles_append
+		WHERE
+			substring('articles_append'::regclass::text, 1, 4) = 'hello'
+		ORDER BY
+			author_id
+		LIMIT 1;
+$$);
 
 -- same query on router planner with where false but evaluation left to worker
-SELECT author_id FROM articles_single_shard_hash
-	WHERE 
-		substring('articles_single_shard_hash'::regclass::text, 1, 4) = 'hello'
-	ORDER BY
-		author_id
-	LIMIT 1;
+SELECT raise_failed_execution_router($$
+	SELECT author_id FROM articles_single_shard_hash
+		WHERE
+			substring('articles_single_shard_hash'::regclass::text, 1, 4) = 'hello'
+		ORDER BY
+			author_id
+		LIMIT 1;
+$$);
 
-SELECT author_id FROM articles_hash
-	WHERE 
-		author_id = 1
-		AND substring('articles_hash'::regclass::text, 1, 5) = 'hello'
-	ORDER BY
-		author_id
-	LIMIT 1;
+SELECT raise_failed_execution_router($$
+	SELECT author_id FROM articles_hash
+		WHERE
+			author_id = 1
+			AND substring('articles_hash'::regclass::text, 1, 5) = 'hello'
+		ORDER BY
+			author_id
+		LIMIT 1;
+$$);
 
 -- create a dummy function to be used in filtering
 CREATE OR REPLACE FUNCTION someDummyFunction(regclass)
@@ -882,7 +988,7 @@ BEGIN
 END;
 $$ LANGUAGE 'plpgsql' IMMUTABLE;
 
--- not router plannable, returns all rows 
+-- not router plannable, returns all rows
 SELECT * FROM articles_hash
 	WHERE
 		someDummyFunction('articles_hash') = md5('articles_hash')
@@ -891,12 +997,16 @@ SELECT * FROM articles_hash
 	LIMIT 5;
 
 -- router plannable, errors
-SELECT * FROM articles_hash
-	WHERE
-		someDummyFunction('articles_hash') = md5('articles_hash') AND author_id = 1
-	ORDER BY
-		author_id, id
-	LIMIT 5;
+SELECT raise_failed_execution_router($$
+	SELECT * FROM articles_hash
+		WHERE
+			someDummyFunction('articles_hash') = md5('articles_hash') AND author_id = 1
+		ORDER BY
+			author_id, id
+		LIMIT 5;
+$$);
+
+\set VERBOSITY DEFAULT
 
 -- temporarily turn off debug messages before dropping the function
 SET client_min_messages TO 'NOTICE';
@@ -904,10 +1014,10 @@ DROP FUNCTION someDummyFunction(regclass);
 
 SET client_min_messages TO 'DEBUG2';
 
--- complex query hitting a single shard 	
+-- complex query hitting a single shard
 SELECT
 	count(DISTINCT CASE
-			WHEN 
+			WHEN
 				word_count > 100
 			THEN
 				id
@@ -922,7 +1032,7 @@ SELECT
 -- same query is not router plannable if hits multiple shards
 SELECT
 	count(DISTINCT CASE
-			WHEN 
+			WHEN
 				word_count > 100
 			THEN
 				id
@@ -954,7 +1064,7 @@ END;
 
 -- cursor queries are router plannable
 BEGIN;
-DECLARE test_cursor CURSOR FOR 
+DECLARE test_cursor CURSOR FOR
 	SELECT *
 		FROM articles_hash
 		WHERE author_id = 1
@@ -971,7 +1081,7 @@ COPY (
 	FROM articles_hash
 	WHERE author_id = 1
 	ORDER BY id) TO STDOUT;
-	
+
 -- table creation queries inside can be router plannable
 CREATE TEMP TABLE temp_articles_hash as
 	SELECT *
@@ -979,7 +1089,7 @@ CREATE TEMP TABLE temp_articles_hash as
 	WHERE author_id = 1
 	ORDER BY id;
 
--- router plannable queries may include filter for aggragates
+-- router plannable queries may include filter for aggregates
 SELECT count(*), count(*) FILTER (WHERE id < 3)
 	FROM articles_hash
 	WHERE author_id = 1;
@@ -993,7 +1103,8 @@ SELECT count(*), count(*) FILTER (WHERE id < 3)
 PREPARE author_1_articles as
 	SELECT *
 	FROM articles_hash
-	WHERE author_id = 1;
+	WHERE author_id = 1
+	ORDER BY 1;
 
 EXECUTE author_1_articles;
 
@@ -1001,7 +1112,8 @@ EXECUTE author_1_articles;
 PREPARE author_articles(int) as
 	SELECT *
 	FROM articles_hash
-	WHERE author_id = $1;
+	WHERE author_id = $1
+	ORDER BY 1;
 
 EXECUTE author_articles(1);
 
@@ -1031,7 +1143,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-SELECT * FROM author_articles_id_word_count();
+SELECT * FROM author_articles_id_word_count() ORDER BY 1;
 
 -- materialized views can be created for router plannable queries
 CREATE MATERIALIZED VIEW mv_articles_hash_empty AS
@@ -1042,19 +1154,18 @@ CREATE MATERIALIZED VIEW mv_articles_hash_data AS
 	SELECT * FROM articles_hash WHERE author_id in (1,2);
 SELECT * FROM mv_articles_hash_data ORDER BY 1, 2, 3, 4;
 
--- router planner/executor is now enabled for task-tracker executor
-SET citus.task_executor_type to 'task-tracker';
 SELECT id
 	FROM articles_hash
-	WHERE author_id = 1;
+	WHERE author_id = 1
+	ORDER BY 1;
 
--- insert query is router plannable even under task-tracker
 INSERT INTO articles_hash VALUES (51, 1, 'amateus', 1814), (52, 1, 'second amateus', 2824);
 
--- verify insert is successfull (not router plannable and executable)
+-- verify insert is successful (not router plannable and executable)
 SELECT id
 	FROM articles_hash
-	WHERE author_id = 1;
+	WHERE author_id = 1
+	ORDER BY 1;
 
 SET client_min_messages to 'NOTICE';
 
@@ -1102,6 +1213,9 @@ DROP FUNCTION author_articles_id_word_count();
 
 DROP MATERIALIZED VIEW mv_articles_hash_empty;
 DROP MATERIALIZED VIEW mv_articles_hash_data;
+
+DROP VIEW num_db;
+DROP FUNCTION number1();
 
 DROP TABLE articles_hash;
 DROP TABLE articles_single_shard_hash;

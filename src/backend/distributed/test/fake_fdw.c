@@ -5,12 +5,15 @@
  * This file contains a barebones FDW implementation, suitable for use in
  * test code. Inspired by Andrew Dunstan's blackhole_fdw.
  *
- * Copyright (c) 2014-2016, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
+
+#include "distributed/pg_version_constants.h"
+
 #include "c.h"
 #include "fmgr.h"
 
@@ -22,7 +25,11 @@
 #include "nodes/nodes.h"
 #include "nodes/pg_list.h"
 #include "nodes/plannodes.h"
+#if PG_VERSION_NUM >= PG_VERSION_12
+#include "nodes/pathnodes.h"
+#else
 #include "nodes/relation.h"
+#endif
 #include "optimizer/pathnode.h"
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
@@ -114,7 +121,10 @@ FakeGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid,
  * FakeBeginForeignScan begins the fake plan (i.e. does nothing).
  */
 static void
-FakeBeginForeignScan(ForeignScanState *node, int eflags) { }
+FakeBeginForeignScan(ForeignScanState *node, int eflags)
+{
+	/* this comment is for indentation consistency */
+}
 
 
 /*
@@ -134,11 +144,17 @@ FakeIterateForeignScan(ForeignScanState *node)
  * FakeReScanForeignScan restarts the fake plan (i.e. does nothing).
  */
 static void
-FakeReScanForeignScan(ForeignScanState *node) { }
+FakeReScanForeignScan(ForeignScanState *node)
+{
+	/* this comment is for indentation consistency */
+}
 
 
 /*
  * FakeEndForeignScan ends the fake plan (i.e. does nothing).
  */
 static void
-FakeEndForeignScan(ForeignScanState *node) { }
+FakeEndForeignScan(ForeignScanState *node)
+{
+	/* this comment is for indentation consistency */
+}

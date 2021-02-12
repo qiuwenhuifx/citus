@@ -4,7 +4,7 @@
  *	  Type declarations for multi-relational algebra operators, and function
  *	  declarations for building logical plans over distributed relations.
  *
- * Copyright (c) 2012-2016, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  * $Id$
  *
@@ -16,6 +16,7 @@
 
 #include "distributed/citus_nodes.h"
 #include "distributed/errormessage.h"
+#include "distributed/log_utils.h"
 #include "distributed/multi_join_order.h"
 #include "distributed/relation_restriction_equivalence.h"
 #include "nodes/nodes.h"
@@ -155,7 +156,7 @@ typedef struct MultiCartesianProduct
 /*
  * MultiExtendedOp defines a set of extended operators that operate on columns
  * in relational algebra. This node allows us to distinguish between operations
- * in the master and worker nodes, and also captures the following:
+ * in the coordinator and worker nodes, and also captures the following:
  *
  * (1) Aggregate functions such as sums or averages;
  * (2) Grouping of attributes; these groupings may also be tied to aggregates;
@@ -173,11 +174,15 @@ typedef struct MultiExtendedOp
 	List *sortClauseList;
 	Node *limitCount;
 	Node *limitOffset;
+#if PG_VERSION_NUM >= PG_VERSION_13
+	LimitOption limitOption;
+#endif
 	Node *havingQual;
 	List *distinctClause;
+	List *windowClause;
 	bool hasDistinctOn;
 	bool hasWindowFuncs;
-	List *windowClause;
+	bool onlyPushableWindowFunctions;
 } MultiExtendedOp;
 
 
@@ -185,13 +190,19 @@ typedef struct MultiExtendedOp
 extern MultiTreeRoot * MultiLogicalPlanCreate(Query *originalQuery, Query *queryTree,
 											  PlannerRestrictionContext *
 											  plannerRestrictionContext);
-extern bool FindNodeCheck(Node *node, bool (*check)(Node *));
-extern bool SingleRelationRepartitionSubquery(Query *queryTree);
+extern bool FindNodeMatchingCheckFunction(Node *node, bool (*check)(Node *));
 extern bool TargetListOnPartitionColumn(Query *query, List *targetEntryList);
-extern bool FindNodeCheckInRangeTableList(List *rtable, bool (*check)(Node *));
+extern bool FindNodeMatchingCheckFunctionInRangeTableList(List *rtable, bool (*check)(
+															  Node *));
+extern bool IsCitusTableRTE(Node *node);
+extern bool IsDistributedOrReferenceTableRTE(Node *node);
 extern bool IsDistributedTableRTE(Node *node);
+extern bool IsReferenceTableRTE(Node *node);
 extern bool QueryContainsDistributedTableRTE(Query *query);
+extern bool IsCitusExtraDataContainerRelation(RangeTblEntry *rte);
 extern bool ContainsReadIntermediateResultFunction(Node *node);
+extern bool ContainsReadIntermediateResultArrayFunction(Node *node);
+extern char * FindIntermediateResultIdIfExists(RangeTblEntry *rte);
 extern MultiNode * ParentNode(MultiNode *multiNode);
 extern MultiNode * ChildNode(MultiUnaryNode *multiNode);
 extern MultiNode * GrandChildNode(MultiUnaryNode *multiNode);
@@ -206,19 +217,15 @@ extern List * JoinClauseList(List *whereClauseList);
 extern bool IsJoinClause(Node *clause);
 extern List * SubqueryEntryList(Query *queryTree);
 extern DeferredErrorMessage * DeferErrorIfQueryNotSupported(Query *queryTree);
-extern bool ExtractRangeTableIndexWalker(Node *node, List **rangeTableIndexList);
 extern List * WhereClauseList(FromExpr *fromExpr);
 extern List * QualifierList(FromExpr *fromExpr);
 extern List * TableEntryList(List *rangeTableList);
 extern List * UsedTableEntryList(Query *query);
-extern bool ExtractRangeTableRelationWalker(Node *node, List **rangeTableList);
-extern bool ExtractRangeTableEntryWalker(Node *node, List **rangeTableList);
 extern List * pull_var_clause_default(Node *node);
 extern bool OperatorImplementsEquality(Oid opno);
-extern bool FindNodeCheck(Node *node, bool (*check)(Node *));
 extern DeferredErrorMessage * DeferErrorIfUnsupportedClause(List *clauseList);
 extern MultiProject * MultiProjectNode(List *targetEntryList);
-extern MultiExtendedOp * MultiExtendedOpNode(Query *queryTree);
+extern MultiExtendedOp * MultiExtendedOpNode(Query *queryTree, Query *originalQuery);
 extern DeferredErrorMessage * DeferErrorIfUnsupportedSubqueryRepartition(Query *
 																		 subqueryTree);
 extern MultiNode * MultiNodeTree(Query *queryTree);

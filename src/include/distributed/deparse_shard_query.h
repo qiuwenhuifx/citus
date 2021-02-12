@@ -5,7 +5,7 @@
  * Declarations for public functions and types related to deparsing shard
  * queries.
  *
- * Copyright (c) 2014-2016, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -18,10 +18,17 @@
 #include "nodes/nodes.h"
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
+#include "distributed/citus_custom_scan.h"
 
 
-extern void RebuildQueryStrings(Query *originalQuery, List *taskList);
+extern void RebuildQueryStrings(Job *workerJob);
 extern bool UpdateRelationToShardNames(Node *node, List *relationShardList);
-
+extern void SetTaskQueryIfShouldLazyDeparse(Task *task, Query *query);
+extern void SetTaskQueryString(Task *task, char *queryString);
+extern void SetTaskQueryStringList(Task *task, List *queryStringList);
+extern char * TaskQueryString(Task *task);
+extern char * TaskQueryStringAtIndex(Task *task, int index);
+extern bool UpdateRelationsToLocalShardTables(Node *node, List *relationShardList);
+extern int GetTaskQueryType(Task *task);
 
 #endif /* DEPARSE_SHARD_QUERY_H */

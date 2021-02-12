@@ -4,7 +4,7 @@
  * This file contains functions to create, alter and drop policies on
  * distributed tables.
  *
- * Copyright (c) 2018, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -26,14 +26,16 @@ CreatePolicyCommands(Oid relationId)
 }
 
 
-/* placeholder for PlanCreatePolicyStmt */
+/* placeholder for PreprocessCreatePolicyStmt */
 List *
-PlanCreatePolicyStmt(CreatePolicyStmt *stmt)
+PreprocessCreatePolicyStmt(Node *node, const char *queryString,
+						   ProcessUtilityContext processUtilityContext)
 {
+	CreatePolicyStmt *stmt = castNode(CreatePolicyStmt, node);
 	Oid relationId = RangeVarGetRelid(stmt->table,
 									  AccessExclusiveLock,
 									  false);
-	if (IsDistributedTable(relationId))
+	if (IsCitusTable(relationId))
 	{
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("policies on distributed tables are only supported in "
@@ -45,9 +47,10 @@ PlanCreatePolicyStmt(CreatePolicyStmt *stmt)
 }
 
 
-/* placeholder for PlanAlterPolicyStmt */
+/* placeholder for PreprocessAlterPolicyStmt */
 List *
-PlanAlterPolicyStmt(AlterPolicyStmt *stmt)
+PreprocessAlterPolicyStmt(Node *node, const char *queryString,
+						  ProcessUtilityContext processUtilityContext)
 {
 	/* placeholder for future implementation */
 	return NIL;
@@ -68,17 +71,10 @@ ErrorIfUnsupportedPolicy(Relation relation)
 }
 
 
-/* placeholder for ErrorIfUnsupportedPolicyExpr */
-void
-ErrorIfUnsupportedPolicyExpr(Node *expr)
-{
-	/* placeholder for future implementation */
-}
-
-
-/* placeholder for PlanDropPolicyStmt */
+/* placeholder for PreprocessDropPolicyStmt */
 List *
-PlanDropPolicyStmt(DropStmt *stmt, const char *queryString)
+PreprocessDropPolicyStmt(Node *node, const char *queryString,
+						 ProcessUtilityContext processUtilityContext)
 {
 	/* placeholder for future implementation */
 	return NIL;

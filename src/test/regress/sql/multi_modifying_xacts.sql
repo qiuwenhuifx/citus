@@ -179,7 +179,7 @@ INSERT INTO labs VALUES (6, 'Bell Labs');
 \.
 COMMIT;
 
--- COPY cannot be performed if multiple shards were modified over the same connection
+-- COPY can be performed if multiple shards were modified over the same connection
 BEGIN;
 INSERT INTO researchers VALUES (2, 1, 'Knuth Donald');
 INSERT INTO researchers VALUES (10, 6, 'Lamport Leslie');
@@ -189,7 +189,7 @@ INSERT INTO researchers VALUES (10, 6, 'Lamport Leslie');
 \.
 ROLLBACK;
 
--- COPY cannot be performed after a multi-row INSERT that uses one connection
+-- COPY can be performed after a multi-row INSERT that uses one connection
 BEGIN;
 INSERT INTO researchers VALUES (2, 1, 'Knuth Donald'), (10, 6, 'Lamport Leslie');
 \copy researchers from stdin delimiter ','
@@ -340,7 +340,7 @@ BEGIN;
 ALTER TABLE labs ADD COLUMN motto text;
 ABORT;
 
--- cannot perform parallel DDL once a connection is used for multiple shards
+-- can perform parallel DDL even a connection is used for multiple shards
 BEGIN;
 SELECT lab_id FROM researchers WHERE lab_id = 1 AND id = 0;
 SELECT lab_id FROM researchers WHERE lab_id = 2 AND id = 0;
@@ -412,18 +412,18 @@ FOR EACH ROW EXECUTE PROCEDURE reject_bad();
 \c - - - :master_port
 
 -- test partial failure; worker_1 succeeds, 2 fails
+-- in this case, we expect the transaction to abort
 \set VERBOSITY terse
 BEGIN;
 INSERT INTO objects VALUES (1, 'apple');
 INSERT INTO objects VALUES (2, 'BAD');
-INSERT INTO labs VALUES (7, 'E Corp');
 COMMIT;
 
--- data should be persisted
+-- so the data should noy be persisted
 SELECT * FROM objects WHERE id = 2;
 SELECT * FROM labs WHERE id = 7;
 
--- but one placement should be bad
+-- and none of placements should be inactive
 SELECT count(*)
 FROM   pg_dist_shard_placement AS sp,
 	   pg_dist_shard           AS s
@@ -435,13 +435,8 @@ AND    s.logicalrelid = 'objects'::regclass;
 
 DELETE FROM objects;
 
--- mark shards as healthy again; delete all data
-UPDATE pg_dist_shard_placement AS sp SET shardstate = 1
-FROM   pg_dist_shard AS s
-WHERE  sp.shardid = s.shardid
-AND    s.logicalrelid = 'objects'::regclass;
-
--- what if there are errors on different shards at different times?
+-- there cannot be errors on different shards at different times
+-- because the first failure will fail the whole transaction
 \c - - - :worker_1_port
 CREATE FUNCTION reject_bad() RETURNS trigger AS $rb$
     BEGIN
@@ -464,7 +459,7 @@ BEGIN;
 INSERT INTO objects VALUES (1, 'apple');
 INSERT INTO objects VALUES (2, 'BAD');
 INSERT INTO labs VALUES (8, 'Aperture Science');
-INSERT INTO labs VALUES (9, 'BAD');
+INSERT INTO labs VALUES (2, 'BAD');
 COMMIT;
 
 -- data should NOT be persisted
@@ -501,7 +496,6 @@ COMMIT;
 
 -- data should be persisted
 SELECT * FROM objects WHERE id = 2;
-SELECT * FROM labs WHERE id = 7;
 
 -- but one placement should be bad
 SELECT count(*)
@@ -801,8 +795,8 @@ SELECT   s.logicalrelid::regclass::text, sp.shardstate, count(*)
 FROM     pg_dist_shard_placement AS sp,
 	     pg_dist_shard           AS s
 WHERE    sp.shardid = s.shardid
-AND      (s.logicalrelid = 'reference_modifying_xacts'::regclass OR 
-		  s.logicalrelid = 'hash_modifying_xacts'::regclass)	
+AND      (s.logicalrelid = 'reference_modifying_xacts'::regclass OR
+		  s.logicalrelid = 'hash_modifying_xacts'::regclass)
 GROUP BY s.logicalrelid, sp.shardstate
 ORDER BY s.logicalrelid, sp.shardstate;
 
@@ -837,8 +831,8 @@ SELECT   s.logicalrelid::regclass::text, sp.shardstate, count(*)
 FROM     pg_dist_shard_placement AS sp,
 	     pg_dist_shard           AS s
 WHERE    sp.shardid = s.shardid
-AND      (s.logicalrelid = 'reference_modifying_xacts'::regclass OR 
-		  s.logicalrelid = 'hash_modifying_xacts'::regclass)	
+AND      (s.logicalrelid = 'reference_modifying_xacts'::regclass OR
+		  s.logicalrelid = 'hash_modifying_xacts'::regclass)
 GROUP BY s.logicalrelid, sp.shardstate
 ORDER BY s.logicalrelid, sp.shardstate;
 
@@ -907,7 +901,7 @@ SELECT create_distributed_table('numbers_hash_failure_test', 'key');
 \c - test_user - :worker_1_port
 \dt reference_failure_test_1200015
 
--- now connect with the default user, 
+-- now connect with the default user,
 -- and rename the existing user
 \c - :default_user - :worker_1_port
 ALTER USER test_user RENAME TO test_user_new;
@@ -929,7 +923,9 @@ COPY reference_failure_test FROM STDIN WITH (FORMAT 'csv');
 COMMIT;
 
 -- show that no data go through the table and shard states are good
+SET client_min_messages to 'ERROR';
 SELECT * FROM reference_failure_test;
+RESET client_min_messages;
 
 
 -- all placements should be healthy
@@ -937,7 +933,7 @@ SELECT   s.logicalrelid::regclass::text, sp.shardstate, count(*)
 FROM     pg_dist_shard_placement AS sp,
 	     pg_dist_shard           AS s
 WHERE    sp.shardid = s.shardid
-AND      s.logicalrelid = 'reference_failure_test'::regclass	
+AND      s.logicalrelid = 'reference_failure_test'::regclass
 GROUP BY s.logicalrelid, sp.shardstate
 ORDER BY s.logicalrelid, sp.shardstate;
 
@@ -996,7 +992,7 @@ ALTER USER test_user RENAME TO test_user_new;
 -- fails on all shard placements
 INSERT INTO numbers_hash_failure_test VALUES (2,2);
 
--- connect back to the master with the proper user to continue the tests 
+-- connect back to the master with the proper user to continue the tests
 \c - :default_user - :master_port
 SET citus.next_shard_id TO 1200020;
 SET citus.next_placement_id TO 1200033;
@@ -1064,7 +1060,7 @@ END;
 
 SELECT user_id FROM items ORDER BY user_id;
 
--- should not be able to open multiple connections per node after INSERTing over one connection
+-- should be able to open multiple connections per node after INSERTing over one connection
 BEGIN;
 INSERT INTO users VALUES (2, 'burak');
 INSERT INTO users VALUES (3, 'burak');
@@ -1072,14 +1068,14 @@ INSERT INTO users VALUES (3, 'burak');
 2,item-2,0
 3,item-3,0
 \.
-END;
+ROLLBACK;
 
--- cannot perform parallel DDL after a co-located table has been read over 1 connection
+-- perform parallel DDL after a co-located table has been read over 1 connection
 BEGIN;
 SELECT id FROM users WHERE id = 1;
 SELECT id FROM users WHERE id = 6;
 ALTER TABLE items ADD COLUMN last_update timestamptz;
-END;
+ROLLBACK;
 
 -- can perform sequential DDL after a co-located table has been read over 1 connection
 BEGIN;
@@ -1089,7 +1085,7 @@ SELECT id FROM users WHERE id = 6;
 ALTER TABLE items ADD COLUMN last_update timestamptz;
 ROLLBACK;
 
--- but the other way around is fine
+-- and the other way around is also fine
 BEGIN;
 ALTER TABLE items ADD COLUMN last_update timestamptz;
 SELECT id FROM users JOIN items ON (id = user_id) WHERE id = 1;
@@ -1105,7 +1101,9 @@ BEGIN;
 -- now read from the reference table over each connection
 SELECT user_id FROM items JOIN itemgroups ON (item_group = gid) WHERE user_id = 2;
 SELECT user_id FROM items JOIN itemgroups ON (item_group = gid) WHERE user_id = 3;
--- perform a DDL command on the reference table
+-- perform a DDL command on the reference table errors
+-- because the current implementation of COPY always opens one connection
+-- per placement SELECTs have to use those connections for correctness
 ALTER TABLE itemgroups ADD COLUMN last_update timestamptz;
 END;
 

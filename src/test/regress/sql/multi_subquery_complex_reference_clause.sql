@@ -6,7 +6,6 @@
 
 -- We don't need shard id sequence here, so commented out to prevent conflicts with concurrent tests
 -- SET citus.next_shard_id TO 1400000;
-ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 1400000;
 
 CREATE TABLE user_buy_test_table(user_id int, item_id int, buy_count int);
 SELECT create_distributed_table('user_buy_test_table', 'user_id');
@@ -220,7 +219,7 @@ SELECT count(*) FROM
   (SELECT user_id FROM user_buy_test_table
    UNION ALL
    SELECT id FROM (SELECT 5 AS id) users_ref_test_table) subquery_1;
- 
+
 -- union involving reference table and distributed table subqueries
 -- is supported with pulling data to coordinator
 SELECT * FROM
@@ -354,7 +353,8 @@ SELECT * FROM
               users_table as "users"
             WHERE
               user_id > 2 and value_2 = 1) as foo_in ON (event_val_2 = user_id)) as foo LEFT JOIN
-           (SELECT user_id as user_user_id FROM users_table) as fooo ON (user_id = user_user_id)) as bar;
+           (SELECT user_id as user_user_id FROM users_table) as fooo ON (user_id = user_user_id)) as bar
+ORDER BY 1;
 
 -- the same query but this time reference table is in the outer part of the query
 SELECT * FROM
@@ -400,6 +400,102 @@ GROUP BY 2
 ORDER BY 1 DESC,
          2 DESC
 LIMIT 5;
+
+-- should be fine even if the tables are deep inside subqueries
+SELECT max(events_all.cnt),
+       events_all.usr_id
+	FROM
+(SELECT *, random() FROM
+	(SELECT *, random()
+			FROM (SELECT users_table.user_id AS usr_id, count(*) AS cnt
+					FROM (SELECT *,random FROM (SELECT *, random() FROM events_reference_table) as events_reference_table) as events_reference_table
+					INNER JOIN users_table ON (users_table.user_id = events_reference_table.user_id)
+					GROUP BY users_table.user_id) AS events_all_inner
+          ) AS events_all
+	) AS events_all
+	LEFT JOIN (SELECT *,random() FROM (SELECT *, random() FROM  events_table)  as events_table) as events_table ON (events_all.usr_id = events_table.user_id)
+GROUP BY 2
+ORDER BY 1 DESC,
+         2 DESC
+LIMIT 5;
+
+-- should be fine with FULL join as well
+SELECT max(events_all.cnt),
+       events_all.usr_id
+	FROM events_table
+	FULL JOIN (SELECT *, random()
+			FROM (SELECT users_table.user_id AS usr_id, count(*) AS cnt
+					FROM events_reference_table
+					INNER JOIN users_table ON (users_table.user_id = events_reference_table.user_id)
+					GROUP BY users_table.user_id) AS events_all_inner
+          ) AS events_all ON (events_all.usr_id = events_table.user_id)
+GROUP BY 2
+ORDER BY 1 DESC,
+         2 DESC
+LIMIT 5;
+
+-- two levels of "(ref_table JOIN dist_table) LEFT JOIN"
+-- should be fine as well
+SELECT
+	users_table.*
+FROM
+	(SELECT
+		events_all.*, random()
+	FROM
+			events_reference_table JOIN users_table USING(user_id)
+		JOIN
+			(SELECT *, random()
+				FROM (SELECT users_table.user_id AS usr_id, count(*) AS cnt
+						FROM (SELECT *,random FROM (SELECT *, random() FROM events_reference_table) as events_reference_table) as events_reference_table
+						INNER JOIN users_table ON (users_table.user_id = events_reference_table.user_id)
+						GROUP BY users_table.user_id) AS events_all_inner
+	          ) AS events_all ON (user_id = usr_id)
+	) AS events_all
+	LEFT JOIN (SELECT *,random() FROM (SELECT *, random() FROM  events_table)  as events_table) as events_table ON (events_all.usr_id = events_table.user_id)
+	LEFT JOIN users_table USING (user_id)
+ORDER BY 1,2,3,4 LIMIT 5;
+
+
+-- we should be able to support OUTER joins involving
+-- reference tables even if the subquery is in WHERE clause
+SELECT count(*)
+FROM events_table
+WHERE user_id IN
+    (SELECT subquery_1.user_id
+     FROM
+       (SELECT tt1.user_id,
+               random()
+        FROM users_table AS tt1
+        JOIN events_table AS tt2 ON tt1.user_id = tt2.user_id) subquery_1
+     RIGHT JOIN
+       (SELECT *,
+               random()
+        FROM
+          (SELECT tt1.user_id,
+                  random()
+           FROM users_table AS tt1
+           JOIN events_reference_table AS REF ON tt1.user_id = ref.user_id) subquery_2_inner) subquery_2 ON subquery_1.user_id = subquery_2.user_id);
+
+-- we should be able to support OUTER joins involving
+-- reference tables even if the subquery is in the outer part of a JOIN
+
+SELECT count(*)
+FROM users_table
+RIGHT JOIN
+  (SELECT subquery_1.user_id
+   FROM
+     (SELECT tt1.user_id,
+             random()
+      FROM users_table AS tt1
+      JOIN events_table AS tt2 ON tt1.user_id = tt2.user_id) subquery_1
+   RIGHT JOIN
+     (SELECT *,
+             random()
+      FROM
+        (SELECT tt1.user_id,
+                random()
+         FROM users_table AS tt1
+         JOIN events_reference_table AS REF ON tt1.user_id = ref.user_id) subquery_2_inner) subquery_2 ON subquery_1.user_id = subquery_2.user_id) AS foo USING (user_id);
 
 -- LATERAL JOINs used with INNER JOINs with reference tables
 SET citus.subquery_pushdown to ON;
@@ -1116,7 +1212,7 @@ ORDER BY 1 LIMIT 3;
 
 -- should be able to pushdown since one of the subqueries has distinct on reference tables
 -- and there is only reference table in that subquery
-SELECT 
+SELECT
   distinct_users, event_type, time
 FROM
 (SELECT user_id, time, event_type FROM events_table) as events_dist INNER JOIN
@@ -1126,11 +1222,11 @@ LIMIT 5
 OFFSET 0;
 
 -- the same query wuth multiple reference tables in the subquery
-SELECT 
+SELECT
   distinct_users, event_type, time
 FROM
 (SELECT user_id, time, event_type FROM events_table) as events_dist INNER JOIN
-(SELECT DISTINCT users_reference_table.user_id as distinct_users FROM users_reference_table, events_reference_table 
+(SELECT DISTINCT users_reference_table.user_id as distinct_users FROM users_reference_table, events_reference_table
  WHERE events_reference_table.user_id =  users_reference_table.user_id AND events_reference_table.event_type IN (1,2,3,4)) users_ref
 ON (events_dist.user_id = users_ref.distinct_users)
 ORDER BY time DESC
@@ -1138,7 +1234,7 @@ LIMIT 5
 OFFSET 0;
 
 -- similar query as the above, but with group bys
-SELECT 
+SELECT
   distinct_users, event_type, time
 FROM
 (SELECT user_id, time, event_type FROM events_table) as events_dist INNER JOIN
@@ -1161,7 +1257,7 @@ SELECT * FROM
   GROUP BY 1
 ) as foo;
 
--- similiar to the above examples, this time there is a subquery 
+-- similiar to the above examples, this time there is a subquery
 -- whose output is not in the DISTINCT clause
 SELECT * FROM
 (
@@ -1173,8 +1269,8 @@ ORDER BY 1;
 SELECT * FROM
 (
   SELECT DISTINCT users_reference_table.user_id, us_events.user_id FROM users_reference_table, (SELECT user_id, random() FROM events_table WHERE event_type IN (2,3)) as us_events WHERE users_reference_table.user_id = us_events.user_id
-) as foo 
-ORDER BY 1 DESC 
+) as foo
+ORDER BY 1 DESC
 LIMIT 4;
 
 -- should not pushdown since there is a non partition column on the DISTINCT clause
@@ -1182,34 +1278,34 @@ LIMIT 4;
 -- is disabled
 SELECT * FROM
 (
-  SELECT 
-    DISTINCT users_reference_table.user_id, us_events.value_4 
-  FROM 
-    users_reference_table, 
-    (SELECT user_id, value_4, random() FROM events_table WHERE event_type IN (2,3)) as us_events 
-  WHERE 
+  SELECT
+    DISTINCT users_reference_table.user_id, us_events.value_4
+  FROM
+    users_reference_table,
+    (SELECT user_id, value_4, random() FROM events_table WHERE event_type IN (2,3)) as us_events
+  WHERE
     users_reference_table.user_id = us_events.user_id
-) as foo 
-ORDER BY 1 DESC 
+) as foo
+ORDER BY 1 DESC
 LIMIT 4;
 
 
 
 -- test the read_intermediate_result() for GROUP BYs
 BEGIN;
- 
+
 SELECT broadcast_intermediate_result('squares', 'SELECT s, s*s FROM generate_series(1,200) s');
 
 -- single appereance of read_intermediate_result
-SELECT 
-  DISTINCT user_id 
-FROM 
-  users_table 
-JOIN 
-(SELECT 
-  max(res.val) as mx 
-FROM 
-  read_intermediate_result('squares', 'binary') AS res (val int, val_square int) 
+SELECT
+  DISTINCT user_id
+FROM
+  users_table
+JOIN
+(SELECT
+  max(res.val) as mx
+FROM
+  read_intermediate_result('squares', 'binary') AS res (val int, val_square int)
 GROUP BY res.val_square) squares
  ON (mx = user_id)
 ORDER BY 1
@@ -1225,15 +1321,15 @@ ORDER BY 1
 LIMIT 5;
 
 -- single appereance of read_intermediate_result but inside a subquery
-SELECT 
-  DISTINCT user_id 
-FROM 
-  users_table 
+SELECT
+  DISTINCT user_id
+FROM
+  users_table
 JOIN (
-  SELECT *,random() FROM (SELECT 
-    max(res.val) as mx 
-  FROM 
-      (SELECT val, val_square FROM read_intermediate_result('squares', 'binary') AS res (val int, val_square int)) res 
+  SELECT *,random() FROM (SELECT
+    max(res.val) as mx
+  FROM
+      (SELECT val, val_square FROM read_intermediate_result('squares', 'binary') AS res (val int, val_square int)) res
   GROUP BY res.val_square) foo)
 squares
  ON (mx = user_id)
@@ -1241,16 +1337,16 @@ ORDER BY 1
 LIMIT 5;
 
 -- multiple read_intermediate_results in the same subquery is OK
-SELECT 
-  DISTINCT user_id 
-FROM 
-  users_table 
-JOIN 
-(SELECT 
-  max(res.val) as mx 
-FROM 
+SELECT
+  DISTINCT user_id
+FROM
+  users_table
+JOIN
+(SELECT
+  max(res.val) as mx
+FROM
   read_intermediate_result('squares', 'binary') AS res (val int, val_square int),
-  read_intermediate_result('squares', 'binary') AS res2 (val int, val_square int) 
+  read_intermediate_result('squares', 'binary') AS res2 (val int, val_square int)
 WHERE res.val = res2.val_square
 GROUP BY res2.val_square) squares
  ON (mx = user_id)
@@ -1258,19 +1354,19 @@ ORDER BY 1
 LIMIT 5;
 
 -- mixed recurring tuples should be supported
-SELECT 
-  DISTINCT user_id 
-FROM 
-  users_table 
-JOIN 
-(SELECT 
-  max(res.val) as mx 
-FROM 
-  read_intermediate_result('squares', 'binary') AS res (val int, val_square int), 
+SELECT
+  DISTINCT user_id
+FROM
+  users_table
+JOIN
+(SELECT
+  max(res.val) as mx
+FROM
+  read_intermediate_result('squares', 'binary') AS res (val int, val_square int),
   generate_series(0, 10) i
   WHERE
   res.val = i
-  GROUP BY 
+  GROUP BY
     i) squares
  ON (mx = user_id)
 ORDER BY 1
@@ -1278,16 +1374,16 @@ LIMIT 5;
 
 -- should recursively plan since
 -- there are no columns on the GROUP BY from the distributed table
-SELECT 
-  DISTINCT user_id 
-FROM 
+SELECT
+  DISTINCT user_id
+FROM
   users_reference_table
-JOIN 
-  (SELECT 
-    max(val_square) as mx 
-  FROM 
-    read_intermediate_result('squares', 'binary') AS res (val int, val_square int), events_table 
-  WHERE 
+JOIN
+  (SELECT
+    max(val_square) as mx
+  FROM
+    read_intermediate_result('squares', 'binary') AS res (val int, val_square int), events_table
+  WHERE
     events_table.user_id = res.val GROUP BY res.val) squares
  ON (mx = user_id)
 ORDER BY 1
@@ -1296,38 +1392,84 @@ LIMIT 5;
 ROLLBACK;
 
 -- should work since we're using an immutable function as recurring tuple
-SELECT 
-  DISTINCT user_id 
-FROM 
-  users_table 
-JOIN 
-(SELECT 
-  max(i+5)as mx 
-FROM 
+SELECT
+  DISTINCT user_id
+FROM
+  users_table
+JOIN
+(SELECT
+  max(i+5)as mx
+FROM
   generate_series(0, 10) as i GROUP BY i) squares
  ON (mx = user_id)
 ORDER BY 1
 LIMIT 5;
 
 
--- should recursively plan since we're 
+-- should recursively plan since we're
 -- using an immutable function as recurring tuple
--- along with a distributed table, where GROUP BY is 
+-- along with a distributed table, where GROUP BY is
 -- on the recurring tuple
-SELECT 
-  DISTINCT user_id 
-FROM 
+SELECT
+  DISTINCT user_id
+FROM
   users_reference_table
-JOIN 
-  (SELECT 
-    max(i+5)as mx 
-  FROM 
-     generate_series(0, 10) as i, events_table 
-  WHERE 
+JOIN
+  (SELECT
+    max(i+5)as mx
+  FROM
+     generate_series(0, 10) as i, events_table
+  WHERE
     events_table.user_id = i GROUP BY i) squares
  ON (mx = user_id)
 ORDER BY 1
 LIMIT 5;
+
+-- outer part of the LEFT JOIN consists only reference tables, so we cannot push down
+-- we have different combinations for ON condition, true/false/two column join/single column filter
+SELECT count(*) FROM users_ref_test_table ref1 INNER JOIN users_ref_test_table ref2 on ref1.id = ref2.id LEFT JOIN user_buy_test_table ON true;
+SELECT count(*) FROM users_ref_test_table ref1 LEFT JOIN users_ref_test_table ref2 on ref1.id = ref2.id LEFT JOIN user_buy_test_table ON true;
+SELECT count(*) FROM users_ref_test_table ref1 INNER JOIN users_ref_test_table ref2 on ref1.id = ref2.id LEFT JOIN user_buy_test_table ON false;
+SELECT count(*) FROM users_ref_test_table ref1 LEFT JOIN users_ref_test_table ref2 on ref1.id = ref2.id LEFT JOIN user_buy_test_table ON false;
+SELECT count(*) FROM users_ref_test_table ref1 INNER JOIN users_ref_test_table ref2 on ref1.id = ref2.id LEFT JOIN user_buy_test_table ON (ref1.id > 5);
+SELECT count(*) FROM users_ref_test_table ref1 INNER JOIN users_ref_test_table ref2 on ref1.id = ref2.id LEFT JOIN user_buy_test_table ON (user_buy_test_table.user_id > 5);
+SELECT count(*) FROM users_ref_test_table ref1 INNER JOIN users_ref_test_table ref2 on ref1.id = ref2.id LEFT JOIN user_buy_test_table ON (ref1.id = user_buy_test_table.user_id);
+SELECT count(*) FROM users_ref_test_table ref1 INNER JOIN users_ref_test_table ref2 on ref1.id = ref2.id LEFT JOIN user_buy_test_table ON (ref2.id = user_buy_test_table.user_id);
+SELECT count(*) FROM users_ref_test_table ref1 LEFT JOIN users_ref_test_table ref2 on ref1.id = ref2.id LEFT JOIN user_buy_test_table ON (ref1.id = user_buy_test_table.user_id);
+SELECT count(*) FROM users_ref_test_table ref1 LEFT JOIN users_ref_test_table ref2 on ref1.id = ref2.id LEFT JOIN user_buy_test_table ON (ref2.id = user_buy_test_table.user_id);
+
+
+-- outer part of the LEFT JOIN consists only reference tables within a subquery, so we cannot push down
+-- we have different combinations for ON condition, true/false/two column join/single column filter
+SELECT count(*) FROM (SELECT ref1.*, random() FROM users_ref_test_table ref1 INNER JOIN users_ref_test_table ref2 on ref1.id = ref2.id) as foo LEFT JOIN user_buy_test_table ON true;
+SELECT count(*) FROM (SELECT ref1.*, random() FROM users_ref_test_table ref1 LEFT JOIN users_ref_test_table ref2 on ref1.id = ref2.id) as foo LEFT JOIN user_buy_test_table ON true;
+SELECT count(*) FROM (SELECT ref1.*, random() FROM users_ref_test_table ref1 INNER JOIN users_ref_test_table ref2 on ref1.id = ref2.id) as foo LEFT JOIN user_buy_test_table ON false;
+SELECT count(*) FROM (SELECT ref1.*, random() FROM users_ref_test_table ref1 LEFT JOIN users_ref_test_table ref2 on ref1.id = ref2.id) as foo LEFT JOIN user_buy_test_table ON false;
+SELECT count(*) FROM (SELECT ref1.*, random() FROM users_ref_test_table ref1 INNER JOIN users_ref_test_table ref2 on ref1.id = ref2.id) as foo LEFT JOIN user_buy_test_table ON (foo.id > 5);
+SELECT count(*) FROM (SELECT ref1.*, random() FROM users_ref_test_table ref1 LEFT JOIN users_ref_test_table ref2 on ref1.id = ref2.id) as foo LEFT JOIN user_buy_test_table ON (user_buy_test_table.user_id > 19);
+SELECT count(*) FROM (SELECT ref1.*, random() FROM users_ref_test_table ref1 INNER JOIN users_ref_test_table ref2 on ref1.id = ref2.id) as foo LEFT JOIN user_buy_test_table ON (foo.id = user_buy_test_table.user_id);
+
+-- one example where unsupported outer join is deep inside a subquery
+SELECT *, random() FROM (
+SELECT *,random() FROM user_buy_test_table WHERE user_id > (
+SELECT count(*) FROM (SELECT *,random() FROM (SELECT ref1.*, random() FROM users_ref_test_table ref1 INNER JOIN users_ref_test_table ref2 on ref1.id = ref2.id) as bar) as foo LEFT JOIN (SELECT *, random() FROM (SELECT *,random() FROM user_buy_test_table d1 JOIN user_buy_test_table d2 USING (user_id)) as bar_inner ) as bar ON true)) as boo;
+
+-- In theory, we should be able to pushdown this query
+-- however, as the LEFT JOIN condition is between a reference table and the distributed table
+-- Postgres generates a LEFT JOIN alternative among those tables
+SELECT count(*) FROM (SELECT ref1.*, random() FROM users_ref_test_table ref1 INNER JOIN user_buy_test_table u1 on ref1.id = u1.user_id) as foo LEFT JOIN user_buy_test_table ON (foo.id = user_buy_test_table.user_id);
+
+-- same as the above query, but this time LEFT JOIN condition is between distributed tables
+-- so Postgres doesn't generate join restriction between reference and distributed tables
+SELECT count(*) FROM (SELECT u1.*, random() FROM users_ref_test_table ref1 INNER JOIN user_buy_test_table u1 on ref1.id = u1.user_id) as foo LEFT JOIN user_buy_test_table ON (foo.user_id = user_buy_test_table.user_id);
+
+-- outer part of the LEFT JOIN consists only intermediate result due to LIMIT, so we cannot push down
+SELECT count(*) FROM (SELECT ref1.* FROM users_ref_test_table ref1 INNER JOIN users_ref_test_table ref2 on ref1.id = ref2.id LIMIT 5) as foo LEFT JOIN user_buy_test_table ON true;
+
+-- should be fine as OUTER part is the distributed table
+SELECT count(*) FROM users_ref_test_table ref1 INNER JOIN users_ref_test_table ref2 on ref1.id = ref2.id RIGHT JOIN user_buy_test_table ON true;
+SELECT count(*) FROM users_ref_test_table ref1 INNER JOIN users_ref_test_table ref2 on ref1.id = ref2.id RIGHT JOIN user_buy_test_table ON false;
+SELECT count(*) FROM users_ref_test_table ref1 INNER JOIN users_ref_test_table ref2 on ref1.id = ref2.id RIGHT JOIN user_buy_test_table ON (ref1.id = user_id);
 
 DROP TABLE user_buy_test_table;
 DROP TABLE users_ref_test_table;

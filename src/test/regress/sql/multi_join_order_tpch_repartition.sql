@@ -10,7 +10,7 @@ SET citus.next_shard_id TO 660000;
 
 SET citus.explain_distributed_queries TO off;
 SET citus.log_multi_join_order TO TRUE;
-SET citus.task_executor_type = 'task-tracker'; -- can't explain all queries otherwise
+SET citus.enable_repartition_joins to ON;
 SET client_min_messages TO LOG;
 
 -- The following queries are basically the same as the ones in tpch_small
@@ -19,7 +19,8 @@ SET client_min_messages TO LOG;
 
 -- Query #6 from the TPC-H decision support benchmark
 
-EXPLAIN SELECT
+EXPLAIN (COSTS OFF)
+SELECT
 	sum(l_extendedprice * l_discount) as revenue
 FROM
 	lineitem
@@ -31,7 +32,8 @@ WHERE
 
 -- Query #3 from the TPC-H decision support benchmark
 
-EXPLAIN SELECT
+EXPLAIN (COSTS OFF)
+SELECT
 	l_orderkey,
 	sum(l_extendedprice * (1 - l_discount)) as revenue,
 	o_orderdate,
@@ -56,7 +58,8 @@ ORDER BY
 
 -- Query #10 from the TPC-H decision support benchmark
 
-EXPLAIN SELECT
+EXPLAIN (COSTS OFF)
+SELECT
 	c_custkey,
 	c_name,
 	sum(l_extendedprice * (1 - l_discount)) as revenue,
@@ -90,7 +93,8 @@ ORDER BY
 
 -- Query #19 from the TPC-H decision support benchmark (modified)
 
-EXPLAIN SELECT
+EXPLAIN (COSTS OFF)
+SELECT
 	sum(l_extendedprice* (1 - l_discount)) as revenue
 FROM
 	lineitem,
@@ -122,7 +126,8 @@ WHERE
 
 -- Query to test multiple re-partition jobs in a single query
 
-EXPLAIN SELECT
+EXPLAIN (COSTS OFF)
+SELECT
 	l_partkey, count(*)
 FROM
 	lineitem, part_append, orders, customer_append

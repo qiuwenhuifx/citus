@@ -3,7 +3,7 @@
  * grant.c
  *    Commands for granting access to distributed tables.
  *
- * Copyright (c) 2018, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -11,9 +11,10 @@
 #include "distributed/commands.h"
 
 
-/* placeholder for PlanGrantStmt */
+/* placeholder for PreprocessGrantStmt */
 List *
-PlanGrantStmt(GrantStmt *grantStmt)
+PreprocessGrantStmt(Node *node, const char *queryString,
+					ProcessUtilityContext processUtilityContext)
 {
 	return NIL;
 }

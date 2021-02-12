@@ -4,12 +4,7 @@
 -- Test user permissions.
 --
 
--- print whether we're using version > 10 to make version-specific tests clear
-SHOW server_version \gset
-SELECT substring(:'server_version', '\d+')::int > 10 AS version_above_ten;
-
 SET citus.next_shard_id TO 1420000;
-ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 1420000;
 
 SET citus.shard_replication_factor TO 1;
 
@@ -17,7 +12,7 @@ CREATE TABLE test (id integer, val integer);
 SELECT create_distributed_table('test', 'id');
 
 CREATE TABLE test_coloc (id integer, val integer);
-SELECT create_distributed_table('test_coloc', 'id', colocate_with := 'none');
+SELECT create_distributed_table('test_coloc', 'id', colocate_with := 'test');
 
 SET citus.shard_count TO 1;
 CREATE TABLE singleshard (id integer, val integer);
@@ -27,6 +22,7 @@ SELECT create_distributed_table('singleshard', 'id');
 SET citus.enable_ddl_propagation TO off;
 
 CREATE USER full_access;
+CREATE USER usage_access;
 CREATE USER read_access;
 CREATE USER no_access;
 CREATE ROLE some_role;
@@ -38,12 +34,14 @@ GRANT SELECT ON TABLE test TO read_access;
 
 CREATE SCHEMA full_access_user_schema;
 REVOKE ALL ON SCHEMA full_access_user_schema FROM PUBLIC;
-GRANT USAGE ON SCHEMA full_access_user_schema TO full_access;
+GRANT ALL ON SCHEMA full_access_user_schema TO full_access;
+GRANT USAGE ON SCHEMA full_access_user_schema TO usage_access;
 
 SET citus.enable_ddl_propagation TO DEFAULT;
 
 \c - - - :worker_1_port
 CREATE USER full_access;
+CREATE USER usage_access;
 CREATE USER read_access;
 CREATE USER no_access;
 CREATE ROLE some_role;
@@ -59,9 +57,12 @@ GRANT SELECT ON TABLE test_1420002 TO read_access;
 CREATE SCHEMA full_access_user_schema;
 REVOKE ALL ON SCHEMA full_access_user_schema FROM PUBLIC;
 GRANT USAGE ON SCHEMA full_access_user_schema TO full_access;
+GRANT ALL ON SCHEMA full_access_user_schema TO full_access;
+GRANT USAGE ON SCHEMA full_access_user_schema TO usage_access;
 
 \c - - - :worker_2_port
 CREATE USER full_access;
+CREATE USER usage_access;
 CREATE USER read_access;
 CREATE USER no_access;
 CREATE ROLE some_role;
@@ -77,8 +78,13 @@ GRANT SELECT ON TABLE test_1420003 TO read_access;
 CREATE SCHEMA full_access_user_schema;
 REVOKE ALL ON SCHEMA full_access_user_schema FROM PUBLIC;
 GRANT USAGE ON SCHEMA full_access_user_schema TO full_access;
+GRANT ALL ON SCHEMA full_access_user_schema TO full_access;
+GRANT USAGE ON SCHEMA full_access_user_schema TO usage_access;
 
 \c - - - :master_port
+
+SET citus.replication_model TO 'streaming';
+SET citus.shard_replication_factor TO 1;
 
 -- create prepare tests
 PREPARE prepare_insert AS INSERT INTO test VALUES ($1);
@@ -100,25 +106,29 @@ INSERT INTO test VALUES (2);
 SELECT count(*) FROM test;
 SELECT count(*) FROM test WHERE id = 1;
 
-SET citus.task_executor_type TO 'task-tracker';
+SET citus.enable_repartition_joins to ON;
 SELECT count(*), min(current_user) FROM test;
 
 -- test re-partition query (needs to transmit intermediate results)
 SELECT count(*) FROM test a JOIN test b ON (a.val = b.val) WHERE a.id = 1 AND b.id = 2;
 
--- should not be able to transmit directly
-COPY "postgresql.conf" TO STDOUT WITH (format transmit);
-
-SET citus.task_executor_type TO 'real-time';
+SET citus.enable_repartition_joins TO true;
+SELECT count(*) FROM test a JOIN test b ON (a.val = b.val) WHERE a.id = 1 AND b.id = 2;
 
 -- should not be able to transmit directly
 COPY "postgresql.conf" TO STDOUT WITH (format transmit);
 
--- create a task that other users should not be able to inspect
-SELECT task_tracker_assign_task(1, 1, 'SELECT 1');
+
+-- should not be able to transmit directly
+COPY "postgresql.conf" TO STDOUT WITH (format transmit);
 
 -- check read permission
 SET ROLE read_access;
+
+-- should be allowed to run commands, as the current user
+SELECT result FROM run_command_on_workers($$SELECT current_user$$);
+SELECT result FROM run_command_on_placements('test', $$SELECT current_user$$);
+SELECT result FROM run_command_on_colocated_placements('test', 'test_coloc', $$SELECT current_user$$);
 
 EXECUTE prepare_insert(1);
 EXECUTE prepare_select;
@@ -127,19 +137,17 @@ INSERT INTO test VALUES (2);
 SELECT count(*) FROM test;
 SELECT count(*) FROM test WHERE id = 1;
 
-SET citus.task_executor_type TO 'task-tracker';
+SET citus.enable_repartition_joins to ON;
 SELECT count(*), min(current_user) FROM test;
 
 -- test re-partition query (needs to transmit intermediate results)
 SELECT count(*) FROM test a JOIN test b ON (a.val = b.val) WHERE a.id = 1 AND b.id = 2;
 
+SET citus.enable_repartition_joins TO true;
+SELECT count(*) FROM test a JOIN test b ON (a.val = b.val) WHERE a.id = 1 AND b.id = 2;
+
 -- should not be able to transmit directly
 COPY "postgresql.conf" TO STDOUT WITH (format transmit);
-
--- should not be able to access tasks or jobs belonging to a different user
-SELECT task_tracker_task_status(1, 1);
-SELECT task_tracker_assign_task(1, 2, 'SELECT 1');
-SELECT task_tracker_cleanup_job(1);
 
 -- should not be allowed to take aggressive locks on table
 BEGIN;
@@ -147,7 +155,6 @@ SELECT lock_relation_if_exists('test', 'ACCESS SHARE');
 SELECT lock_relation_if_exists('test', 'EXCLUSIVE');
 ABORT;
 
-SET citus.task_executor_type TO 'real-time';
 
 -- check no permission
 SET ROLE no_access;
@@ -159,16 +166,18 @@ INSERT INTO test VALUES (2);
 SELECT count(*) FROM test;
 SELECT count(*) FROM test WHERE id = 1;
 
-SET citus.task_executor_type TO 'task-tracker';
+SET citus.enable_repartition_joins to ON;
 SELECT count(*), min(current_user) FROM test;
 
 -- test re-partition query
 SELECT count(*) FROM test a JOIN test b ON (a.val = b.val) WHERE a.id = 1 AND b.id = 2;
 
+SET citus.enable_repartition_joins TO true;
+SELECT count(*) FROM test a JOIN test b ON (a.val = b.val) WHERE a.id = 1 AND b.id = 2;
+
 -- should not be able to transmit directly
 COPY "postgresql.conf" TO STDOUT WITH (format transmit);
 
-SET citus.task_executor_type TO 'real-time';
 
 -- should be able to use intermediate results as any user
 BEGIN;
@@ -183,11 +192,16 @@ ABORT;
 
 SELECT * FROM citus_stat_statements_reset();
 
--- should not be allowed to upgrade to reference table
-SELECT upgrade_to_reference_table('singleshard');
-
 -- should not be allowed to co-located tables
-SELECT mark_tables_colocated('test', ARRAY['test_coloc'::regclass]);
+SELECT update_distributed_table_colocation('test', colocate_with => 'test_coloc');
+
+-- should not be allowed to take any locks
+BEGIN;
+SELECT lock_relation_if_exists('test', 'ACCESS SHARE');
+ABORT;
+BEGIN;
+SELECT lock_relation_if_exists('test', 'EXCLUSIVE');
+ABORT;
 
 -- table owner should be the same on the shards, even when distributing the table as superuser
 SET ROLE full_access;
@@ -195,8 +209,6 @@ CREATE TABLE my_table (id integer, val integer);
 RESET ROLE;
 SELECT create_distributed_table('my_table', 'id');
 SELECT result FROM run_command_on_workers($$SELECT tableowner FROM pg_tables WHERE tablename LIKE 'my_table_%' LIMIT 1$$);
-
-SELECT task_tracker_cleanup_job(1);
 
 -- table should be distributable by super user when it has data in there
 SET ROLE full_access;
@@ -234,16 +246,16 @@ $cmd$);
 
 -- we want to make sure the schema and user are setup in such a way they can't create a
 -- table
-SET ROLE full_access;
+SET ROLE usage_access;
 CREATE TABLE full_access_user_schema.t1 (id int);
 RESET ROLE;
 
 -- now we create the table for the user
 CREATE TABLE full_access_user_schema.t1 (id int);
-ALTER TABLE full_access_user_schema.t1 OWNER TO full_access;
+ALTER TABLE full_access_user_schema.t1 OWNER TO usage_access;
 
 -- make sure we can insert data
-SET ROLE full_access;
+SET ROLE usage_access;
 INSERT INTO full_access_user_schema.t1 VALUES (1),(2),(3);
 
 -- creating the table should fail with a failure on the worker machine since the user is
@@ -251,6 +263,61 @@ INSERT INTO full_access_user_schema.t1 VALUES (1),(2),(3);
 SELECT create_distributed_table('full_access_user_schema.t1', 'id');
 RESET ROLE;
 
+SET ROLE usage_access;
+
+CREATE TYPE usage_access_type AS ENUM ('a', 'b');
+CREATE FUNCTION usage_access_func(x usage_access_type, variadic v int[]) RETURNS int[]
+    LANGUAGE plpgsql AS 'begin return v; end;';
+
+SET ROLE no_access;
+SELECT create_distributed_function('usage_access_func(usage_access_type,int[])');
+
+
+SET ROLE usage_access;
+SELECT create_distributed_function('usage_access_func(usage_access_type,int[])');
+
+SELECT typowner::regrole FROM pg_type WHERE typname = 'usage_access_type';
+SELECT proowner::regrole FROM pg_proc WHERE proname = 'usage_access_func';
+SELECT run_command_on_workers($$SELECT typowner::regrole FROM pg_type WHERE typname = 'usage_access_type'$$);
+SELECT run_command_on_workers($$SELECT proowner::regrole FROM pg_proc WHERE proname = 'usage_access_func'$$);
+
+SELECT wait_until_metadata_sync(30000);
+
+CREATE TABLE colocation_table(id text);
+SELECT create_distributed_table('colocation_table','id');
+
+-- now, make sure that the user can use the function
+-- created in the transaction
+BEGIN;
+CREATE FUNCTION usage_access_func_second(key int, variadic v int[]) RETURNS text
+    LANGUAGE plpgsql AS 'begin return current_user; end;';
+SELECT create_distributed_function('usage_access_func_second(int,int[])', '$1', colocate_with := 'colocation_table');
+
+SELECT usage_access_func_second(1, 2,3,4,5) FROM full_access_user_schema.t1 LIMIT 1;
+
+ROLLBACK;
+
+CREATE FUNCTION usage_access_func_third(key int, variadic v int[]) RETURNS text
+    LANGUAGE plpgsql AS 'begin return current_user; end;';
+
+-- connect back as super user
+\c - - - :master_port
+
+-- show that the current user is a super user
+SELECT usesuper FROM pg_user where usename IN (SELECT current_user);
+
+-- superuser creates the distributed function that is owned by a regular user
+SELECT create_distributed_function('usage_access_func_third(int,int[])', '$1', colocate_with := 'colocation_table');
+
+SELECT proowner::regrole FROM pg_proc WHERE proname = 'usage_access_func_third';
+SELECT run_command_on_workers($$SELECT proowner::regrole FROM pg_proc WHERE proname = 'usage_access_func_third'$$);
+
+-- we don't want other tests to have metadata synced
+-- that might change the test outputs, so we're just trying to be careful
+SELECT stop_metadata_sync_to_node('localhost', :worker_1_port);
+SELECT stop_metadata_sync_to_node('localhost', :worker_2_port);
+
+RESET ROLE;
 -- now we distribute the table as super user
 SELECT create_distributed_table('full_access_user_schema.t1', 'id');
 
@@ -263,6 +330,93 @@ SELECT result FROM run_command_on_workers($cmd$
   LIMIT 1;
 $cmd$);
 
+-- a user with all privileges on a schema should be able to distribute tables
+SET ROLE full_access;
+CREATE TABLE full_access_user_schema.t2(id int);
+SELECT create_distributed_table('full_access_user_schema.t2', 'id');
+RESET ROLE;
+
+-- super user should be the only one being able to call worker_cleanup_job_schema_cache
+SELECT worker_cleanup_job_schema_cache();
+SET ROLE full_access;
+SELECT worker_cleanup_job_schema_cache();
+SET ROLE usage_access;
+SELECT worker_cleanup_job_schema_cache();
+SET ROLE read_access;
+SELECT worker_cleanup_job_schema_cache();
+SET ROLE no_access;
+SELECT worker_cleanup_job_schema_cache();
+RESET ROLE;
+
+-- to test access to files created during repartition we will create some on worker 1
+\c - - - :worker_1_port
+CREATE OR REPLACE FUNCTION citus_rm_job_directory(bigint)
+	RETURNS void
+	AS 'citus'
+	LANGUAGE C STRICT;
+SET ROLE full_access;
+SELECT worker_hash_partition_table(42,1,'SELECT a FROM generate_series(1,100) AS a', 'a', 23, ARRAY[-2147483648, -1073741824, 0, 1073741824]::int4[]);
+RESET ROLE;
+-- all attempts for transfer are initiated from other workers
+
+\c - - - :worker_2_port
+
+CREATE OR REPLACE FUNCTION citus_rm_job_directory(bigint)
+	RETURNS void
+	AS 'citus'
+	LANGUAGE C STRICT;
+-- super user should not be able to copy files created by a user
+SELECT worker_fetch_partition_file(42, 1, 1, 1, 'localhost', :worker_1_port);
+
+-- different user should not be able to fetch partition file
+SET ROLE usage_access;
+SELECT worker_fetch_partition_file(42, 1, 1, 1, 'localhost', :worker_1_port);
+
+-- only the user whom created the files should be able to fetch
+SET ROLE full_access;
+SELECT worker_fetch_partition_file(42, 1, 1, 1, 'localhost', :worker_1_port);
+RESET ROLE;
+
+-- now we will test that only the user who owns the fetched file is able to merge it into
+-- a table
+-- test that no other user can merge the downloaded file before the task is being tracked
+SET ROLE usage_access;
+SELECT worker_merge_files_into_table(42, 1, ARRAY['a'], ARRAY['integer']);
+RESET ROLE;
+
+-- test that no other user can merge the downloaded file after the task is being tracked
+SET ROLE usage_access;
+SELECT worker_merge_files_into_table(42, 1, ARRAY['a'], ARRAY['integer']);
+RESET ROLE;
+
+-- test that the super user is unable to read the contents of the intermediate file,
+-- although it does create the table
+SELECT worker_merge_files_into_table(42, 1, ARRAY['a'], ARRAY['integer']);
+SELECT count(*) FROM pg_merge_job_0042.task_000001;
+DROP TABLE pg_merge_job_0042.task_000001; -- drop table so we can reuse the same files for more tests
+
+SET ROLE full_access;
+SELECT worker_merge_files_into_table(42, 1, ARRAY['a'], ARRAY['integer']);
+SELECT count(*) FROM pg_merge_job_0042.task_000001;
+DROP TABLE pg_merge_job_0042.task_000001; -- drop table so we can reuse the same files for more tests
+RESET ROLE;
+
+SELECT count(*) FROM pg_merge_job_0042.task_000001_merge;
+SELECT count(*) FROM pg_merge_job_0042.task_000001;
+DROP TABLE pg_merge_job_0042.task_000001, pg_merge_job_0042.task_000001_merge; -- drop table so we can reuse the same files for more tests
+
+SELECT count(*) FROM pg_merge_job_0042.task_000001_merge;
+SELECT count(*) FROM pg_merge_job_0042.task_000001;
+DROP TABLE pg_merge_job_0042.task_000001, pg_merge_job_0042.task_000001_merge; -- drop table so we can reuse the same files for more tests
+RESET ROLE;
+
+SELECT citus_rm_job_directory(42::bigint);
+
+\c - - - :worker_1_port
+SELECT citus_rm_job_directory(42::bigint);
+
+\c - - - :master_port
+
 DROP SCHEMA full_access_user_schema CASCADE;
 DROP TABLE
     my_table,
@@ -270,7 +424,8 @@ DROP TABLE
     my_role_table_with_data,
     singleshard,
     test,
-    test_coloc;
+    test_coloc,
+    colocation_table;
 DROP USER full_access;
 DROP USER read_access;
 DROP USER no_access;

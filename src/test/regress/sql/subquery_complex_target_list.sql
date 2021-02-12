@@ -1,5 +1,5 @@
 -- ===================================================================
--- test recursive planning functionality with complex target entries 
+-- test subquery functionality with complex target entries
 -- and some utilities
 -- ===================================================================
 CREATE SCHEMA subquery_complex;
@@ -7,13 +7,17 @@ SET search_path TO subquery_complex, public;
 
 SET client_min_messages TO DEBUG1;
 
+-- the logs are enabled and it sometimes
+-- lead to flaky outputs when jit enabled
+SET jit_above_cost TO -1;
+
 -- COUNT DISTINCT at the top level query
 SELECT
   event_type, count(distinct value_2)
 FROM
   events_table
 WHERE
-  user_id IN (SELECT user_id FROM users_table GROUP BY user_id ORDER BY count(*) DESC LIMIT 20) 
+  user_id IN (SELECT user_id FROM users_table GROUP BY user_id ORDER BY count(*) DESC LIMIT 20)
 GROUP BY
   event_type
 ORDER BY 1 DESC, 2 DESC
@@ -46,8 +50,8 @@ FROM
     	SELECT count(distinct value_2) as cnt_2 FROM users_table ORDER BY 1 DESC LIMIT 4
     ) as baz,
 	(
-		SELECT user_id, sum(distinct value_2) as sum FROM users_table GROUP BY user_id ORDER BY 1 DESC LIMIT 4   
-    ) as bat, events_table 
+		SELECT user_id, sum(distinct value_2) as sum FROM users_table GROUP BY user_id ORDER BY 1 DESC LIMIT 4
+    ) as bat, events_table
     WHERE foo.avg != bar.cnt_1 AND baz.cnt_2 = events_table.event_type
     ORDER BY 1 DESC;
 
@@ -56,29 +60,29 @@ SELECT
    *
 FROM
     (
-    	SELECT 
+    	SELECT
     		min(user_id) * 2, max(user_id) / 2, sum(user_id), count(user_id)::float, avg(user_id)::bigint
-    	FROM 
-    		users_table 
-    	ORDER BY 1 DESC 
+    	FROM
+    		users_table
+    	ORDER BY 1 DESC
     	LIMIT 3
     ) as foo,
     (
-    	   SELECT 
+    	   SELECT
     		min(value_3) * 2, max(value_3) / 2, sum(value_3), count(value_3), avg(value_3)
-    	FROM 
-    		users_table 
-    	ORDER BY 1 DESC 
+    	FROM
+    		users_table
+    	ORDER BY 1 DESC
     	LIMIT 3
     ) as bar,
 	(
-    	SELECT 
-    		min(time), max(time), count(time), 
-    		count(*) FILTER (WHERE user_id = 3) as cnt_with_filter, 
+    	SELECT
+    		min(time), max(time), count(time),
+    		count(*) FILTER (WHERE user_id = 3) as cnt_with_filter,
     		count(*) FILTER (WHERE user_id::text LIKE '%3%') as cnt_with_filter_2
-    	FROM 
-    		users_table 
-    	ORDER BY 1 DESC 
+    	FROM
+    		users_table
+    	ORDER BY 1 DESC
     	LIMIT 3
     ) as baz
     ORDER BY 1 DESC;
@@ -95,11 +99,11 @@ FROM
     	SELECT sum(user_id * (5.0 / (value_1 + value_2 + 0.1)) * value_3) as cnt_1 FROM users_table ORDER BY 1 DESC LIMIT 3
     ) as bar,
 	(
-    	SELECT     
+    	SELECT
     		avg(case
             	when user_id > 4
             	then value_1
-        	end) as cnt_2, 
+        	end) as cnt_2,
     		avg(case
             	when user_id > 500
             	then value_1
@@ -112,16 +116,16 @@ FROM
 			end) as sum_1,
 			extract(year FROM max(time)) as l_year,
 			strpos(max(user_id)::text, '1') as pos
-         FROM 
-         		users_table 
-         ORDER BY 
-         	1 DESC 
+         FROM
+         		users_table
+         ORDER BY
+         	1 DESC
          LIMIT 4
-    ) as baz, 
+    ) as baz,
 	(
 		SELECT  COALESCE(value_3, 20) AS count_pay FROM users_table ORDER BY 1 OFFSET 20 LIMIT 5
 	) as tar,
-    events_table 
+    events_table
     WHERE foo.avg != bar.cnt_1 AND baz.cnt_2 != events_table.event_type
     ORDER BY 1 DESC;
 
@@ -183,7 +187,7 @@ FROM (
       		sum(value_1) > 10
       	   ORDER BY (sum(value_3) - avg(value_1) - COALESCE(array_upper(ARRAY[max(user_id)],1) * 5,0)) DESC
       	   LIMIT 3
-        ) as c 
+        ) as c
 
         WHERE b.value_2 != a.user_id
         ORDER BY 3 DESC, 2 DESC, 1 DESC
@@ -193,20 +197,20 @@ FROM (
 SELECT
    bar.user_id
 FROM
-    (SELECT 
-    	DISTINCT users_table.user_id 
-     FROM 
-     	users_table, events_table 
-     WHERE 
-     	users_table.user_id = events_table.user_id AND 
+    (SELECT
+    	DISTINCT users_table.user_id
+     FROM
+     	users_table, events_table
+     WHERE
+     	users_table.user_id = events_table.user_id AND
      event_type IN (1,2,3,4)
      ORDER BY 1 DESC LIMIT 5
      ) as foo,
-    (SELECT 
-    	DISTINCT users_table.user_id 
-     FROM 
-     	users_table, events_table 
-     WHERE 
+    (SELECT
+    	DISTINCT users_table.user_id
+     FROM
+     	users_table, events_table
+     WHERE
      	users_table.user_id = events_table.user_id AND false AND
      event_type IN (1,2,3,4)
      ORDER BY 1 DESC LIMIT 5
@@ -215,7 +219,7 @@ FROM
     ORDER BY 1 DESC;
 
 -- window functions tests, both is recursively planned
-SELECT * FROM 
+SELECT * FROM
 (
 	SELECT
 	   user_id, time, rnk
@@ -244,7 +248,7 @@ SELECT * FROM
 	    *, rank() OVER my_win as rnk
 	  FROM
 	    events_table
-	  WHERE 
+	  WHERE
 	   	user_id = 3
 	  WINDOW my_win AS (PARTITION BY event_type ORDER BY time DESC)
 
@@ -256,14 +260,14 @@ ORDER BY foo.rnk DESC, foo.time DESC, bar.time LIMIT 5;
 
 -- cursor test
 BEGIN;
-	
-	DECLARE recursive_subquery CURSOR FOR     
+
+	DECLARE recursive_subquery CURSOR FOR
 	SELECT
 	  event_type, count(distinct value_2)
 	FROM
 	  events_table
 	WHERE
-	  user_id IN (SELECT user_id FROM users_table GROUP BY user_id ORDER BY count(*) DESC LIMIT 20) 
+	  user_id IN (SELECT user_id FROM users_table GROUP BY user_id ORDER BY count(*) DESC LIMIT 20)
 	GROUP BY
 	  event_type
 	ORDER BY 1 DESC, 2 DESC
@@ -277,14 +281,14 @@ COMMIT;
 
 -- cursor test with FETCH ALL
 BEGIN;
-	
-	DECLARE recursive_subquery CURSOR FOR     
+
+	DECLARE recursive_subquery CURSOR FOR
 	SELECT
 	  event_type, count(distinct value_2)
 	FROM
 	  events_table
 	WHERE
-	  user_id IN (SELECT user_id FROM users_table GROUP BY user_id ORDER BY count(*) DESC LIMIT 20) 
+	  user_id IN (SELECT user_id FROM users_table GROUP BY user_id ORDER BY count(*) DESC LIMIT 20)
 	GROUP BY
 	  event_type
 	ORDER BY 1 DESC, 2 DESC
@@ -296,5 +300,128 @@ COMMIT;
 
 SET client_min_messages TO DEFAULT;
 
+CREATE TABLE items (key text primary key, value text not null, t timestamp);
+SELECT create_distributed_table('items','key');
+INSERT INTO items VALUES ('key-1','value-2', '2020-01-01 00:00');
+INSERT INTO items VALUES ('key-2','value-1', '2020-02-02 00:00');
+
+CREATE TABLE other_items (key text primary key, value text not null);
+SELECT create_distributed_table('other_items','key');
+INSERT INTO other_items VALUES ('key-1','value-2');
+
+-- LEFT JOINs are wrapped into a subquery under the covers, which causes GROUP BY
+-- to be separated from the LEFT JOIN. If the GROUP BY is on a primary key we can
+-- normally use any column even ones that are not in the GROUP BY, but not when
+-- it is in the outer query. In that case, we use the any_value aggregate.
+SELECT key, a.value, count(b.value), t
+FROM items a LEFT JOIN other_items b USING (key)
+GROUP BY key HAVING a.value != 'value-2' ORDER BY count(b.value), a.value LIMIT 5;
+
+SELECT key, a.value, count(b.value), t
+FROM items a LEFT JOIN other_items b USING (key)
+GROUP BY key, t HAVING a.value != 'value-2' ORDER BY count(b.value), a.value LIMIT 5;
+
+-- make sure the same logic works for regular joins
+SELECT key, a.value, count(b.value), t
+FROM items a JOIN other_items b USING (key)
+GROUP BY key HAVING a.value = 'value-2' ORDER BY count(b.value), a.value LIMIT 5;
+
+-- subqueries also trigger wrapping
+SELECT key, a.value, count(b.value), t
+FROM items a JOIN (SELECT key, value, random() FROM other_items) b USING (key)
+GROUP BY key ORDER BY 3, 2, 1;
+
+-- pushdownable window functions also trigger wrapping
+SELECT a.key, a.value, count(a.value) OVER (PARTITION BY a.key)
+FROM items a JOIN other_items b ON (a.key = b.key)
+GROUP BY a.key ORDER BY 3, 2, 1;
+
+-- left join with non-pushdownable window functions
+SELECT a.key, a.value, count(a.value) OVER ()
+FROM items a LEFT JOIN other_items b ON (a.key = b.key)
+GROUP BY a.key ORDER BY 3, 2, 1;
+
+-- function joins (actually with read_intermediate_results) also trigger wrapping
+SELECT key, a.value, sum(b)
+FROM items a JOIN generate_series(1,10) b ON (a.key = 'key-'||b)
+GROUP BY key ORDER BY 3, 2, 1;
+
+-- whole rows in the output should work
+SELECT a.key, a, count(b)
+FROM items a LEFT JOIN other_items b ON (a.key = b.key)
+GROUP BY a.key ORDER BY 3, 2, 1;
+
+-- Of the target list entries, v1-v3 should be wrapped in any_value as they do
+-- not appear in GROUP BY. The append happens on the coordinator in that case.
+-- Vars in the HAVING that do not appear in the GROUP BY are also wrapped.
+SELECT
+  a.key as k1,
+  a.key as k2,
+  a.key || '_append' as k3,
+  a.value as v1,
+  a.value as v2,
+  a.value || '_notgrouped' as v3,
+  a.value || '_append' as va1,
+  a.value || '_append' as va2,
+  a.value || '_append' || '_more' as va2,
+  count(*)
+FROM items a LEFT JOIN other_items b ON (a.key = b.key)
+GROUP BY a.key, a.value ||'_append'
+HAVING length(a.key) + length(a.value) < length(a.value || '_append')
+ORDER BY 1;
+
+SELECT coordinator_plan($$
+EXPLAIN (VERBOSE ON, COSTS OFF)
+SELECT
+  a.key as k1,
+  a.key as k2,
+  a.key || '_append' as k3,
+  a.value as v1,
+  a.value as v2,
+  a.value || '_notgrouped' as v3,
+  a.value || '_append' as va1,
+  a.value || '_append' as va2,
+  a.value || '_append' || '_more' as va3,
+  count(*)
+FROM items a LEFT JOIN other_items b ON (a.key = b.key)
+GROUP BY a.key, a.value ||'_append'
+HAVING length(a.key) + length(a.value) < length(a.value || '_append')
+ORDER BY 1
+$$);
+SELECT a FROM items a ORDER BY key;
+SELECT a FROM items a WHERE key = 'key-1';
+SELECT a FROM (SELECT a, random() FROM items a) b ORDER BY a;
+
+-- whole rows when table name needs escaping
+create table "another table" (key text primary key, value text not null, t timestamp);
+SELECT create_distributed_table('"another table"','key');
+INSERT INTO "another table" TABLE items;
+SELECT a.key, a, count(b)
+FROM "another table" a LEFT JOIN other_items b ON (a.key = b.key)
+GROUP BY a.key ORDER BY 3, 2, 1;
+
+-- subquery output is not recognised yet
+SELECT b FROM (SELECT a FROM items a GROUP BY key) b ORDER BY b;
+
+-- table output in recursive planning
+WITH a AS (SELECT a FROM items a OFFSET 0)
+SELECT count(a) FROM a;
+
+WITH a AS (SELECT a AS b FROM items a OFFSET 0)
+SELECT b FROM a ORDER BY b;
+
+BEGIN;
+WITH a AS (DELETE FROM items RETURNING items)
+SELECT count(a) FROM a;
+ROLLBACK;
+
+-- mix custom types with table type
+CREATE TYPE full_item AS (key text, value text);
+ALTER TABLE items ADD COLUMN fi subquery_complex.full_item;
+UPDATE items SET fi = (items.key, items.value);
+
+SELECT a, a.fi, (a.fi).* FROM items a ORDER BY 1,2,3;
+SELECT a, b.fi, (b.fi).*, (a).fi, ((a).fi).* FROM (SELECT a, fi FROM items a GROUP BY key) b ORDER BY 1,2,3;
+
+SET client_min_messages TO 'WARNING';
 DROP SCHEMA subquery_complex CASCADE;
-SET search_path TO public;

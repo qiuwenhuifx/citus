@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  * transaction_management.h
  *
- * Copyright (c) 2016, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -10,6 +10,7 @@
 #define TRANSACTION_MANAGMENT_H
 
 #include "lib/ilist.h"
+#include "lib/stringinfo.h"
 #include "nodes/pg_list.h"
 
 /* describes what kind of modifications have occurred in the current transaction */
@@ -53,6 +54,13 @@ typedef enum
 	COMMIT_PROTOCOL_2PC = 2
 } CommitProtocolType;
 
+/* Enumeration to keep track of context within nested sub-transactions */
+typedef struct SubXactContext
+{
+	SubTransactionId subId;
+	StringInfo setLocalCmds;
+} SubXactContext;
+
 /*
  * GUC that determines whether a SELECT in a transaction block should also run in
  * a transaction block on the worker.
@@ -67,6 +75,7 @@ extern bool FunctionOpensTransactionBlock;
 
 /* config variable managed via guc.c */
 extern int MultiShardCommitProtocol;
+extern int SingleShardCommitProtocol;
 
 /* state needed to restore multi-shard commit protocol during VACUUM/ANALYZE */
 extern int SavedMultiShardCommitProtocol;
@@ -79,27 +88,40 @@ extern CoordinatedTransactionState CurrentCoordinatedTransactionState;
 /* list of connections that are part of the current coordinated transaction */
 extern dlist_head InProgressTransactions;
 
+/* controls use of locks to enforce safe commutativity */
+extern bool AllModificationsCommutative;
+
+/* we've deprecated this flag, keeping here for some time not to break existing users */
+extern bool EnableDeadlockPrevention;
+
 /* number of nested stored procedure call levels we are currently in */
 extern int StoredProcedureLevel;
 
-/* number of nested function call levels we are currently in */
-extern int FunctionCallLevel;
+/* number of nested DO block levels we are currently in */
+extern int DoBlockLevel;
 
+/* SET LOCAL statements active in the current (sub-)transaction. */
+extern StringInfo activeSetStmts;
+
+/* did current transaction modify pg_dist_node? */
+extern bool TransactionModifiedNodeMetadata;
 
 /*
  * Coordinated transaction management.
  */
-extern void BeginCoordinatedTransaction(void);
-extern void BeginOrContinueCoordinatedTransaction(void);
+extern void UseCoordinatedTransaction(void);
 extern bool InCoordinatedTransaction(void);
 extern void CoordinatedTransactionUse2PC(void);
 extern bool IsMultiStatementTransaction(void);
+extern void EnsureDistributedTransactionId(void);
 
 /* initialization function(s) */
 extern void InitializeTransactionManagement(void);
 
 /* other functions */
-extern List * ActiveSubXacts(void);
+extern List * ActiveSubXactContexts(void);
+extern StringInfo BeginAndSetDistributedTransactionIdCommand(void);
+extern void TriggerMetadataSyncOnCommit(void);
 
 
 #endif /*  TRANSACTION_MANAGMENT_H */

@@ -10,7 +10,7 @@ CREATE SEQUENCE colocation_test_seq
     MINVALUE 1000
     NO CYCLE;
 
-/* a very simple UDF that only sets the colocation ids the same 
+/* a very simple UDF that only sets the colocation ids the same
  * DO NOT USE THIS FUNCTION IN PRODUCTION. It manually sets colocationid column of
  * pg_dist_partition and it does not check anything about pyshical state about shards.
  */
@@ -29,7 +29,7 @@ BEGIN
             FROM pg_dist_partition p1, pg_dist_partition p2
             WHERE
                 p2.logicalrelid = source_table AND
-                (p1.logicalrelid = source_table OR 
+                (p1.logicalrelid = source_table OR
                 (p1.colocationId = p2.colocationId AND p1.colocationId != 0)))
         UNION
         (SELECT target_table)
@@ -92,6 +92,7 @@ SELECT master_create_distributed_table('table6_append', 'id', 'append');
 SELECT master_create_empty_shard('table6_append');
 SELECT master_create_empty_shard('table6_append');
 
+
 -- make table1_group1 and table2_group1 co-located manually
 SELECT colocation_test_colocate_tables('table1_group1', 'table2_group1');
 
@@ -150,8 +151,10 @@ SELECT find_shard_interval_index(1300002);
 SELECT find_shard_interval_index(1300003);
 SELECT find_shard_interval_index(1300016);
 
-
 -- check external colocation API
+
+SELECT count(*) FROM pg_dist_partition WHERE colocationid = 4;
+DELETE FROM pg_dist_colocation WHERE colocationid = 4;
 
 SET citus.shard_count = 2;
 
@@ -204,12 +207,12 @@ CREATE FOREIGN TABLE table3_groupD ( id int ) SERVER fake_fdw_server;
 SELECT create_distributed_table('table3_groupD', 'id');
 
 -- check metadata
-SELECT * FROM pg_dist_colocation 
-    WHERE colocationid >= 1 AND colocationid < 1000 
+SELECT * FROM pg_dist_colocation
+    WHERE colocationid >= 1 AND colocationid < 1000
     ORDER BY colocationid;
 
 SELECT logicalrelid, colocationid FROM pg_dist_partition
-    WHERE colocationid >= 1 AND colocationid < 1000 
+    WHERE colocationid >= 1 AND colocationid < 1000
     ORDER BY logicalrelid;
 
 -- check effects of dropping tables
@@ -234,10 +237,10 @@ CREATE TABLE table3_groupE ( dummy_column text, id int );
 SELECT create_distributed_table('table3_groupE', 'id');
 
 -- test different schema
-CREATE SCHEMA schema_collocation;
+CREATE SCHEMA schema_colocation;
 
-CREATE TABLE schema_collocation.table4_groupE ( id int );
-SELECT create_distributed_table('schema_collocation.table4_groupE', 'id');
+CREATE TABLE schema_colocation.table4_groupE ( id int );
+SELECT create_distributed_table('schema_colocation.table4_groupE', 'id');
 
 -- test colocate_with option
 CREATE TABLE table1_group_none_1 ( id int );
@@ -288,7 +291,7 @@ SELECT create_distributed_table('table_bigint', 'id', colocate_with => 'table1_g
 -- check worker table schemas
 \c - - - :worker_1_port
 SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.table3_groupE_1300062'::regclass;
-SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='schema_collocation.table4_groupE_1300064'::regclass;
+SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='schema_colocation.table4_groupE_1300064'::regclass;
 
 \c - - - :master_port
 SET citus.next_shard_id TO 1300080;
@@ -305,7 +308,7 @@ SELECT * FROM pg_dist_colocation
     ORDER BY colocationid;
 
 -- cross check with internal colocation API
-SELECT 
+SELECT
     p1.logicalrelid::regclass AS table1,
     p2.logicalrelid::regclass AS table2,
     tables_colocated(p1.logicalrelid , p2.logicalrelid) AS colocated
@@ -339,9 +342,9 @@ ORDER BY
     logicalrelid,
     shardmaxvalue::integer,
     shardid,
-    placementid;
+    nodeport;
 
--- reset colocation ids to test mark_tables_colocated
+-- reset colocation ids to test update_distributed_table_colocation
 ALTER SEQUENCE pg_catalog.pg_dist_colocationid_seq RESTART 1;
 DELETE FROM pg_dist_colocation
     WHERE colocationid >= 1 AND colocationid < 1000;
@@ -358,11 +361,11 @@ SELECT logicalrelid, colocationid FROM pg_dist_partition
     ORDER BY colocationid, logicalrelid;
 
 -- first check failing cases
-SELECT mark_tables_colocated('table1_groupB', ARRAY['table1_groupC']);
-SELECT mark_tables_colocated('table1_groupB', ARRAY['table1_groupD']);
-SELECT mark_tables_colocated('table1_groupB', ARRAY['table1_groupE']);
-SELECT mark_tables_colocated('table1_groupB', ARRAY['table1_groupF']);
-SELECT mark_tables_colocated('table1_groupB', ARRAY['table2_groupB', 'table1_groupD']);
+SELECT update_distributed_table_colocation('table1_groupB', colocate_with => 'table1_groupC');
+SELECT update_distributed_table_colocation('table1_groupB', colocate_with => 'table1_groupD');
+SELECT update_distributed_table_colocation('table1_groupB', colocate_with => 'table1_groupE');
+SELECT update_distributed_table_colocation('table1_groupB', colocate_with => 'table1_groupF');
+SELECT update_distributed_table_colocation('table1_groupB', colocate_with => 'table1_groupD');
 
 -- check metadata to see failing calls didn't have any side effects
 SELECT * FROM pg_dist_colocation
@@ -374,14 +377,14 @@ SELECT logicalrelid, colocationid FROM pg_dist_partition
     ORDER BY colocationid, logicalrelid;
 
 -- check successfully cololated tables
-SELECT mark_tables_colocated('table1_groupB', ARRAY['table2_groupB']);
-SELECT mark_tables_colocated('table1_groupC', ARRAY['table2_groupC']);
-SELECT mark_tables_colocated('table1_groupD', ARRAY['table2_groupD']);
-SELECT mark_tables_colocated('table1_groupE', ARRAY['table2_groupE', 'table3_groupE']);
-SELECT mark_tables_colocated('table1_groupF', ARRAY['table2_groupF']);
+SELECT update_distributed_table_colocation('table1_groupB', colocate_with => 'table2_groupB');
+SELECT update_distributed_table_colocation('table1_groupC', colocate_with => 'table2_groupC');
+SELECT update_distributed_table_colocation('table1_groupD', colocate_with => 'table2_groupD');
+SELECT update_distributed_table_colocation('table1_groupE', colocate_with => 'table2_groupE');
+SELECT update_distributed_table_colocation('table1_groupE', colocate_with => 'table3_groupE');
 
 -- check to colocate with itself
-SELECT mark_tables_colocated('table1_groupB', ARRAY['table1_groupB']);
+SELECT update_distributed_table_colocation('table1_groupB', colocate_with => 'table1_groupB');
 
 SET citus.shard_count = 2;
 
@@ -392,8 +395,8 @@ CREATE TABLE table2_group_none ( id int );
 SELECT create_distributed_table('table2_group_none', 'id', colocate_with => 'NONE');
 
 -- check metadata to see colocation groups are created successfully
-SELECT * FROM pg_dist_colocation 
-    WHERE colocationid >= 1 AND colocationid < 1000 
+SELECT * FROM pg_dist_colocation
+    WHERE colocationid >= 1 AND colocationid < 1000
     ORDER BY colocationid;
 
 SELECT logicalrelid, colocationid FROM pg_dist_partition
@@ -401,10 +404,12 @@ SELECT logicalrelid, colocationid FROM pg_dist_partition
     ORDER BY colocationid, logicalrelid;
 
 -- move the all tables in colocation group 5 to colocation group 7
-SELECT mark_tables_colocated('table1_group_none', ARRAY['table1_groupE', 'table2_groupE', 'table3_groupE']);
+SELECT update_distributed_table_colocation('table1_group_none', colocate_with => 'table1_groupE');
+SELECT update_distributed_table_colocation('table1_group_none', colocate_with => 'table2_groupE');
+SELECT update_distributed_table_colocation('table1_group_none', colocate_with => 'table3_groupE');
 
 -- move a table with a colocation id which is already not in pg_dist_colocation
-SELECT mark_tables_colocated('table1_group_none', ARRAY['table2_group_none']);
+SELECT update_distributed_table_colocation('table1_group_none', colocate_with => 'table2_group_none');
 
 -- check metadata to see that unused colocation group is deleted
 SELECT * FROM pg_dist_colocation
@@ -428,7 +433,91 @@ SELECT create_distributed_table('table2_groupG', 'id', colocate_with => 'table1_
 CREATE TABLE table2_groupG ( id int );
 SELECT create_distributed_table('table2_groupG', 'id', colocate_with => 'NONE');
 
-SELECT mark_tables_colocated('table1_groupG', ARRAY['table2_groupG']);
+SELECT update_distributed_table_colocation('table1_groupG', colocate_with => 'table2_groupG');
+
+CREATE TABLE d1(a int, b int);
+CREATE TABLE d2(a int, b int);
+CREATE TABLE d3(a int, b int);
+CREATE TABLE d4(a int, b int);
+CREATE TABLE different_d1(ch char);
+CREATE TABLE append_table(a int, b int);
+CREATE TABLE range_table(a int, b int);
+-- special keyword none
+CREATE TABLE none(a int, b int);
+CREATE TABLE ref(a int);
+CREATE TABLE local_table(a int);
+
+SELECT create_distributed_table('d1', 'a');
+SELECT create_distributed_table('d2', 'a', colocate_with => 'd1');
+SELECT create_distributed_table('d3', 'a', colocate_with => 'd2');
+SELECT create_distributed_table('d4', 'a', colocate_with => 'd3');
+SELECT create_distributed_table('none', 'a', colocate_with => 'd4');
+SELECT create_distributed_table('different_d1', 'ch');
+SELECT create_distributed_table('append_table', 'a', 'append');
+SELECT create_distributed_table('range_table', 'a', 'range');
+
+
+SELECT create_reference_table('ref');
+
+SELECT tables_colocated('d1', 'd2');
+SELECT tables_colocated('d2', 'd3');
+SELECT tables_colocated('d2', 'd4');
+SELECT tables_colocated('d3', 'd4');
+SELECT tables_colocated('d1', 'd3');
+SELECT tables_colocated('d1', 'd4');
+
+-- break colocation of d2
+SELECT update_distributed_table_colocation('d2', colocate_with => 'none');
+
+SELECT tables_colocated('d1', 'd2');
+SELECT tables_colocated('d2', 'd3');
+SELECT tables_colocated('d1', 'd3');
+SELECT tables_colocated('d1', 'd4');
+
+-- break colocation of d2
+-- update colocation should not error if d2 doesn't have any colocated table.
+SELECT update_distributed_table_colocation('d2', colocate_with => 'none');
+
+SELECT tables_colocated('d1', 'd2');
+SELECT tables_colocated('d2', 'd3');
+SELECT tables_colocated('d1', 'd3');
+SELECT tables_colocated('d1', 'd4');
+
+SELECT update_distributed_table_colocation('d3', colocate_with => 'd2');
+
+SELECT tables_colocated('d1', 'd2');
+SELECT tables_colocated('d2', 'd3');
+SELECT tables_colocated('d1', 'd3');
+SELECT tables_colocated('d1', 'd4');
+
+-- special case, colocate with a table named "none".
+SELECT update_distributed_table_colocation('d3', colocate_with => '"none"');
+
+SELECT tables_colocated('d1', 'd2');
+SELECT tables_colocated('d2', 'd3');
+SELECT tables_colocated('d1', 'd3');
+SELECT tables_colocated('d1', 'd4');
+SELECT tables_colocated('d1', 'none');
+SELECT tables_colocated('d4', 'none');
+SELECT tables_colocated('d3', 'none');
+SELECT tables_colocated('d2', 'none');
+
+-- make sure reference and local tables return an error.
+SELECT update_distributed_table_colocation('ref', colocate_with => 'none');
+SELECT update_distributed_table_colocation('local_table', colocate_with => 'none');
+
+-- make sure that different types cannot be colocated
+SELECT update_distributed_table_colocation('different_d1', colocate_with => 'd1');
+SELECT update_distributed_table_colocation('d1', colocate_with => 'different_d1');
+
+-- make sure that append distributed tables cannot be colocated
+SELECT update_distributed_table_colocation('append_table', colocate_with => 'd1');
+SELECT update_distributed_table_colocation('d1', colocate_with => 'append_table');
+SELECT update_distributed_table_colocation('range_table', colocate_with => 'd1');
+SELECT update_distributed_table_colocation('d1', colocate_with => 'range_table');
+
+
+
 
 -- drop tables to clean test space
 DROP TABLE table1_groupb;
@@ -439,11 +528,13 @@ DROP TABLE table1_groupd;
 DROP TABLE table2_groupd;
 DROP TABLE table1_groupf;
 DROP TABLE table2_groupf;
+DROP TABLE table1_groupg;
+DROP TABLE table2_groupg;
 DROP TABLE table1_groupe;
 DROP TABLE table2_groupe;
 DROP TABLE table3_groupe;
 DROP TABLE table4_groupe;
-DROP TABLE schema_collocation.table4_groupe;
+DROP TABLE schema_colocation.table4_groupe;
 DROP TABLE table1_group_none_1;
 DROP TABLE table2_group_none_1;
 DROP TABLE table1_group_none_2;
@@ -451,3 +542,15 @@ DROP TABLE table1_group_none_3;
 DROP TABLE table1_group_none;
 DROP TABLE table2_group_none;
 DROP TABLE table1_group_default;
+DROP TABLE d1;
+DROP TABLE d2;
+DROP TABLE d3;
+DROP TABLE d4;
+DROP TABLE different_d1;
+DROP TABLE append_table;
+DROP TABLE range_table;
+DROP TABLE none;
+DROP TABLE ref;
+DROP TABLE local_table;
+
+

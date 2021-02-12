@@ -5,7 +5,7 @@
  *
  * Portions Copyright (c) 1996-2014, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
- * Portions Copyright (c) 2012-2016, Citus Data, Inc.
+ * Portions Copyright (c) Citus Data, Inc.
  *
  * NOTES
  *	  This is a wrapper around postgres' nodeToString() that additionally
@@ -18,19 +18,27 @@
 
 #include "postgres.h"
 
+#include "distributed/pg_version_constants.h"
+
 #include <ctype.h>
 
 #include "distributed/citus_nodefuncs.h"
 #include "distributed/citus_nodes.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/errormessage.h"
+#include "distributed/log_utils.h"
 #include "distributed/multi_logical_planner.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/distributed_planner.h"
 #include "distributed/multi_server_executor.h"
-#include "distributed/master_metadata_utility.h"
+#include "distributed/metadata_utility.h"
 #include "lib/stringinfo.h"
 #include "nodes/plannodes.h"
+#if PG_VERSION_NUM >= PG_VERSION_12
+#include "nodes/pathnodes.h"
+#else
 #include "nodes/relation.h"
+#endif
 #include "utils/datum.h"
 
 
@@ -107,6 +115,10 @@
 	(appendStringInfo(str, " :" CppAsString(fldname) " "), \
 	 _outBitmapset(str, node->fldname))
 
+#define WRITE_CUSTOM_FIELD(fldname, fldvalue) \
+	(appendStringInfo(str, " :" CppAsString(fldname) " "), \
+	appendStringInfoString(str, (fldvalue)))
+
 
 /* Write an integer array (anything written as ":fldname (%d, %d") */
 #define WRITE_INT_ARRAY(fldname, count) \
@@ -130,7 +142,7 @@
 
 
 #define booltostr(x)  ((x) ? "true" : "false")
-
+static void WriteTaskQuery(OUTFUNC_ARGS);
 
 /*****************************************************************************
  *	Output routines for Citus node types
@@ -176,21 +188,20 @@ OutDistributedPlan(OUTFUNC_ARGS)
 	WRITE_NODE_TYPE("DISTRIBUTEDPLAN");
 
 	WRITE_UINT64_FIELD(planId);
-	WRITE_INT_FIELD(operation);
-	WRITE_BOOL_FIELD(hasReturning);
+	WRITE_ENUM_FIELD(modLevel, RowModifyLevel);
+	WRITE_BOOL_FIELD(expectResults);
 
 	WRITE_NODE_FIELD(workerJob);
-	WRITE_NODE_FIELD(masterQuery);
-	WRITE_BOOL_FIELD(routerExecutable);
+	WRITE_NODE_FIELD(combineQuery);
 	WRITE_UINT64_FIELD(queryId);
 	WRITE_NODE_FIELD(relationIdList);
-
-	WRITE_NODE_FIELD(insertSelectSubquery);
-	WRITE_NODE_FIELD(insertTargetList);
 	WRITE_OID_FIELD(targetRelationId);
+	WRITE_NODE_FIELD(insertSelectQuery);
 	WRITE_STRING_FIELD(intermediateResultIdPrefix);
 
 	WRITE_NODE_FIELD(subPlanList);
+	WRITE_NODE_FIELD(usedSubPlanNodeList);
+	WRITE_BOOL_FIELD(fastPathRouterPlan);
 
 	WRITE_NODE_FIELD(planningError);
 }
@@ -205,6 +216,17 @@ OutDistributedSubPlan(OUTFUNC_ARGS)
 
 	WRITE_UINT_FIELD(subPlanId);
 	WRITE_NODE_FIELD(plan);
+}
+
+void
+OutUsedDistributedSubPlan(OUTFUNC_ARGS)
+{
+	WRITE_LOCALS(UsedDistributedSubPlan);
+
+	WRITE_NODE_TYPE("USEDDISTRIBUTEDSUBPLAN");
+
+	WRITE_STRING_FIELD(subPlanId);
+	WRITE_ENUM_FIELD(accessType, SubPlanAccessType);
 }
 
 
@@ -304,9 +326,15 @@ OutMultiExtendedOp(OUTFUNC_ARGS)
 	WRITE_NODE_FIELD(sortClauseList);
 	WRITE_NODE_FIELD(limitCount);
 	WRITE_NODE_FIELD(limitOffset);
+#if PG_VERSION_NUM >= PG_VERSION_13
+	WRITE_ENUM_FIELD(limitOption, LimitOption);
+#endif
 	WRITE_NODE_FIELD(havingQual);
 	WRITE_BOOL_FIELD(hasDistinctOn);
 	WRITE_NODE_FIELD(distinctClause);
+	WRITE_BOOL_FIELD(hasWindowFuncs);
+	WRITE_BOOL_FIELD(onlyPushableWindowFunctions);
+	WRITE_NODE_FIELD(windowClause);
 
 	OutMultiUnaryNodeFields(str, (const MultiUnaryNode *) node);
 }
@@ -317,11 +345,13 @@ OutJobFields(StringInfo str, const Job *node)
 	WRITE_UINT64_FIELD(jobId);
 	WRITE_NODE_FIELD(jobQuery);
 	WRITE_NODE_FIELD(taskList);
-	WRITE_NODE_FIELD(dependedJobList);
+	WRITE_NODE_FIELD(dependentJobList);
 	WRITE_BOOL_FIELD(subqueryPushdown);
-	WRITE_BOOL_FIELD(requiresMasterEvaluation);
+	WRITE_BOOL_FIELD(requiresCoordinatorEvaluation);
 	WRITE_BOOL_FIELD(deferredPruning);
 	WRITE_NODE_FIELD(partitionKeyValue);
+	WRITE_NODE_FIELD(localPlannedStatements);
+	WRITE_BOOL_FIELD(parametersInJobQueryResolved);
 }
 
 
@@ -401,11 +431,11 @@ OutShardPlacement(OUTFUNC_ARGS)
 	WRITE_UINT64_FIELD(placementId);
 	WRITE_UINT64_FIELD(shardId);
 	WRITE_UINT64_FIELD(shardLength);
-	WRITE_ENUM_FIELD(shardState, RelayFileState);
+	WRITE_ENUM_FIELD(shardState, ShardState);
 	WRITE_INT_FIELD(groupId);
 	WRITE_STRING_FIELD(nodeName);
 	WRITE_UINT_FIELD(nodePort);
-	WRITE_INT_FIELD(nodeId);
+	WRITE_UINT_FIELD(nodeId);
 	/* so we can deal with 0 */
 	WRITE_INT_FIELD(partitionMethod);
 	WRITE_UINT_FIELD(colocationGroupId);
@@ -422,7 +452,7 @@ OutGroupShardPlacement(OUTFUNC_ARGS)
 	WRITE_UINT64_FIELD(placementId);
 	WRITE_UINT64_FIELD(shardId);
 	WRITE_UINT64_FIELD(shardLength);
-	WRITE_ENUM_FIELD(shardState, RelayFileState);
+	WRITE_ENUM_FIELD(shardState, ShardState);
 	WRITE_INT_FIELD(groupId);
 }
 
@@ -448,6 +478,37 @@ OutRelationRowLock(OUTFUNC_ARGS)
 	WRITE_ENUM_FIELD(rowLockStrength, LockClauseStrength);
 }
 
+static void WriteTaskQuery(OUTFUNC_ARGS) {
+	WRITE_LOCALS(Task);
+
+	WRITE_ENUM_FIELD(taskQuery.queryType, TaskQueryType);
+
+	switch (node->taskQuery.queryType)
+	{
+		case TASK_QUERY_TEXT:
+		{
+			WRITE_STRING_FIELD(taskQuery.data.queryStringLazy);
+			break;
+		}
+
+		case TASK_QUERY_OBJECT:
+		{
+			WRITE_NODE_FIELD(taskQuery.data.jobQueryReferenceForLazyDeparsing);
+			break;
+		}
+
+		case TASK_QUERY_TEXT_LIST:
+		{
+			WRITE_NODE_FIELD(taskQuery.data.queryStringList);
+			break;
+		}
+
+		default:
+		{
+			break;
+		}
+	}
+}
 
 void
 OutTask(OUTFUNC_ARGS)
@@ -458,46 +519,42 @@ OutTask(OUTFUNC_ARGS)
 	WRITE_ENUM_FIELD(taskType, TaskType);
 	WRITE_UINT64_FIELD(jobId);
 	WRITE_UINT_FIELD(taskId);
-	WRITE_STRING_FIELD(queryString);
+	WriteTaskQuery(str, raw_node);
+	WRITE_OID_FIELD(anchorDistributedTableId);
 	WRITE_UINT64_FIELD(anchorShardId);
 	WRITE_NODE_FIELD(taskPlacementList);
-	WRITE_NODE_FIELD(dependedTaskList);
+	WRITE_NODE_FIELD(dependentTaskList);
 	WRITE_UINT_FIELD(partitionId);
 	WRITE_UINT_FIELD(upstreamTaskId);
 	WRITE_NODE_FIELD(shardInterval);
 	WRITE_BOOL_FIELD(assignmentConstrained);
-	WRITE_NODE_FIELD(taskExecution);
-	WRITE_BOOL_FIELD(upsertQuery);
 	WRITE_CHAR_FIELD(replicationModel);
 	WRITE_BOOL_FIELD(modifyWithSubquery);
 	WRITE_NODE_FIELD(relationShardList);
 	WRITE_NODE_FIELD(relationRowLockList);
 	WRITE_NODE_FIELD(rowValuesLists);
+	WRITE_BOOL_FIELD(partiallyLocalOrRemote);
+	WRITE_BOOL_FIELD(parametersInQueryStringResolved);
+	WRITE_INT_FIELD(queryCount);
+	WRITE_UINT64_FIELD(totalReceivedTupleData);
+	WRITE_INT_FIELD(fetchedExplainAnalyzePlacementIndex);
+	WRITE_STRING_FIELD(fetchedExplainAnalyzePlan);
+	WRITE_FLOAT_FIELD(fetchedExplainAnalyzeExecutionDuration, "%.2f");
+	WRITE_BOOL_FIELD(isLocalTableModification);
 }
 
 
 void
-OutTaskExecution(OUTFUNC_ARGS)
+OutLocalPlannedStatement(OUTFUNC_ARGS)
 {
-	WRITE_LOCALS(TaskExecution);
-	WRITE_NODE_TYPE("TASKEXECUTION");
+	WRITE_LOCALS(LocalPlannedStatement);
 
-	WRITE_UINT64_FIELD(jobId);
-	WRITE_UINT_FIELD(taskId);
-	WRITE_UINT_FIELD(nodeCount);
+	WRITE_NODE_TYPE("LocalPlannedStatement");
 
-	WRITE_ENUM_ARRAY(taskStatusArray, node->nodeCount);
-	WRITE_ENUM_ARRAY(transmitStatusArray, node->nodeCount);
-	WRITE_INT_ARRAY(connectionIdArray, node->nodeCount);
-	WRITE_INT_ARRAY(fileDescriptorArray, node->nodeCount);
-
-	WRITE_INT64_FIELD(connectStartTime);
-	WRITE_UINT_FIELD(currentNodeIndex);
-	WRITE_UINT_FIELD(querySourceNodeIndex);
-	WRITE_UINT_FIELD(failureCount);
-	WRITE_BOOL_FIELD(criticalErrorOccurred);
+	WRITE_UINT64_FIELD(shardId);
+	WRITE_UINT_FIELD(localGroupId);
+	WRITE_NODE_FIELD(localPlan);
 }
-
 
 void
 OutDeferredErrorMessage(OUTFUNC_ARGS)
@@ -512,4 +569,28 @@ OutDeferredErrorMessage(OUTFUNC_ARGS)
 	WRITE_STRING_FIELD(filename);
 	WRITE_INT_FIELD(linenumber);
 	WRITE_STRING_FIELD(functionname);
+}
+
+
+void
+OutTableDDLCommand(OUTFUNC_ARGS)
+{
+	WRITE_LOCALS(TableDDLCommand);
+	WRITE_NODE_TYPE("TableDDLCommand");
+
+	switch (node->type)
+	{
+		case TABLE_DDL_COMMAND_STRING:
+		{
+			WRITE_STRING_FIELD(commandStr);
+			break;
+		}
+
+		case TABLE_DDL_COMMAND_FUNCTION:
+		{
+			char *example = node->function.function(node->function.context);
+			WRITE_CUSTOM_FIELD(function, example);
+			break;
+		}
+	}
 }

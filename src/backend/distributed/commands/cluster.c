@@ -3,7 +3,7 @@
  * cluster.c
  *    Commands for CLUSTER statement
  *
- * Copyright (c) 2018, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -15,10 +15,12 @@
 #include "distributed/metadata_cache.h"
 
 
-/* placeholder for PlanClusterStmt */
+/* placeholder for PreprocessClusterStmt */
 List *
-PlanClusterStmt(ClusterStmt *clusterStmt, const char *clusterCommand)
+PreprocessClusterStmt(Node *node, const char *clusterCommand,
+					  ProcessUtilityContext processUtilityContext)
 {
+	ClusterStmt *clusterStmt = castNode(ClusterStmt, node);
 	bool showPropagationWarning = false;
 
 	/* CLUSTER all */
@@ -28,15 +30,14 @@ PlanClusterStmt(ClusterStmt *clusterStmt, const char *clusterCommand)
 	}
 	else
 	{
-		Oid relationId = InvalidOid;
 		bool missingOK = false;
 
-		relationId = RangeVarGetRelid(clusterStmt->relation, AccessShareLock,
-									  missingOK);
+		Oid relationId = RangeVarGetRelid(clusterStmt->relation, AccessShareLock,
+										  missingOK);
 
 		if (OidIsValid(relationId))
 		{
-			showPropagationWarning = IsDistributedTable(relationId);
+			showPropagationWarning = IsCitusTable(relationId);
 		}
 	}
 

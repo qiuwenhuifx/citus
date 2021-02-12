@@ -4,7 +4,7 @@
  *    Declarations for public functions and variables used in COPY for
  *    distributed tables.
  *
- * Copyright (c) 2016, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -13,8 +13,9 @@
 #define MULTI_COPY_H
 
 
-#include "distributed/master_metadata_utility.h"
+#include "distributed/metadata_utility.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/version_compat.h"
 #include "nodes/execnodes.h"
 #include "nodes/parsenodes.h"
 #include "parser/parse_coerce.h"
@@ -25,14 +26,28 @@
 
 
 /*
+ * CitusCopyDest indicates the source or destination of a COPY command.
+ */
+typedef enum CitusCopyDest
+{
+	COPY_FILE,                  /* to/from file (or a piped program) */
+	COPY_OLD_FE,                /* to/from frontend (2.0 protocol) */
+	COPY_NEW_FE,                /* to/from frontend (3.0 protocol) */
+	COPY_CALLBACK               /* to/from callback function */
+} CitusCopyDest;
+
+
+/*
  * A smaller version of copy.c's CopyStateData, trimmed to the elements
  * necessary to copy out results. While it'd be a bit nicer to share code,
  * it'd require changing core postgres code.
  */
 typedef struct CopyOutStateData
 {
+	CitusCopyDest copy_dest;    /* type of copy source/destination */
 	StringInfo fe_msgbuf;       /* used for all dests during COPY TO, only for
 	                             * dest == COPY_NEW_FE in COPY FROM */
+	List *attnumlist;           /* integer list of attnums to copy */
 	int file_encoding;          /* file or remote side's character encoding */
 	bool need_transcoding;              /* file encoding diff from server? */
 	bool binary;                /* binary format? */
@@ -74,9 +89,6 @@ typedef struct CitusCopyDestReceiver
 	List *columnNameList;
 	int partitionColumnIndex;
 
-	/* distributed table metadata */
-	DistTableCacheEntry *tableMetadata;
-
 	/* open relation handle */
 	Relation distributedRelation;
 
@@ -92,9 +104,16 @@ typedef struct CitusCopyDestReceiver
 	/* template for COPY statement to send to workers */
 	CopyStmt *copyStatement;
 
-	/* cached shard metadata for pruning */
-	HTAB *shardConnectionHash;
 	bool stopOnFailure;
+
+	/*
+	 * shardId to CopyShardState map. Also used in insert_select_executor.c for
+	 * task pruning.
+	 */
+	HTAB *shardStateHash;
+
+	/* socket to CopyConnectionState map */
+	HTAB *connectionStateHash;
 
 	/* state on how to copy out data types */
 	CopyOutState copyOutState;
@@ -109,9 +128,21 @@ typedef struct CitusCopyDestReceiver
 	/* useful for tracking multi shard accesses */
 	bool multiShardCopy;
 
-	/* copy into intermediate result */
-	char *intermediateResultIdPrefix;
+	/* if true, should copy to local placements in the current session */
+	bool shouldUseLocalCopy;
+
+	/*
+	 * Copy into colocated intermediate result. When this is set, the
+	 * COPY assumes there are hypothetical colocated shards to the
+	 * relation that are files. And, COPY writes the data to the
+	 * files as if they are shards.
+	 */
+	char *colocatedIntermediateResultIdPrefix;
 } CitusCopyDestReceiver;
+
+
+/* managed via GUC, the default is 4MB */
+extern int CopySwitchOverThresholdBytes;
 
 
 /* function declarations for copying into a distributed table */
@@ -123,6 +154,7 @@ extern CitusCopyDestReceiver * CreateCitusCopyDestReceiver(Oid relationId,
 														   char *intermediateResultPrefix);
 extern FmgrInfo * ColumnOutputFunctions(TupleDesc rowDescriptor, bool binaryFormat);
 extern bool CanUseBinaryCopyFormat(TupleDesc tupleDescription);
+extern bool CanUseBinaryCopyFormatForTargetList(List *targetEntryList);
 extern bool CanUseBinaryCopyFormatForType(Oid typeId);
 extern void AppendCopyRowData(Datum *valueArray, bool *isNullArray,
 							  TupleDesc rowDescriptor,
@@ -132,10 +164,14 @@ extern void AppendCopyRowData(Datum *valueArray, bool *isNullArray,
 extern void AppendCopyBinaryHeaders(CopyOutState headerOutputState);
 extern void AppendCopyBinaryFooters(CopyOutState footerOutputState);
 extern void EndRemoteCopy(int64 shardId, List *connectionList);
-extern Node * ProcessCopyStmt(CopyStmt *copyStatement, char *completionTag,
+extern List * CreateRangeTable(Relation rel, AclMode requiredAccess);
+extern Node * ProcessCopyStmt(CopyStmt *copyStatement,
+							  QueryCompletionCompat *completionTag,
 							  const char *queryString);
 extern void CheckCopyPermissions(CopyStmt *copyStatement);
 extern bool IsCopyResultStmt(CopyStmt *copyStatement);
+extern void ConversionPathForTypes(Oid inputType, Oid destType, CopyCoercionData *result);
+extern Datum CoerceColumnValue(Datum inputValue, CopyCoercionData *coercionPath);
 
 
 #endif /* MULTI_COPY_H */

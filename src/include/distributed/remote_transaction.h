@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  * remote_transaction.h
  *
- * Copyright (c) 2016, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -26,11 +26,17 @@ struct MultiConnection;
 typedef enum
 {
 	/* no transaction active */
-	REMOTE_TRANS_INVALID = 0,
+	REMOTE_TRANS_NOT_STARTED = 0,
 
 	/* transaction start */
 	REMOTE_TRANS_STARTING,
 	REMOTE_TRANS_STARTED,
+
+	/* command execution */
+	REMOTE_TRANS_SENT_BEGIN,
+	REMOTE_TRANS_SENT_COMMAND,
+	REMOTE_TRANS_FETCHING_RESULTS,
+	REMOTE_TRANS_CLEARING_RESULTS,
 
 	/* 2pc prepare */
 	REMOTE_TRANS_PREPARING,
@@ -77,6 +83,9 @@ typedef struct RemoteTransaction
 
 	/* 2PC transaction name currently associated with connection */
 	char preparedName[NAMEDATALEN];
+
+	/* set when BEGIN is sent over the connection */
+	bool beginSent;
 } RemoteTransaction;
 
 
@@ -93,7 +102,6 @@ extern void RemoteTransactionListBegin(List *connectionList);
 
 extern void StartRemoteTransactionPrepare(struct MultiConnection *connection);
 extern void FinishRemoteTransactionPrepare(struct MultiConnection *connection);
-extern void RemoteTransactionPrepare(struct MultiConnection *connection);
 
 extern void StartRemoteTransactionCommit(struct MultiConnection *connection);
 extern void FinishRemoteTransactionCommit(struct MultiConnection *connection);
@@ -115,7 +123,6 @@ extern void HandleRemoteTransactionResultError(struct MultiConnection *connectio
 extern void MarkRemoteTransactionFailed(struct MultiConnection *connection,
 										bool allowErrorPromotion);
 extern void MarkRemoteTransactionCritical(struct MultiConnection *connection);
-extern bool IsRemoteTransactionCritical(struct MultiConnection *connection);
 
 
 /*

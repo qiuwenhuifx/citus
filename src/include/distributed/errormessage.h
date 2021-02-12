@@ -3,7 +3,7 @@
  * errormessage.h
  *	  Error handling related support functionality.
  *
- * Copyright (c) 2017, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *-------------------------------------------------------------------------
  */
 
@@ -38,8 +38,8 @@ typedef struct DeferredErrorMessage
 	DeferredErrorInternal(code, message, detail, hint, __FILE__, __LINE__, \
 						  PG_FUNCNAME_MACRO)
 
-DeferredErrorMessage * DeferredErrorInternal(int code, const char *message, const
-											 char *detail, const char *hint,
+DeferredErrorMessage * DeferredErrorInternal(int code, const char *message,
+											 const char *detail, const char *hint,
 											 const char *filename, int linenumber, const
 											 char *functionname);
 
@@ -72,5 +72,3 @@ DeferredErrorMessage * DeferredErrorInternal(int code, const char *message, cons
 void RaiseDeferredErrorInternal(DeferredErrorMessage *error, int elevel);
 
 #endif
-
-extern char * ApplyLogRedaction(const char *text);

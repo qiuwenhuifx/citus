@@ -4,23 +4,29 @@
  * information that is shared among both the worker and master extended
  * op nodes.
  *
- * Copyright (c) 2018, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
+#include "distributed/pg_version_constants.h"
 
 #include "distributed/extended_op_node_utils.h"
+#include "distributed/listutils.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_logical_optimizer.h"
 #include "distributed/pg_dist_partition.h"
+#if PG_VERSION_NUM >= PG_VERSION_12
+#include "optimizer/optimizer.h"
+#else
 #include "optimizer/var.h"
+#endif
+#include "optimizer/restrictinfo.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/pg_list.h"
 
 
-static bool GroupedByDisjointPartitionColumn(List *tableNodeList,
-											 MultiExtendedOp *opNode);
+static bool GroupedByPartitionColumn(MultiNode *node, MultiExtendedOp *opNode);
 static bool ExtendedOpNodeContainsRepartitionSubquery(MultiExtendedOp *originalOpNode);
 
 static bool HasNonPartitionColumnDistinctAgg(List *targetEntryList, Node *havingQual,
@@ -28,7 +34,12 @@ static bool HasNonPartitionColumnDistinctAgg(List *targetEntryList, Node *having
 static bool PartitionColumnInTableList(Var *column, List *tableNodeList);
 static bool ShouldPullDistinctColumn(bool repartitionSubquery,
 									 bool groupedByDisjointPartitionColumn,
-									 bool hasNonPartitionColumnDistinctAgg);
+									 bool hasNonPartitionColumnDistinctAgg,
+									 bool onlyPushableWindowFunctions);
+static bool CanPushDownGroupingAndHaving(bool pullUpIntermediateRows,
+										 bool groupedByDisjointPartitionColumn,
+										 bool hasWindowFuncs,
+										 bool onlyPushableWindowFunctions);
 
 
 /*
@@ -37,40 +48,39 @@ static bool ShouldPullDistinctColumn(bool repartitionSubquery,
  * value should be used in a read-only manner.
  */
 ExtendedOpNodeProperties
-BuildExtendedOpNodeProperties(MultiExtendedOp *extendedOpNode)
+BuildExtendedOpNodeProperties(MultiExtendedOp *extendedOpNode,
+							  bool hasNonDistributableAggregates)
 {
 	ExtendedOpNodeProperties extendedOpNodeProperties;
-	List *tableNodeList = NIL;
-	List *targetList = NIL;
-	Node *havingQual = NULL;
 
-	bool groupedByDisjointPartitionColumn = false;
-	bool repartitionSubquery = false;
-	bool hasNonPartitionColumnDistinctAgg = false;
-	bool pullDistinctColumns = false;
-	bool pushDownWindowFunctions = false;
+	List *tableNodeList = FindNodesOfType((MultiNode *) extendedOpNode, T_MultiTable);
+	bool groupedByDisjointPartitionColumn =
+		GroupedByPartitionColumn((MultiNode *) extendedOpNode, extendedOpNode);
 
-	tableNodeList = FindNodesOfType((MultiNode *) extendedOpNode, T_MultiTable);
-	groupedByDisjointPartitionColumn = GroupedByDisjointPartitionColumn(tableNodeList,
-																		extendedOpNode);
+	bool pullUpIntermediateRows = !groupedByDisjointPartitionColumn &&
+								  hasNonDistributableAggregates;
 
-	repartitionSubquery = ExtendedOpNodeContainsRepartitionSubquery(extendedOpNode);
+	bool repartitionSubquery = ExtendedOpNodeContainsRepartitionSubquery(extendedOpNode);
 
-	targetList = extendedOpNode->targetList;
-	havingQual = extendedOpNode->havingQual;
-	hasNonPartitionColumnDistinctAgg =
+	List *targetList = extendedOpNode->targetList;
+	Node *havingQual = extendedOpNode->havingQual;
+	bool hasNonPartitionColumnDistinctAgg =
 		HasNonPartitionColumnDistinctAgg(targetList, havingQual, tableNodeList);
 
-	pullDistinctColumns =
-		ShouldPullDistinctColumn(repartitionSubquery, groupedByDisjointPartitionColumn,
-								 hasNonPartitionColumnDistinctAgg);
+	bool pushDownGroupingAndHaving =
+		CanPushDownGroupingAndHaving(pullUpIntermediateRows,
+									 groupedByDisjointPartitionColumn,
+									 extendedOpNode->hasWindowFuncs,
+									 extendedOpNode->onlyPushableWindowFunctions);
 
-	/*
-	 * TODO: Only window functions that can be pushed down reach here, thus,
-	 * using hasWindowFuncs is safe for now. However, this should be fixed
-	 * when we support pull-to-master window functions.
-	 */
-	pushDownWindowFunctions = extendedOpNode->hasWindowFuncs;
+	bool pullDistinctColumns =
+		ShouldPullDistinctColumn(repartitionSubquery,
+								 groupedByDisjointPartitionColumn,
+								 hasNonPartitionColumnDistinctAgg,
+								 extendedOpNode->onlyPushableWindowFunctions);
+
+	extendedOpNodeProperties.hasGroupBy = extendedOpNode->groupClauseList != NIL;
+	extendedOpNodeProperties.hasAggregate = TargetListHasAggregates(targetList);
 
 	extendedOpNodeProperties.groupedByDisjointPartitionColumn =
 		groupedByDisjointPartitionColumn;
@@ -78,49 +88,96 @@ BuildExtendedOpNodeProperties(MultiExtendedOp *extendedOpNode)
 	extendedOpNodeProperties.hasNonPartitionColumnDistinctAgg =
 		hasNonPartitionColumnDistinctAgg;
 	extendedOpNodeProperties.pullDistinctColumns = pullDistinctColumns;
-	extendedOpNodeProperties.pushDownWindowFunctions = pushDownWindowFunctions;
+	extendedOpNodeProperties.pullUpIntermediateRows = pullUpIntermediateRows;
+	extendedOpNodeProperties.hasWindowFuncs = extendedOpNode->hasWindowFuncs;
+	extendedOpNodeProperties.onlyPushableWindowFunctions =
+		extendedOpNode->onlyPushableWindowFunctions;
+	extendedOpNodeProperties.pushDownGroupingAndHaving = pushDownGroupingAndHaving;
 
 	return extendedOpNodeProperties;
 }
 
 
 /*
- * GroupedByDisjointPartitionColumn returns true if the query is grouped by the
- * partition column of a table whose shards have disjoint sets of partition values.
+ * GroupedByPartitionColumn returns true if a GROUP BY in the opNode contains
+ * the partition column of the underlying relation, which is determined by
+ * searching the MultiNode tree for a MultiTable and MultiPartition with
+ * a matching column.
+ *
+ * When there is a re-partition join, the search terminates at the
+ * MultiPartition node. Hence we can push down the GROUP BY if the join
+ * column is in the GROUP BY.
  */
 static bool
-GroupedByDisjointPartitionColumn(List *tableNodeList, MultiExtendedOp *opNode)
+GroupedByPartitionColumn(MultiNode *node, MultiExtendedOp *opNode)
 {
-	bool result = false;
-	ListCell *tableNodeCell = NULL;
-
-	foreach(tableNodeCell, tableNodeList)
+	if (node == NULL)
 	{
-		MultiTable *tableNode = (MultiTable *) lfirst(tableNodeCell);
+		return false;
+	}
+
+	if (CitusIsA(node, MultiTable))
+	{
+		MultiTable *tableNode = (MultiTable *) node;
+
 		Oid relationId = tableNode->relationId;
-		char partitionMethod = 0;
 
-		if (relationId == SUBQUERY_RELATION_ID || !IsDistributedTable(relationId))
+		if (relationId == SUBQUERY_RELATION_ID)
 		{
-			continue;
+			/* ignore subqueries for now */
+			return false;
 		}
-
-		partitionMethod = PartitionMethod(relationId);
-		if (partitionMethod != DISTRIBUTE_BY_RANGE &&
-			partitionMethod != DISTRIBUTE_BY_HASH)
+		else if (relationId != SUBQUERY_PUSHDOWN_RELATION_ID)
 		{
-			continue;
+			if (!IsCitusTableType(relationId, STRICTLY_PARTITIONED_DISTRIBUTED_TABLE))
+			{
+				/* only range- and hash-distributed tables are strictly partitioned */
+				return false;
+			}
 		}
 
 		if (GroupedByColumn(opNode->groupClauseList, opNode->targetList,
 							tableNode->partitionColumn))
 		{
-			result = true;
-			break;
+			/* this node is partitioned by a column in the GROUP BY */
+			return true;
+		}
+	}
+	else if (CitusIsA(node, MultiPartition))
+	{
+		MultiPartition *partitionNode = (MultiPartition *) node;
+
+		if (GroupedByColumn(opNode->groupClauseList, opNode->targetList,
+							partitionNode->partitionColumn))
+		{
+			/* this node is partitioned by a column in the GROUP BY */
+			return true;
+		}
+	}
+	else if (UnaryOperator(node))
+	{
+		MultiNode *childNode = ((MultiUnaryNode *) node)->childNode;
+
+		if (GroupedByPartitionColumn(childNode, opNode))
+		{
+			/* a child node is partitioned by a column in the GROUP BY */
+			return true;
+		}
+	}
+	else if (BinaryOperator(node))
+	{
+		MultiNode *leftChildNode = ((MultiBinaryNode *) node)->leftChildNode;
+		MultiNode *rightChildNode = ((MultiBinaryNode *) node)->rightChildNode;
+
+		if (GroupedByPartitionColumn(leftChildNode, opNode) ||
+			GroupedByPartitionColumn(rightChildNode, opNode))
+		{
+			/* a child node is partitioned by a column in the GROUP BY */
+			return true;
 		}
 	}
 
-	return result;
+	return false;
 }
 
 
@@ -168,20 +225,15 @@ HasNonPartitionColumnDistinctAgg(List *targetEntryList, Node *havingQual,
 	foreach(aggregateCheckCell, aggregateCheckList)
 	{
 		Node *targetNode = lfirst(aggregateCheckCell);
-		Aggref *targetAgg = NULL;
-		List *varList = NIL;
 		ListCell *varCell = NULL;
 		bool isPartitionColumn = false;
-		TargetEntry *firstTargetEntry = NULL;
-		Node *firstTargetExprNode = NULL;
 
-		if (IsA(targetNode, Var))
+		if (!IsA(targetNode, Aggref))
 		{
 			continue;
 		}
 
-		Assert(IsA(targetNode, Aggref));
-		targetAgg = (Aggref *) targetNode;
+		Aggref *targetAgg = castNode(Aggref, targetNode);
 		if (targetAgg->aggdistinct == NIL)
 		{
 			continue;
@@ -196,14 +248,15 @@ HasNonPartitionColumnDistinctAgg(List *targetEntryList, Node *havingQual,
 			return true;
 		}
 
-		firstTargetEntry = linitial_node(TargetEntry, targetAgg->args);
-		firstTargetExprNode = strip_implicit_coercions((Node *) firstTargetEntry->expr);
+		TargetEntry *firstTargetEntry = linitial_node(TargetEntry, targetAgg->args);
+		Node *firstTargetExprNode = strip_implicit_coercions(
+			(Node *) firstTargetEntry->expr);
 		if (!IsA(firstTargetExprNode, Var))
 		{
 			return true;
 		}
 
-		varList = pull_var_clause_default((Node *) targetAgg->args);
+		List *varList = pull_var_clause_default((Node *) targetAgg->args);
 		foreach(varCell, varList)
 		{
 			Node *targetVar = (Node *) lfirst(varCell);
@@ -242,9 +295,7 @@ PartitionColumnInTableList(Var *column, List *tableNodeList)
 			partitionColumn->varno == column->varno &&
 			partitionColumn->varattno == column->varattno)
 		{
-			Assert(partitionColumn->varno == tableNode->rangeTableId);
-
-			if (PartitionMethod(tableNode->relationId) != DISTRIBUTE_BY_APPEND)
+			if (!IsCitusTableType(tableNode->relationId, APPEND_DISTRIBUTED))
 			{
 				return true;
 			}
@@ -257,8 +308,8 @@ PartitionColumnInTableList(Var *column, List *tableNodeList)
 
 /*
  * ShouldPullDistinctColumn returns true if distinct aggregate should pull
- * individual columns from worker to master and evaluate aggregate operation
- * at master.
+ * individual columns from worker to coordinator and evaluate aggregate operation
+ * on the coordinator.
  *
  * Pull cases are:
  * - repartition subqueries
@@ -269,21 +320,52 @@ PartitionColumnInTableList(Var *column, List *tableNodeList)
 static bool
 ShouldPullDistinctColumn(bool repartitionSubquery,
 						 bool groupedByDisjointPartitionColumn,
-						 bool hasNonPartitionColumnDistinctAgg)
+						 bool hasNonPartitionColumnDistinctAgg,
+						 bool onlyPushableWindowFunctions)
 {
 	if (repartitionSubquery)
 	{
 		return true;
 	}
 
-	if (groupedByDisjointPartitionColumn)
+	/* don't pull distinct columns when it can be pushed down */
+	if (onlyPushableWindowFunctions && groupedByDisjointPartitionColumn)
 	{
 		return false;
 	}
-	else if (!groupedByDisjointPartitionColumn && hasNonPartitionColumnDistinctAgg)
+	else if (hasNonPartitionColumnDistinctAgg)
 	{
 		return true;
 	}
 
 	return false;
+}
+
+
+/*
+ * CanPushDownGroupingAndHaving returns whether GROUP BY & HAVING should be
+ * pushed down to worker.
+ */
+static bool
+CanPushDownGroupingAndHaving(bool pullUpIntermediateRows,
+							 bool groupedByDisjointPartitionColumn,
+							 bool hasWindowFuncs, bool onlyPushableWindowFunctions)
+{
+	/* don't push down if we're pulling up */
+	if (pullUpIntermediateRows)
+	{
+		return false;
+	}
+
+	/*
+	 * If grouped by a partition column we can push down the having qualifier.
+	 *
+	 * When a query with subquery is provided, we can't determine if
+	 * groupedByDisjointPartitionColumn, therefore we also check if there is a
+	 * window function too. If there is a window function we would know that it
+	 * is safe to push down (i.e. it is partitioned on distribution column, and
+	 * if there is a group by, it contains distribution column).
+	 */
+	return groupedByDisjointPartitionColumn ||
+		   (hasWindowFuncs && onlyPushableWindowFunctions);
 }

@@ -3,7 +3,7 @@
  * rename.c
  *    Commands for renaming objects related to distributed tables
  *
- * Copyright (c) 2018, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -19,19 +19,19 @@
 
 
 /*
- * PlanRenameStmt first determines whether a given rename statement involves
+ * PreprocessRenameStmt first determines whether a given rename statement involves
  * a distributed table. If so (and if it is supported, i.e. renames a column),
  * it creates a DDLJob to encapsulate information needed during the worker node
  * portion of DDL execution before returning that DDLJob in a List. If no dis-
  * tributed table is involved, this function returns NIL.
  */
 List *
-PlanRenameStmt(RenameStmt *renameStmt, const char *renameCommand)
+PreprocessRenameStmt(Node *node, const char *renameCommand,
+					 ProcessUtilityContext processUtilityContext)
 {
+	RenameStmt *renameStmt = castNode(RenameStmt, node);
 	Oid objectRelationId = InvalidOid; /* SQL Object OID */
 	Oid tableRelationId = InvalidOid; /* Relation OID, maybe not the same. */
-	bool isDistributedRelation = false;
-	DDLJob *ddlJob = NULL;
 
 	/*
 	 * We only support some of the PostgreSQL supported RENAME statements, and
@@ -97,20 +97,19 @@ PlanRenameStmt(RenameStmt *renameStmt, const char *renameCommand)
 			return NIL;
 	}
 
-	isDistributedRelation = IsDistributedTable(tableRelationId);
-	if (!isDistributedRelation)
+	bool isCitusRelation = IsCitusTable(tableRelationId);
+	if (!isCitusRelation)
 	{
 		return NIL;
 	}
 
 	/*
-	 * We might ERROR out on some commands, but only for Citus tables where
-	 * isDistributedRelation is true. That's why this test comes this late in
-	 * the function.
+	 * We might ERROR out on some commands, but only for Citus tables.
+	 * That's why this test comes this late in the function.
 	 */
 	ErrorIfUnsupportedRenameStmt(renameStmt);
 
-	ddlJob = palloc0(sizeof(DDLJob));
+	DDLJob *ddlJob = palloc0(sizeof(DDLJob));
 	ddlJob->targetRelationId = tableRelationId;
 	ddlJob->concurrentIndexCmd = false;
 	ddlJob->commandString = renameCommand;
@@ -136,5 +135,34 @@ ErrorIfUnsupportedRenameStmt(RenameStmt *renameStmt)
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("renaming constraints belonging to distributed tables is "
 							   "currently unsupported")));
+	}
+}
+
+
+/*
+ * PreprocessRenameAttributeStmt called for RenameStmt's that are targetting an attribute eg.
+ * type attributes. Based on the relation type the attribute gets renamed it dispatches to
+ * a specialized implementation if present, otherwise return an empty list for its DDLJobs
+ */
+List *
+PreprocessRenameAttributeStmt(Node *node, const char *queryString,
+							  ProcessUtilityContext processUtilityContext)
+{
+	RenameStmt *stmt = castNode(RenameStmt, node);
+	Assert(stmt->renameType == OBJECT_ATTRIBUTE);
+
+	switch (stmt->relationType)
+	{
+		case OBJECT_TYPE:
+		{
+			return PreprocessRenameTypeAttributeStmt(node, queryString,
+													 processUtilityContext);
+		}
+
+		default:
+		{
+			/* unsupported relation for attribute rename, do nothing */
+			return NIL;
+		}
 	}
 }

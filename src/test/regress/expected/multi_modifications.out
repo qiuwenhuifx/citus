@@ -1,8 +1,9 @@
 SET citus.shard_count TO 32;
 SET citus.next_shard_id TO 750000;
 SET citus.next_placement_id TO 750000;
+CREATE SCHEMA multi_modifications;
 -- some failure messages that comes from the worker nodes
--- might change due to parallel exectuions, so supress those
+-- might change due to parallel executions, so suppress those
 -- using \set VERBOSITY terse
 -- ===================================================================
 -- test end-to-end modification functionality
@@ -25,32 +26,32 @@ CREATE TABLE range_partitioned ( LIKE limit_orders );
 CREATE TABLE append_partitioned ( LIKE limit_orders );
 SET citus.shard_count TO 2;
 SELECT create_distributed_table('limit_orders', 'id', 'hash');
- create_distributed_table 
---------------------------
- 
+ create_distributed_table
+---------------------------------------------------------------------
+
 (1 row)
 
 SELECT create_distributed_table('multiple_hash', 'id', 'hash');
 ERROR:  column "id" of relation "multiple_hash" does not exist
 SELECT create_distributed_table('range_partitioned', 'id', 'range');
- create_distributed_table 
---------------------------
- 
+ create_distributed_table
+---------------------------------------------------------------------
+
 (1 row)
 
 SELECT create_distributed_table('append_partitioned', 'id', 'append');
- create_distributed_table 
---------------------------
- 
+ create_distributed_table
+---------------------------------------------------------------------
+
 (1 row)
 
 SET citus.shard_count TO 1;
 SET citus.shard_replication_factor TO 1;
 -- make a single shard that covers no partition values
 SELECT create_distributed_table('insufficient_shards', 'id', 'hash');
- create_distributed_table 
---------------------------
- 
+ create_distributed_table
+---------------------------------------------------------------------
+
 (1 row)
 
 UPDATE pg_dist_shard SET shardminvalue = 0, shardmaxvalue = 0
@@ -77,15 +78,15 @@ WHERE shardid = :new_shard_id;
 INSERT INTO limit_orders VALUES (32743, 'AAPL', 9580, '2004-10-19 10:23:54', 'buy',
 								 20.69);
 SELECT COUNT(*) FROM limit_orders WHERE id = 32743;
- count 
--------
+ count
+---------------------------------------------------------------------
      1
 (1 row)
 
 -- basic single-row INSERT with RETURNING
 INSERT INTO limit_orders VALUES (32744, 'AAPL', 9580, '2004-10-19 10:23:54', 'buy', 20.69) RETURNING *;
-  id   | symbol | bidder_id |        placed_at         | kind | limit_price 
--------+--------+-----------+--------------------------+------+-------------
+  id   | symbol | bidder_id |        placed_at         | kind | limit_price
+---------------------------------------------------------------------
  32744 | AAPL   |      9580 | Tue Oct 19 10:23:54 2004 | buy  |       20.69
 (1 row)
 
@@ -102,24 +103,21 @@ INSERT INTO append_partitioned VALUES (414123, 'AAPL', 9580, '2004-10-19 10:23:5
 									   20.69);
 -- ensure the values are where we put them and query to ensure they are properly pruned
 SET client_min_messages TO 'DEBUG2';
-SET citus.task_executor_type TO 'real-time';
 SELECT * FROM range_partitioned WHERE id = 32743;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-  id   | symbol | bidder_id |        placed_at         | kind | limit_price 
--------+--------+-----------+--------------------------+------+-------------
+  id   | symbol | bidder_id |        placed_at         | kind | limit_price
+---------------------------------------------------------------------
  32743 | AAPL   |      9580 | Tue Oct 19 10:23:54 2004 | buy  |       20.69
 (1 row)
 
 SELECT * FROM append_partitioned WHERE id = 414123;
-DEBUG:  Plan is router executable
-   id   | symbol | bidder_id |        placed_at         | kind | limit_price 
---------+--------+-----------+--------------------------+------+-------------
+DEBUG:  Router planner does not support append-partitioned tables.
+   id   | symbol | bidder_id |        placed_at         | kind | limit_price
+---------------------------------------------------------------------
  414123 | AAPL   |      9580 | Tue Oct 19 10:23:54 2004 | buy  |       20.69
 (1 row)
 
 SET client_min_messages TO DEFAULT;
-SET citus.task_executor_type TO DEFAULT;
 -- try inserting without a range-partitioned shard to receive the value
 INSERT INTO range_partitioned VALUES (999999, 'AAPL', 9580, '2004-10-19 10:23:54', 'buy',
 									  20.69);
@@ -134,8 +132,8 @@ HINT:  Make sure the value for partition column "id" falls into a single shard.
 INSERT INTO limit_orders VALUES (12756, 'MSFT', 10959, '2013-05-08 07:29:23', 'sell',
 								 DEFAULT);
 SELECT COUNT(*) FROM limit_orders WHERE id = 12756;
- count 
--------
+ count
+---------------------------------------------------------------------
      1
 (1 row)
 
@@ -143,8 +141,8 @@ SELECT COUNT(*) FROM limit_orders WHERE id = 12756;
 INSERT INTO limit_orders VALUES (430, upper('ibm'), 214, timestamp '2003-01-28 10:31:17' +
 								 interval '5 hours', 'buy', sqrt(2));
 SELECT COUNT(*) FROM limit_orders WHERE id = 430;
- count 
--------
+ count
+---------------------------------------------------------------------
      1
 (1 row)
 
@@ -188,8 +186,8 @@ INSERT INTO limit_orders VALUES (12037, 'GOOG', 5634, '2001-04-16 03:37:28', 'bu
                                 (12038, 'GOOG', 5634, '2001-04-17 03:37:28', 'buy', 2.50),
                                 (12039, 'GOOG', 5634, '2001-04-18 03:37:28', 'buy', 1.50);
 SELECT COUNT(*) FROM limit_orders WHERE id BETWEEN 12037 AND 12039;
- count 
--------
+ count
+---------------------------------------------------------------------
      3
 (1 row)
 
@@ -198,16 +196,16 @@ INSERT INTO limit_orders VALUES (22037, 'GOOG', 5634, now(), 'buy', 0.50),
                                 (22038, 'GOOG', 5634, now(), 'buy', 2.50),
                                 (22039, 'GOOG', 5634, now(), 'buy', 1.50)
 RETURNING id;
-  id   
--------
+  id
+---------------------------------------------------------------------
  22037
  22038
  22039
 (3 rows)
 
 SELECT COUNT(*) FROM limit_orders WHERE id BETWEEN 22037 AND 22039;
- count 
--------
+ count
+---------------------------------------------------------------------
      3
 (1 row)
 
@@ -216,8 +214,8 @@ INSERT INTO limit_orders VALUES (random() * 10 + 70000, 'GOOG', 5634, now(), 'bu
                                 (random() * 10 + 80000, 'GOOG', 5634, now(), 'buy', 2.50),
                                 (random() * 10 + 80090, 'GOOG', 5634, now(), 'buy', 1.50);
 SELECT COUNT(*) FROM limit_orders WHERE id BETWEEN 70000 AND 90000;
- count 
--------
+ count
+---------------------------------------------------------------------
      3
 (1 row)
 
@@ -227,43 +225,43 @@ INSERT INTO limit_orders SELECT * FROM deleted_orders;
 -- test simple DELETE
 INSERT INTO limit_orders VALUES (246, 'TSLA', 162, '2007-07-02 16:32:15', 'sell', 20.69);
 SELECT COUNT(*) FROM limit_orders WHERE id = 246;
- count 
--------
+ count
+---------------------------------------------------------------------
      1
 (1 row)
 
 DELETE FROM limit_orders WHERE id = 246;
 SELECT COUNT(*) FROM limit_orders WHERE id = 246;
- count 
--------
+ count
+---------------------------------------------------------------------
      0
 (1 row)
 
 -- test simple DELETE with RETURNING
 DELETE FROM limit_orders WHERE id = 430 RETURNING *;
- id  | symbol | bidder_id |        placed_at         | kind |   limit_price   
------+--------+-----------+--------------------------+------+-----------------
+ id  | symbol | bidder_id |        placed_at         | kind |   limit_price
+---------------------------------------------------------------------
  430 | IBM    |       214 | Tue Jan 28 15:31:17 2003 | buy  | 1.4142135623731
 (1 row)
 
 SELECT COUNT(*) FROM limit_orders WHERE id = 430;
- count 
--------
+ count
+---------------------------------------------------------------------
      0
 (1 row)
 
 -- DELETE with expression in WHERE clause
 INSERT INTO limit_orders VALUES (246, 'TSLA', 162, '2007-07-02 16:32:15', 'sell', 20.69);
 SELECT COUNT(*) FROM limit_orders WHERE id = 246;
- count 
--------
+ count
+---------------------------------------------------------------------
      1
 (1 row)
 
 DELETE FROM limit_orders WHERE id = (2 * 123);
 SELECT COUNT(*) FROM limit_orders WHERE id = 246;
- count 
--------
+ count
+---------------------------------------------------------------------
      0
 (1 row)
 
@@ -272,7 +270,6 @@ CREATE TABLE bidders ( name text, id bigint );
 DELETE FROM limit_orders USING bidders WHERE limit_orders.id = 246 AND
 											 limit_orders.bidder_id = bidders.id AND
 											 bidders.name = 'Bernie Madoff';
-ERROR:  relation bidders is not distributed
 -- commands containing a CTE are supported
 WITH new_orders AS (INSERT INTO limit_orders VALUES (411, 'FLO', 12, '2017-07-02 16:32:15', 'buy', 66))
 DELETE FROM limit_orders WHERE id < 0;
@@ -283,53 +280,53 @@ DELETE FROM limit_orders RETURNING id / 0;
 ERROR:  division by zero
 \set VERBOSITY default
 SELECT * FROM limit_orders WHERE id = 412;
- id | symbol | bidder_id | placed_at | kind | limit_price 
-----+--------+-----------+-----------+------+-------------
+ id | symbol | bidder_id | placed_at | kind | limit_price
+---------------------------------------------------------------------
 (0 rows)
 
 INSERT INTO limit_orders VALUES (246, 'TSLA', 162, '2007-07-02 16:32:15', 'sell', 20.69);
 -- simple UPDATE
 UPDATE limit_orders SET symbol = 'GM' WHERE id = 246;
 SELECT symbol FROM limit_orders WHERE id = 246;
- symbol 
---------
+ symbol
+---------------------------------------------------------------------
  GM
 (1 row)
 
 -- simple UPDATE with RETURNING
 UPDATE limit_orders SET symbol = 'GM' WHERE id = 246 RETURNING *;
- id  | symbol | bidder_id |        placed_at         | kind | limit_price 
------+--------+-----------+--------------------------+------+-------------
+ id  | symbol | bidder_id |        placed_at         | kind | limit_price
+---------------------------------------------------------------------
  246 | GM     |       162 | Mon Jul 02 16:32:15 2007 | sell |       20.69
 (1 row)
 
 -- expression UPDATE
 UPDATE limit_orders SET bidder_id = 6 * 3 WHERE id = 246;
 SELECT bidder_id FROM limit_orders WHERE id = 246;
- bidder_id 
------------
+ bidder_id
+---------------------------------------------------------------------
         18
 (1 row)
 
 -- expression UPDATE with RETURNING
 UPDATE limit_orders SET bidder_id = 6 * 5 WHERE id = 246 RETURNING *;
- id  | symbol | bidder_id |        placed_at         | kind | limit_price 
------+--------+-----------+--------------------------+------+-------------
+ id  | symbol | bidder_id |        placed_at         | kind | limit_price
+---------------------------------------------------------------------
  246 | GM     |        30 | Mon Jul 02 16:32:15 2007 | sell |       20.69
 (1 row)
 
 -- multi-column UPDATE
 UPDATE limit_orders SET (kind, limit_price) = ('buy', DEFAULT) WHERE id = 246;
 SELECT kind, limit_price FROM limit_orders WHERE id = 246;
- kind | limit_price 
-------+-------------
+ kind | limit_price
+---------------------------------------------------------------------
  buy  |        0.00
 (1 row)
 
 -- multi-column UPDATE with RETURNING
 UPDATE limit_orders SET (kind, limit_price) = ('buy', 999) WHERE id = 246 RETURNING *;
- id  | symbol | bidder_id |        placed_at         | kind | limit_price 
------+--------+-----------+--------------------------+------+-------------
+ id  | symbol | bidder_id |        placed_at         | kind | limit_price
+---------------------------------------------------------------------
  246 | GM     |        30 | Mon Jul 02 16:32:15 2007 | buy  |         999
 (1 row)
 
@@ -346,27 +343,46 @@ ALTER TABLE limit_orders_750000 RENAME TO renamed_orders;
 -- Third: Connect back to master node
 \c - - - :master_port
 -- Fourth: Perform an INSERT on the remaining node
+-- the whole transaction should fail
 \set VERBOSITY terse
 INSERT INTO limit_orders VALUES (276, 'ADR', 140, '2007-07-02 16:32:15', 'sell', 43.67);
-WARNING:  relation "public.limit_orders_750000" does not exist
--- Last: Verify the insert worked but the deleted placement is now unhealthy
+ERROR:  relation "public.limit_orders_750000" does not exist
+-- set the shard name back
+\c - - - :worker_2_port
+-- Second: Move aside limit_orders shard on the second worker node
+ALTER TABLE renamed_orders RENAME TO limit_orders_750000;
+-- Verify the insert failed and both placements are healthy
+-- or the insert succeeded and placement marked unhealthy
+\c - - - :worker_1_port
+SELECT count(*) FROM limit_orders_750000 WHERE id = 276;
+ count
+---------------------------------------------------------------------
+     0
+(1 row)
+
+\c - - - :worker_2_port
+SELECT count(*) FROM limit_orders_750000 WHERE id = 276;
+ count
+---------------------------------------------------------------------
+     0
+(1 row)
+
+\c - - - :master_port
 SELECT count(*) FROM limit_orders WHERE id = 276;
- count 
--------
-     1
+ count
+---------------------------------------------------------------------
+     0
 (1 row)
 
 SELECT count(*)
 FROM   pg_dist_shard_placement AS sp,
 	   pg_dist_shard           AS s
 WHERE  sp.shardid = s.shardid
-AND    sp.nodename = 'localhost'
-AND    sp.nodeport = :worker_2_port
 AND    sp.shardstate = 3
 AND    s.logicalrelid = 'limit_orders'::regclass;
- count 
--------
-     1
+ count
+---------------------------------------------------------------------
+     0
 (1 row)
 
 -- Test that if all shards miss a modification, no state change occurs
@@ -390,8 +406,8 @@ AND    sp.nodename = 'localhost'
 AND    sp.nodeport = :worker_1_port
 AND    sp.shardstate = 1
 AND    s.logicalrelid = 'limit_orders'::regclass;
- count 
--------
+ count
+---------------------------------------------------------------------
      2
 (1 row)
 
@@ -411,18 +427,17 @@ ERROR:  modifying the partition value of rows is not allowed
 UPDATE limit_orders SET id = 246 WHERE id = 246;
 UPDATE limit_orders SET id = 246 WHERE id = 246 AND symbol = 'GM';
 UPDATE limit_orders SET id = limit_orders.id WHERE id = 246;
--- UPDATEs with a FROM clause are unsupported
+-- UPDATEs with a FROM clause are supported even with local tables
 UPDATE limit_orders SET limit_price = 0.00 FROM bidders
 					WHERE limit_orders.id = 246 AND
 						  limit_orders.bidder_id = bidders.id AND
 						  bidders.name = 'Bernie Madoff';
-ERROR:  relation bidders is not distributed
 -- should succeed with a CTE
 WITH deleted_orders AS (INSERT INTO limit_orders VALUES (399, 'PDR', 14, '2017-07-02 16:32:15', 'sell', 43))
 UPDATE limit_orders SET symbol = 'GM';
 SELECT symbol, bidder_id FROM limit_orders WHERE id = 246;
- symbol | bidder_id 
---------+-----------
+ symbol | bidder_id
+---------------------------------------------------------------------
  GM     |        30
 (1 row)
 
@@ -433,15 +448,15 @@ UPDATE limit_orders SET bidder_id = bidder_id + 1 WHERE id = 246;
 -- IMMUTABLE functions are allowed
 UPDATE limit_orders SET symbol = LOWER(symbol) WHERE id = 246;
 SELECT symbol, bidder_id FROM limit_orders WHERE id = 246;
- symbol | bidder_id 
---------+-----------
+ symbol | bidder_id
+---------------------------------------------------------------------
  gm     |       247
 (1 row)
 
 -- IMMUTABLE functions are allowed -- even in returning
 UPDATE limit_orders SET symbol = UPPER(symbol) WHERE id = 246 RETURNING id, LOWER(symbol), symbol;
- id  | lower | symbol 
------+-------+--------
+ id  | lower | symbol
+---------------------------------------------------------------------
  246 | gm    | GM
 (1 row)
 
@@ -470,8 +485,8 @@ UPDATE limit_orders
 SET array_of_values = stable_append(array_of_values, 3) WHERE id = 246;
 ERROR:  STABLE functions used in UPDATE queries cannot be called with column references
 SELECT array_of_values FROM limit_orders WHERE id = 246;
- array_of_values 
------------------
+ array_of_values
+---------------------------------------------------------------------
  {1,2}
 (1 row)
 
@@ -483,8 +498,8 @@ UPDATE limit_orders SET bidder_id = temp_strict_func(1, null) WHERE id = 246;
 ERROR:  null value in column "bidder_id" violates not-null constraint
 \set VERBOSITY default
 SELECT array_of_values FROM limit_orders WHERE id = 246;
- array_of_values 
------------------
+ array_of_values
+---------------------------------------------------------------------
  {1,2}
 (1 row)
 
@@ -500,8 +515,8 @@ INSERT INTO multiple_hash VALUES ('0', '4');
 INSERT INTO multiple_hash VALUES ('0', '5');
 INSERT INTO multiple_hash VALUES ('0', '6');
 UPDATE multiple_hash SET data = data ||'-1' WHERE category = '0' RETURNING *;
- category | data 
-----------+------
+ category | data
+---------------------------------------------------------------------
  0        | 1-1
  0        | 2-1
  0        | 3-1
@@ -511,8 +526,8 @@ UPDATE multiple_hash SET data = data ||'-1' WHERE category = '0' RETURNING *;
 (6 rows)
 
 DELETE FROM multiple_hash WHERE category = '0' RETURNING *;
- category | data 
-----------+------
+ category | data
+---------------------------------------------------------------------
  0        | 1-1
  0        | 2-1
  0        | 3-1
@@ -536,8 +551,8 @@ INSERT 0 1
 INSERT INTO multiple_hash VALUES ('2', '3');
 INSERT 0 1
 INSERT INTO multiple_hash VALUES ('2', '3') RETURNING *;
- category | data 
-----------+------
+ category | data
+---------------------------------------------------------------------
  2        | 3
 (1 row)
 
@@ -551,8 +566,8 @@ UPDATE multiple_hash SET data = data ||'-2' WHERE category = '1';
 UPDATE 3
 -- three rows, with RETURNING
 UPDATE multiple_hash SET data = data ||'-2' WHERE category = '1' RETURNING category;
- category 
-----------
+ category
+---------------------------------------------------------------------
  1
  1
  1
@@ -561,8 +576,8 @@ UPDATE multiple_hash SET data = data ||'-2' WHERE category = '1' RETURNING categ
 UPDATE 3
 -- check
 SELECT * FROM multiple_hash WHERE category = '1' ORDER BY category, data;
- category |  data   
-----------+---------
+ category |  data
+---------------------------------------------------------------------
  1        | 1-1-2-2
  1        | 2-2-2
  1        | 3-2-2
@@ -577,8 +592,8 @@ DELETE FROM multiple_hash WHERE category = '2';
 DELETE 3
 -- three rows, with RETURNING
 DELETE FROM multiple_hash WHERE category = '1' RETURNING category;
- category 
-----------
+ category
+---------------------------------------------------------------------
  1
  1
  1
@@ -587,13 +602,13 @@ DELETE FROM multiple_hash WHERE category = '1' RETURNING category;
 DELETE 3
 -- check
 SELECT * FROM multiple_hash WHERE category = '1' ORDER BY category, data;
- category | data 
-----------+------
+ category | data
+---------------------------------------------------------------------
 (0 rows)
 
 SELECT * FROM multiple_hash WHERE category = '2' ORDER BY category, data;
- category | data 
-----------+------
+ category | data
+---------------------------------------------------------------------
 (0 rows)
 
 -- verify interaction of default values, SERIAL, and RETURNING
@@ -601,26 +616,26 @@ SELECT * FROM multiple_hash WHERE category = '2' ORDER BY category, data;
 CREATE TABLE app_analytics_events (id serial, app_id integer, name text);
 SET citus.shard_count TO 4;
 SELECT create_distributed_table('app_analytics_events', 'app_id', 'hash');
- create_distributed_table 
---------------------------
- 
+ create_distributed_table
+---------------------------------------------------------------------
+
 (1 row)
 
 INSERT INTO app_analytics_events VALUES (DEFAULT, 101, 'Fauxkemon Geaux') RETURNING id;
- id 
-----
+ id
+---------------------------------------------------------------------
   1
 (1 row)
 
 INSERT INTO app_analytics_events (app_id, name) VALUES (102, 'Wayz') RETURNING id;
- id 
-----
+ id
+---------------------------------------------------------------------
   2
 (1 row)
 
 INSERT INTO app_analytics_events (app_id, name) VALUES (103, 'Mynt') RETURNING *;
- id | app_id | name 
-----+--------+------
+ id | app_id | name
+---------------------------------------------------------------------
   3 |    103 | Mynt
 (1 row)
 
@@ -628,42 +643,42 @@ DROP TABLE app_analytics_events;
 -- again with serial in the partition column
 CREATE TABLE app_analytics_events (id serial, app_id integer, name text);
 SELECT create_distributed_table('app_analytics_events', 'id');
- create_distributed_table 
---------------------------
- 
+ create_distributed_table
+---------------------------------------------------------------------
+
 (1 row)
 
 INSERT INTO app_analytics_events VALUES (DEFAULT, 101, 'Fauxkemon Geaux') RETURNING id;
- id 
-----
+ id
+---------------------------------------------------------------------
   1
 (1 row)
 
 INSERT INTO app_analytics_events (app_id, name) VALUES (102, 'Wayz') RETURNING id;
- id 
-----
+ id
+---------------------------------------------------------------------
   2
 (1 row)
 
 INSERT INTO app_analytics_events (app_id, name) VALUES (103, 'Mynt') RETURNING *;
- id | app_id | name 
-----+--------+------
+ id | app_id | name
+---------------------------------------------------------------------
   3 |    103 | Mynt
 (1 row)
 
 -- Test multi-row insert with serial in the partition column
 INSERT INTO app_analytics_events (app_id, name)
 VALUES (104, 'Wayz'), (105, 'Mynt') RETURNING *;
- id | app_id | name 
-----+--------+------
+ id | app_id | name
+---------------------------------------------------------------------
   4 |    104 | Wayz
   5 |    105 | Mynt
 (2 rows)
 
 INSERT INTO app_analytics_events (id, name)
 VALUES (DEFAULT, 'Foo'), (300, 'Wah') RETURNING *;
- id  | app_id | name 
------+--------+------
+ id  | app_id | name
+---------------------------------------------------------------------
    6 |        | Foo
  300 |        | Wah
 (2 rows)
@@ -672,50 +687,50 @@ PREPARE prep(varchar) AS
 INSERT INTO app_analytics_events (id, name)
 VALUES (DEFAULT, $1 || '.1'), (400 , $1 || '.2') RETURNING *;
 EXECUTE prep('version-1');
- id  | app_id |    name     
------+--------+-------------
+ id  | app_id |    name
+---------------------------------------------------------------------
    7 |        | version-1.1
  400 |        | version-1.2
 (2 rows)
 
 EXECUTE prep('version-2');
- id  | app_id |    name     
------+--------+-------------
+ id  | app_id |    name
+---------------------------------------------------------------------
    8 |        | version-2.1
  400 |        | version-2.2
 (2 rows)
 
 EXECUTE prep('version-3');
- id  | app_id |    name     
------+--------+-------------
+ id  | app_id |    name
+---------------------------------------------------------------------
    9 |        | version-3.1
  400 |        | version-3.2
 (2 rows)
 
 EXECUTE prep('version-4');
- id  | app_id |    name     
------+--------+-------------
+ id  | app_id |    name
+---------------------------------------------------------------------
   10 |        | version-4.1
  400 |        | version-4.2
 (2 rows)
 
 EXECUTE prep('version-5');
- id  | app_id |    name     
------+--------+-------------
+ id  | app_id |    name
+---------------------------------------------------------------------
   11 |        | version-5.1
  400 |        | version-5.2
 (2 rows)
 
 EXECUTE prep('version-6');
- id  | app_id |    name     
------+--------+-------------
+ id  | app_id |    name
+---------------------------------------------------------------------
   12 |        | version-6.1
  400 |        | version-6.2
 (2 rows)
 
 SELECT * FROM app_analytics_events ORDER BY id, name;
- id  | app_id |      name       
------+--------+-----------------
+ id  | app_id |      name
+---------------------------------------------------------------------
    1 |    101 | Fauxkemon Geaux
    2 |    102 | Wayz
    3 |    103 | Mynt
@@ -742,15 +757,15 @@ TRUNCATE app_analytics_events;
 ALTER TABLE app_analytics_events DROP COLUMN app_id;
 INSERT INTO app_analytics_events (name)
 VALUES ('Wayz'), ('Mynt') RETURNING *;
- id | name 
-----+------
+ id | name
+---------------------------------------------------------------------
  13 | Wayz
  14 | Mynt
 (2 rows)
 
 SELECT * FROM app_analytics_events ORDER BY id;
- id | name 
-----+------
+ id | name
+---------------------------------------------------------------------
  13 | Wayz
  14 | Mynt
 (2 rows)
@@ -759,23 +774,23 @@ DROP TABLE app_analytics_events;
 -- Test multi-row insert with a dropped column before the partition column
 CREATE TABLE app_analytics_events (id int default 3, app_id integer, name text);
 SELECT create_distributed_table('app_analytics_events', 'name', colocate_with => 'none');
- create_distributed_table 
---------------------------
- 
+ create_distributed_table
+---------------------------------------------------------------------
+
 (1 row)
 
 ALTER TABLE app_analytics_events DROP COLUMN app_id;
 INSERT INTO app_analytics_events (name)
 VALUES ('Wayz'), ('Mynt') RETURNING *;
- id | name 
-----+------
+ id | name
+---------------------------------------------------------------------
   3 | Mynt
   3 | Wayz
 (2 rows)
 
 SELECT * FROM app_analytics_events WHERE name = 'Wayz';
- id | name 
-----+------
+ id | name
+---------------------------------------------------------------------
   3 | Wayz
 (1 row)
 
@@ -783,22 +798,22 @@ DROP TABLE app_analytics_events;
 -- Test multi-row insert with serial in a reference table
 CREATE TABLE app_analytics_events (id serial, app_id integer, name text);
 SELECT create_reference_table('app_analytics_events');
- create_reference_table 
-------------------------
- 
+ create_reference_table
+---------------------------------------------------------------------
+
 (1 row)
 
 INSERT INTO app_analytics_events (app_id, name)
 VALUES (104, 'Wayz'), (105, 'Mynt') RETURNING *;
- id | app_id | name 
-----+--------+------
+ id | app_id | name
+---------------------------------------------------------------------
   1 |    104 | Wayz
   2 |    105 | Mynt
 (2 rows)
 
 SELECT * FROM app_analytics_events ORDER BY id;
- id | app_id | name 
-----+--------+------
+ id | app_id | name
+---------------------------------------------------------------------
   1 |    104 | Wayz
   2 |    105 | Mynt
 (2 rows)
@@ -807,22 +822,22 @@ DROP TABLE app_analytics_events;
 -- Test multi-row insert with serial in a non-partition column
 CREATE TABLE app_analytics_events (id int, app_id serial, name text);
 SELECT create_distributed_table('app_analytics_events', 'id');
- create_distributed_table 
---------------------------
- 
+ create_distributed_table
+---------------------------------------------------------------------
+
 (1 row)
 
 INSERT INTO app_analytics_events (id, name)
 VALUES (99, 'Wayz'), (98, 'Mynt') RETURNING name, app_id;
- name | app_id 
-------+--------
+ name | app_id
+---------------------------------------------------------------------
  Mynt |      2
  Wayz |      1
 (2 rows)
 
 SELECT * FROM app_analytics_events ORDER BY id;
- id | app_id | name 
-----+--------+------
+ id | app_id | name
+---------------------------------------------------------------------
  98 |      2 | Mynt
  99 |      1 | Wayz
 (2 rows)
@@ -837,15 +852,15 @@ CREATE TABLE summary_table (
 	count int,
 	uniques int);
 SELECT create_distributed_table('raw_table', 'id');
- create_distributed_table 
---------------------------
- 
+ create_distributed_table
+---------------------------------------------------------------------
+
 (1 row)
 
 SELECT create_distributed_table('summary_table', 'id');
- create_distributed_table 
---------------------------
- 
+ create_distributed_table
+---------------------------------------------------------------------
+
 (1 row)
 
 INSERT INTO raw_table VALUES (1, 100);
@@ -856,11 +871,18 @@ INSERT INTO raw_table VALUES (2, 400);
 INSERT INTO raw_table VALUES (2, 500);
 INSERT INTO summary_table VALUES (1);
 INSERT INTO summary_table VALUES (2);
+-- test noop deletes and updates
+DELETE FROM summary_table WHERE false;
+DELETE FROM summary_table WHERE null;
+DELETE FROM summary_table WHERE null > jsonb_build_array();
+UPDATE summary_table SET uniques = 0 WHERE false;
+UPDATE summary_table SET uniques = 0 WHERE null;
+UPDATE summary_table SET uniques = 0 WHERE null > jsonb_build_array();
 SELECT * FROM summary_table ORDER BY id;
- id | min_value | average_value | count | uniques 
-----+-----------+---------------+-------+---------
-  1 |           |               |       |        
-  2 |           |               |       |        
+ id | min_value | average_value | count | uniques
+---------------------------------------------------------------------
+  1 |           |               |       |
+  2 |           |               |       |
 (2 rows)
 
 UPDATE summary_table SET average_value = average_query.average FROM (
@@ -868,10 +890,10 @@ UPDATE summary_table SET average_value = average_query.average FROM (
 	) average_query
 WHERE id = 1;
 SELECT * FROM summary_table ORDER BY id;
- id | min_value |    average_value     | count | uniques 
-----+-----------+----------------------+-------+---------
-  1 |           | 200.0000000000000000 |       |        
-  2 |           |                      |       |        
+ id | min_value |    average_value     | count | uniques
+---------------------------------------------------------------------
+  1 |           | 200.0000000000000000 |       |
+  2 |           |                      |       |
 (2 rows)
 
 -- try different syntax
@@ -879,39 +901,39 @@ UPDATE summary_table SET (min_value, average_value) =
 	(SELECT min(value), avg(value) FROM raw_table WHERE id = 2)
 WHERE id = 2;
 SELECT * FROM summary_table ORDER BY id;
- id | min_value |    average_value     | count | uniques 
-----+-----------+----------------------+-------+---------
-  1 |           | 200.0000000000000000 |       |        
-  2 |       400 | 450.0000000000000000 |       |        
+ id | min_value |    average_value     | count | uniques
+---------------------------------------------------------------------
+  1 |           | 200.0000000000000000 |       |
+  2 |       400 | 450.0000000000000000 |       |
 (2 rows)
 
 UPDATE summary_table SET min_value = 100
 	WHERE id IN (SELECT id FROM raw_table WHERE id = 1 and value > 100) AND id = 1;
 SELECT * FROM summary_table ORDER BY id;
- id | min_value |    average_value     | count | uniques 
-----+-----------+----------------------+-------+---------
-  1 |       100 | 200.0000000000000000 |       |        
-  2 |       400 | 450.0000000000000000 |       |        
+ id | min_value |    average_value     | count | uniques
+---------------------------------------------------------------------
+  1 |       100 | 200.0000000000000000 |       |
+  2 |       400 | 450.0000000000000000 |       |
 (2 rows)
 
 -- indeed, we don't need filter on UPDATE explicitly if SELECT already prunes to one shard
 UPDATE summary_table SET uniques = 2
 	WHERE id IN (SELECT id FROM raw_table WHERE id = 1 and value IN (100, 200));
 SELECT * FROM summary_table ORDER BY id;
- id | min_value |    average_value     | count | uniques 
-----+-----------+----------------------+-------+---------
+ id | min_value |    average_value     | count | uniques
+---------------------------------------------------------------------
   1 |       100 | 200.0000000000000000 |       |       2
-  2 |       400 | 450.0000000000000000 |       |        
+  2 |       400 | 450.0000000000000000 |       |
 (2 rows)
 
 -- use inner results for non-partition column
 UPDATE summary_table SET uniques = NULL
 	WHERE min_value IN (SELECT value FROM raw_table WHERE id = 1) AND id = 1;
 SELECT * FROM summary_table ORDER BY id;
- id | min_value |    average_value     | count | uniques 
-----+-----------+----------------------+-------+---------
-  1 |       100 | 200.0000000000000000 |       |        
-  2 |       400 | 450.0000000000000000 |       |        
+ id | min_value |    average_value     | count | uniques
+---------------------------------------------------------------------
+  1 |       100 | 200.0000000000000000 |       |
+  2 |       400 | 450.0000000000000000 |       |
 (2 rows)
 
 -- these should not update anything
@@ -924,10 +946,10 @@ UPDATE summary_table SET average_value = average_query.average FROM (
 	) average_query
 WHERE id = 1 AND id = 4;
 SELECT * FROM summary_table ORDER BY id;
- id | min_value |    average_value     | count | uniques 
-----+-----------+----------------------+-------+---------
-  1 |       100 | 200.0000000000000000 |       |        
-  2 |       400 | 450.0000000000000000 |       |        
+ id | min_value |    average_value     | count | uniques
+---------------------------------------------------------------------
+  1 |       100 | 200.0000000000000000 |       |
+  2 |       400 | 450.0000000000000000 |       |
 (2 rows)
 
 -- update with NULL value
@@ -936,10 +958,10 @@ UPDATE summary_table SET average_value = average_query.average FROM (
 	) average_query
 WHERE id = 1;
 SELECT * FROM summary_table ORDER BY id;
- id | min_value |    average_value     | count | uniques 
-----+-----------+----------------------+-------+---------
-  1 |       100 |                      |       |        
-  2 |       400 | 450.0000000000000000 |       |        
+ id | min_value |    average_value     | count | uniques
+---------------------------------------------------------------------
+  1 |       100 |                      |       |
+  2 |       400 | 450.0000000000000000 |       |
 (2 rows)
 
 -- multi-shard updates with recursively planned subqueries
@@ -968,20 +990,20 @@ WHERE
    summary_table.id = metrics.id AND
    summary_table.id = 1;
 SELECT * FROM summary_table ORDER BY id;
- id | min_value |    average_value     | count | uniques 
-----+-----------+----------------------+-------+---------
+ id | min_value |    average_value     | count | uniques
+---------------------------------------------------------------------
   1 |       100 |                      |     4 |       2
-  2 |       400 | 450.0000000000000000 |       |        
+  2 |       400 | 450.0000000000000000 |       |
 (2 rows)
 
 -- test joins
 UPDATE summary_table SET count = count + 1 FROM raw_table
 	WHERE raw_table.id = summary_table.id AND summary_table.id = 1;
 SELECT * FROM summary_table ORDER BY id;
- id | min_value |    average_value     | count | uniques 
-----+-----------+----------------------+-------+---------
+ id | min_value |    average_value     | count | uniques
+---------------------------------------------------------------------
   1 |       100 |                      |     5 |       2
-  2 |       400 | 450.0000000000000000 |       |        
+  2 |       400 | 450.0000000000000000 |       |
 (2 rows)
 
 -- test with prepared statements
@@ -996,10 +1018,10 @@ EXECUTE prepared_update_with_subquery(10, 1);
 EXECUTE prepared_update_with_subquery(10, 1);
 EXECUTE prepared_update_with_subquery(10, 1);
 SELECT * FROM summary_table ORDER BY id;
- id | min_value |    average_value     | count | uniques 
-----+-----------+----------------------+-------+---------
+ id | min_value |    average_value     | count | uniques
+---------------------------------------------------------------------
   1 |       100 |                      |    65 |       2
-  2 |       400 | 450.0000000000000000 |       |        
+  2 |       400 | 450.0000000000000000 |       |
 (2 rows)
 
 -- test with reference tables
@@ -1011,23 +1033,23 @@ CREATE TABLE reference_summary_table (
 	count int,
 	uniques int);
 SELECT create_reference_table('reference_raw_table');
- create_reference_table 
-------------------------
- 
+ create_reference_table
+---------------------------------------------------------------------
+
 (1 row)
 
 SELECT create_reference_table('reference_summary_table');
- create_reference_table 
-------------------------
- 
+ create_reference_table
+---------------------------------------------------------------------
+
 (1 row)
 
 INSERT INTO reference_raw_table VALUES (1, 100);
 INSERT INTO reference_raw_table VALUES (1, 200);
 INSERT INTO reference_raw_table VALUES (1, 200);
 INSERT INTO reference_raw_table VALUES (1,300), (2, 400), (2,500) RETURNING *;
- id | value 
-----+-------
+ id | value
+---------------------------------------------------------------------
   1 |   300
   2 |   400
   2 |   500
@@ -1036,10 +1058,10 @@ INSERT INTO reference_raw_table VALUES (1,300), (2, 400), (2,500) RETURNING *;
 INSERT INTO reference_summary_table VALUES (1);
 INSERT INTO reference_summary_table VALUES (2);
 SELECT * FROM reference_summary_table ORDER BY id;
- id | min_value | average_value | count | uniques 
-----+-----------+---------------+-------+---------
-  1 |           |               |       |        
-  2 |           |               |       |        
+ id | min_value | average_value | count | uniques
+---------------------------------------------------------------------
+  1 |           |               |       |
+  2 |           |               |       |
 (2 rows)
 
 UPDATE reference_summary_table SET average_value = average_query.average FROM (
@@ -1055,10 +1077,10 @@ UPDATE reference_summary_table SET (min_value, average_value) =
 	(SELECT min(value), avg(value) FROM reference_raw_table WHERE id = 2)
 WHERE id = 2;
 SELECT * FROM reference_summary_table ORDER BY id;
- id | min_value |    average_value     | count | uniques 
-----+-----------+----------------------+-------+---------
-  1 |           | 200.0000000000000000 |       |        
-  2 |       400 | 450.0000000000000000 |       |        
+ id | min_value |    average_value     | count | uniques
+---------------------------------------------------------------------
+  1 |           | 200.0000000000000000 |       |
+  2 |       400 | 450.0000000000000000 |       |
 (2 rows)
 
 -- no need partition colum equalities on reference tables
@@ -1066,10 +1088,10 @@ UPDATE reference_summary_table SET (count) =
 	(SELECT id AS inner_id FROM reference_raw_table WHERE value = 500)
 WHERE min_value = 400;
 SELECT * FROM reference_summary_table ORDER BY id;
- id | min_value |    average_value     | count | uniques 
-----+-----------+----------------------+-------+---------
-  1 |           | 200.0000000000000000 |       |        
-  2 |       400 | 450.0000000000000000 |     2 |        
+ id | min_value |    average_value     | count | uniques
+---------------------------------------------------------------------
+  1 |           | 200.0000000000000000 |       |
+  2 |       400 | 450.0000000000000000 |     2 |
 (2 rows)
 
 -- can read from a reference table and update a distributed table
@@ -1099,11 +1121,11 @@ UPDATE summary_table SET average_value = average_query.average FROM (
 WHERE id = 3;
 COMMIT;
 SELECT * FROM summary_table ORDER BY id;
- id | min_value |    average_value     | count | uniques 
-----+-----------+----------------------+-------+---------
+ id | min_value |    average_value     | count | uniques
+---------------------------------------------------------------------
   1 |       100 | 200.0000000000000000 |    65 |       2
-  2 |       400 | 450.0000000000000000 |       |        
-  3 |           | 150.0000000000000000 |       |        
+  2 |       400 | 450.0000000000000000 |       |
+  3 |           | 150.0000000000000000 |       |
 (3 rows)
 
 -- COPY on UPDATE part
@@ -1117,12 +1139,12 @@ UPDATE summary_table SET average_value = average_query.average FROM (
 WHERE id = 4;
 COMMIT;
 SELECT * FROM summary_table ORDER BY id;
- id | min_value |    average_value     | count | uniques 
-----+-----------+----------------------+-------+---------
+ id | min_value |    average_value     | count | uniques
+---------------------------------------------------------------------
   1 |       100 | 200.0000000000000000 |    65 |       2
-  2 |       400 | 450.0000000000000000 |       |        
-  3 |           | 150.0000000000000000 |       |        
-  4 |           | 150.0000000000000000 |       |        
+  2 |       400 | 450.0000000000000000 |       |
+  3 |           | 150.0000000000000000 |       |
+  4 |           | 150.0000000000000000 |       |
 (4 rows)
 
 -- COPY on both part
@@ -1135,13 +1157,13 @@ UPDATE summary_table SET average_value = average_query.average FROM (
 WHERE id = 5;
 COMMIT;
 SELECT * FROM summary_table ORDER BY id;
- id | min_value |    average_value     | count | uniques 
-----+-----------+----------------------+-------+---------
+ id | min_value |    average_value     | count | uniques
+---------------------------------------------------------------------
   1 |       100 | 200.0000000000000000 |    65 |       2
-  2 |       400 | 450.0000000000000000 |       |        
-  3 |           | 150.0000000000000000 |       |        
-  4 |           | 150.0000000000000000 |       |        
-  5 |           | 150.0000000000000000 |       |        
+  2 |       400 | 450.0000000000000000 |       |
+  3 |           | 150.0000000000000000 |       |
+  4 |           | 150.0000000000000000 |       |
+  5 |           | 150.0000000000000000 |       |
 (5 rows)
 
 -- COPY on reference tables
@@ -1154,20 +1176,20 @@ UPDATE summary_table SET average_value = average_query.average FROM (
 WHERE id = 6;
 COMMIT;
 SELECT * FROM summary_table ORDER BY id;
- id | min_value |    average_value     | count | uniques 
-----+-----------+----------------------+-------+---------
+ id | min_value |    average_value     | count | uniques
+---------------------------------------------------------------------
   1 |       100 | 200.0000000000000000 |    65 |       2
-  2 |       400 | 450.0000000000000000 |       |        
-  3 |           | 150.0000000000000000 |       |        
-  4 |           | 150.0000000000000000 |       |        
-  5 |           | 150.0000000000000000 |       |        
-  6 |           | 150.0000000000000000 |       |        
+  2 |       400 | 450.0000000000000000 |       |
+  3 |           | 150.0000000000000000 |       |
+  4 |           | 150.0000000000000000 |       |
+  5 |           | 150.0000000000000000 |       |
+  6 |           | 150.0000000000000000 |       |
 (6 rows)
 
 -- test DELETE queries
 SELECT * FROM raw_table ORDER BY id, value;
- id | value 
-----+-------
+ id | value
+---------------------------------------------------------------------
   1 |   100
   1 |   200
   1 |   200
@@ -1185,25 +1207,25 @@ SELECT * FROM raw_table ORDER BY id, value;
 DELETE FROM summary_table
   WHERE min_value IN (SELECT value FROM raw_table WHERE id = 1) AND id = 1;
 SELECT * FROM summary_table ORDER BY id;
- id | min_value |    average_value     | count | uniques 
-----+-----------+----------------------+-------+---------
-  2 |       400 | 450.0000000000000000 |       |        
-  3 |           | 150.0000000000000000 |       |        
-  4 |           | 150.0000000000000000 |       |        
-  5 |           | 150.0000000000000000 |       |        
-  6 |           | 150.0000000000000000 |       |        
+ id | min_value |    average_value     | count | uniques
+---------------------------------------------------------------------
+  2 |       400 | 450.0000000000000000 |       |
+  3 |           | 150.0000000000000000 |       |
+  4 |           | 150.0000000000000000 |       |
+  5 |           | 150.0000000000000000 |       |
+  6 |           | 150.0000000000000000 |       |
 (5 rows)
 
 -- test with different syntax
 DELETE FROM summary_table USING raw_table
   WHERE summary_table.id = raw_table.id AND raw_table.id = 2;
 SELECT * FROM summary_table ORDER BY id;
- id | min_value |    average_value     | count | uniques 
-----+-----------+----------------------+-------+---------
-  3 |           | 150.0000000000000000 |       |        
-  4 |           | 150.0000000000000000 |       |        
-  5 |           | 150.0000000000000000 |       |        
-  6 |           | 150.0000000000000000 |       |        
+ id | min_value |    average_value     | count | uniques
+---------------------------------------------------------------------
+  3 |           | 150.0000000000000000 |       |
+  4 |           | 150.0000000000000000 |       |
+  5 |           | 150.0000000000000000 |       |
+  6 |           | 150.0000000000000000 |       |
 (4 rows)
 
 -- cannot read from a distributed table and delete from a reference table
@@ -1211,12 +1233,12 @@ DELETE FROM reference_summary_table USING raw_table
   WHERE reference_summary_table.id = raw_table.id AND raw_table.id = 3;
 ERROR:  cannot perform select on a distributed table and modify a reference table
 SELECT * FROM summary_table ORDER BY id;
- id | min_value |    average_value     | count | uniques 
-----+-----------+----------------------+-------+---------
-  3 |           | 150.0000000000000000 |       |        
-  4 |           | 150.0000000000000000 |       |        
-  5 |           | 150.0000000000000000 |       |        
-  6 |           | 150.0000000000000000 |       |        
+ id | min_value |    average_value     | count | uniques
+---------------------------------------------------------------------
+  3 |           | 150.0000000000000000 |       |
+  4 |           | 150.0000000000000000 |       |
+  5 |           | 150.0000000000000000 |       |
+  6 |           | 150.0000000000000000 |       |
 (4 rows)
 
 -- test connection API via using COPY with DELETEs
@@ -1228,12 +1250,12 @@ DELETE FROM summary_table USING reference_raw_table
   WHERE summary_table.id = reference_raw_table.id AND reference_raw_table.id = 2;
 COMMIT;
 SELECT * FROM summary_table ORDER BY id;
- id | min_value |    average_value     | count | uniques 
-----+-----------+----------------------+-------+---------
-  3 |           | 150.0000000000000000 |       |        
-  4 |           | 150.0000000000000000 |       |        
-  5 |           | 150.0000000000000000 |       |        
-  6 |           | 150.0000000000000000 |       |        
+ id | min_value |    average_value     | count | uniques
+---------------------------------------------------------------------
+  3 |           | 150.0000000000000000 |       |
+  4 |           | 150.0000000000000000 |       |
+  5 |           | 150.0000000000000000 |       |
+  6 |           | 150.0000000000000000 |       |
 (4 rows)
 
 -- test DELETEs with prepared statements
@@ -1249,8 +1271,8 @@ EXECUTE prepared_delete_with_join(4);
 EXECUTE prepared_delete_with_join(5);
 EXECUTE prepared_delete_with_join(6);
 SELECT * FROM summary_table ORDER BY id;
- id | min_value | average_value | count | uniques 
-----+-----------+---------------+-------+---------
+ id | min_value | average_value | count | uniques
+---------------------------------------------------------------------
 (0 rows)
 
 -- we don't support subqueries in VALUES clause
@@ -1267,7 +1289,24 @@ HINT:  Try rewriting your queries with 'INSERT INTO ... SELECT' syntax.
 INSERT INTO summary_table (id) VALUES ((SELECT id FROM reference_summary_table));
 ERROR:  subqueries are not supported within INSERT queries
 HINT:  Try rewriting your queries with 'INSERT INTO ... SELECT' syntax.
+-- subqueries that would be eliminated by = null clauses
+DELETE FROM summary_table WHERE (
+    SELECT 1 FROM pg_catalog.pg_statio_sys_sequences
+) = null;
+DELETE FROM summary_table WHERE (
+    SELECT (select min(action_statement) from information_schema.triggers)
+    FROM pg_catalog.pg_statio_sys_sequences
+) = null;
+DELETE FROM summary_table WHERE id < (
+    SELECT 0 FROM pg_dist_node
+);
+CREATE TABLE multi_modifications.local (a int default 1, b int);
+INSERT INTO multi_modifications.local VALUES (default, (SELECT min(id) FROM summary_table));
+ERROR:  subqueries are not supported within INSERT queries
+HINT:  Try rewriting your queries with 'INSERT INTO ... SELECT' syntax.
 DROP TABLE raw_table;
 DROP TABLE summary_table;
 DROP TABLE reference_raw_table;
 DROP TABLE reference_summary_table;
+DROP SCHEMA multi_modifications CASCADE;
+NOTICE:  drop cascades to table multi_modifications.local

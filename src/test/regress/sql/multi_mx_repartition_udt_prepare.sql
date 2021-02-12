@@ -61,19 +61,13 @@ CREATE TABLE repartition_udt_other (
     txtcol text
 );
 
--- Connect directly to a worker, create and drop the type, then 
+-- Connect directly to a worker, create and drop the type, then
 -- proceed with type creation as above; thus the OIDs will be different.
 -- so that the OID is off.
 
 \c - - - :worker_1_port
 
-CREATE TYPE test_udt AS (i integer, i2 integer);
-DROP TYPE test_udt CASCADE;
-
 -- START type creation
-
-CREATE TYPE test_udt AS (i integer, i2 integer);
-
 -- ... as well as a function to use as its comparator...
 CREATE FUNCTION equal_test_udt_function(test_udt, test_udt) RETURNS boolean
 AS 'select $1.i = $2.i AND $1.i2 = $2.i2;'
@@ -118,9 +112,6 @@ FUNCTION 1 test_udt_hash(test_udt);
 \c - - - :worker_2_port
 
 -- START type creation
-
-CREATE TYPE test_udt AS (i integer, i2 integer);
-
 -- ... as well as a function to use as its comparator...
 CREATE FUNCTION equal_test_udt_function(test_udt, test_udt) RETURNS boolean
 AS 'select $1.i = $2.i AND $1.i2 = $2.i2;'
@@ -191,7 +182,7 @@ INSERT INTO repartition_udt_other values (11, '(2,2)'::test_udt, 'foo');
 INSERT INTO repartition_udt_other values (12, '(2,3)'::test_udt, 'foo');
 
 SET client_min_messages = LOG;
-SET citus.task_executor_type = 'task-tracker';
+SET citus.enable_repartition_joins to ON;
 
 -- Query that should result in a repartition
 -- join on int column, and be empty.
@@ -201,7 +192,8 @@ SELECT * FROM repartition_udt JOIN repartition_udt_other
 -- Query that should result in a repartition join on UDT column.
 SET citus.log_multi_join_order = true;
 
-EXPLAIN SELECT * FROM repartition_udt JOIN repartition_udt_other
+EXPLAIN (COSTS OFF)
+SELECT * FROM repartition_udt JOIN repartition_udt_other
     ON repartition_udt.udtcol = repartition_udt_other.udtcol
     WHERE repartition_udt.pk > 1;
 
@@ -209,6 +201,6 @@ SELECT * FROM repartition_udt JOIN repartition_udt_other
     ON repartition_udt.udtcol = repartition_udt_other.udtcol
     WHERE repartition_udt.pk > 1
     ORDER BY repartition_udt.pk;
-    
+
 \c - - - :worker_1_port
 \c - - - :worker_2_port

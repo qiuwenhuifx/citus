@@ -2,7 +2,6 @@
 -- MULTI_TASK_STRING_SIZE
 --
 SET citus.next_shard_id TO 1602000;
-ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 1602000;
 CREATE TABLE wide_table
 (
 	long_column_001 int,
@@ -207,21 +206,11 @@ CREATE TABLE wide_table
 	long_column_200 int
 );
 SELECT create_distributed_table('wide_table', 'long_column_001');
- create_distributed_table 
---------------------------
- 
+ create_distributed_table
+---------------------------------------------------------------------
+
 (1 row)
 
-SET citus.task_executor_type TO 'task-tracker';
-SHOW citus.max_task_string_size;
- citus.max_task_string_size 
-----------------------------
- 12288
-(1 row)
-
--- setting can not be changed on runtime
-SET citus.max_task_string_size TO 20000;
-ERROR:  parameter "citus.max_task_string_size" cannot be changed without restarting the server
 -- error message may vary between executions
 -- hiding warning and error message
 -- no output means the query has failed
@@ -229,15 +218,18 @@ SET client_min_messages to ERROR;
 SELECT raise_failed_execution('
 SELECT u.* FROM wide_table u JOIN wide_table v ON (u.long_column_002 = v.long_column_003);
 ');
-ERROR:  Task failed to execute
-CONTEXT:  PL/pgSQL function raise_failed_execution(text) line 6 at RAISE
+ raise_failed_execution
+---------------------------------------------------------------------
+
+(1 row)
+
+SET citus.enable_repartition_joins to ON;
 -- following will succeed since it fetches few columns
 SELECT u.long_column_001, u.long_column_002, u.long_column_003 FROM wide_table u JOIN wide_table v ON (u.long_column_002 = v.long_column_003);
- long_column_001 | long_column_002 | long_column_003 
------------------+-----------------+-----------------
+ long_column_001 | long_column_002 | long_column_003
+---------------------------------------------------------------------
 (0 rows)
 
 RESET client_min_messages;
 DROP TABLE wide_table;
 RESET citus.shard_count;
-RESET citus.task_executor_type;

@@ -4,15 +4,18 @@
 # doing the actual diff. Rules for normalization are in normalize.sed. See
 # the comments there for more information.
 #
-# We only normalize tests listed in normalized_tests.lst. We use the bare
-# diff for other tests.
-#
 # Note that src/test/regress/Makefile adds this directory to $PATH so
 # pg_regress uses this diff tool instead of the system diff tool.
+set -eu -o pipefail
 
 file1="${@:(-2):1}"
 file2="${@:(-1):1}"
-test=$(basename $file1 .out)
+# pg_regress passes the expected file as the first argument ($file1 above),
+# and results file as the second argument ($file2 above). We take the base
+# filename of the expected file as the test name. We can have multiple
+# expected files for a single test with _0, _1, ... suffixes.
+# So for the test name, we also strip the additional suffix.
+test=$(basename "$file1" .out | sed -E "s/_[0-9]+$//")
 args=${@:1:$#-2}
 BASEDIR=$(dirname "$0")
 
@@ -24,22 +27,21 @@ then
     DIFF=/usr/bin/diff
 fi
 
-grep -q "^$test$" $BASEDIR/normalized_tests.lst
-grep_result=$?
-
-if [ "$grep_result" -eq "0" ]
+if test -z "${VANILLATEST:-}"
 then
-    sed -Ef $BASEDIR/normalize.sed < $file1 > $file1.modified
-    sed -Ef $BASEDIR/normalize.sed < $file2 > $file2.modified
-
-    $DIFF $args $file1.modified $file2.modified
-    exitcode=$?
-
-    rm -rf $file1.modified $file2.modified
+	touch "$file1"  # when adding a new test the expected file does not exist
+	normalize_file="$BASEDIR/normalize.sed"
+	# when running tests on an existing cluster some changes need to be done on
+	# normalize.sed file. So a new file is used.
+	if [[ -f "$BASEDIR/normalize_modified.sed" ]]
+	then
+		normalize_file="$BASEDIR/normalize_modified.sed"
+	fi
+	sed -Ef "$normalize_file" < "$file1" > "$file1.modified"
+	sed -Ef "$normalize_file" < "$file2" > "$file2.modified"
+	"$DIFF" -w $args "$file1.modified" "$file2.modified" | LC_CTYPE=C.UTF-8 diff-filter "$BASEDIR/normalize.sed"
+	exit ${PIPESTATUS[0]}
 else
-    # if test is not in normalized_tests.lst, just diff without normalizing.
-    $DIFF $args $file1 $file2
-    exitcode=$?
+	exec "$DIFF" -w $args "$file1" "$file2"
 fi
 
-exit $exitcode

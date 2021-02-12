@@ -5,7 +5,7 @@
  * Declarations for public functions and types related to executing
  * INSERT..SELECT commands.
  *
- * Copyright (c) 2017, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -16,8 +16,12 @@
 
 #include "executor/execdesc.h"
 
+extern bool EnableRepartitionedInsertSelect;
 
-extern TupleTableSlot * CoordinatorInsertSelectExecScan(CustomScanState *node);
+extern TupleTableSlot * NonPushableInsertSelectExecScan(CustomScanState *node);
+extern Query * BuildSelectForInsertSelect(Query *insertSelectQuery);
+extern bool IsSupportedRedistributionTarget(Oid targetRelationId);
+extern bool IsRedistributablePlan(Plan *selectPlan);
 
 
 #endif /* INSERT_SELECT_EXECUTOR_H */

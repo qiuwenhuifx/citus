@@ -5,6 +5,13 @@ SET citus.shard_count to 2;
 SET citus.shard_replication_factor to 1;
 SET citus.next_shard_id TO 16000000;
 
+-- CTE inlining should not happen because
+-- the tests rely on intermediate results
+SET citus.enable_cte_inlining TO false;
+
+-- prevent using locally executing the intermediate results
+SET citus.task_assignment_policy TO "round-robin";
+
 SELECT pg_backend_pid() as pid \gset
 
 CREATE TABLE users_table (user_id int, user_name text);
@@ -25,19 +32,19 @@ WITH cte AS (
 	)
 	SELECT dist_cte.user_id FROM local_cte join dist_cte on dist_cte.user_id=local_cte.user_id
 )
-SELECT 
-	count(*) 
-FROM 
+SELECT
+	count(*)
+FROM
 	cte,
-	  (SELECT 
-    	DISTINCT users_table.user_id 
-     FROM 
-     	users_table, events_table 
-     WHERE 
-     	users_table.user_id = events_table.user_id AND 
+	  (SELECT
+    	DISTINCT users_table.user_id
+     FROM
+     	users_table, events_table
+     WHERE
+     	users_table.user_id = events_table.user_id AND
      event_type IN (1,2,3,4)
      ORDER BY 1 DESC LIMIT 5
-     ) as foo 
+     ) as foo
 	  WHERE foo.user_id = cte.user_id;
 
 -- kill at the second copy (pull)
@@ -52,21 +59,21 @@ WITH cte AS (
 	)
 	SELECT dist_cte.user_id FROM local_cte join dist_cte on dist_cte.user_id=local_cte.user_id
 )
-SELECT 
-	count(*) 
-FROM 
+SELECT
+	count(*)
+FROM
 	cte,
-	  (SELECT 
-    	DISTINCT users_table.user_id 
-     FROM 
-     	users_table, events_table 
-     WHERE 
-     	users_table.user_id = events_table.user_id AND 
+	  (SELECT
+    	DISTINCT users_table.user_id
+     FROM
+     	users_table, events_table
+     WHERE
+     	users_table.user_id = events_table.user_id AND
      event_type IN (1,2,3,4)
      ORDER BY 1 DESC LIMIT 5
-     ) as foo 
+     ) as foo
 	  WHERE foo.user_id = cte.user_id;
-	  
+
 -- kill at the third copy (pull)
 SELECT citus.mitmproxy('conn.onQuery(query="SELECT DISTINCT users_table.user").kill()');
 
@@ -79,19 +86,19 @@ WITH cte AS (
 	)
 	SELECT dist_cte.user_id FROM local_cte join dist_cte on dist_cte.user_id=local_cte.user_id
 )
-SELECT 
-	count(*) 
-FROM 
+SELECT
+	count(*)
+FROM
 	cte,
-	  (SELECT 
-    	DISTINCT users_table.user_id 
-     FROM 
-     	users_table, events_table 
-     WHERE 
-     	users_table.user_id = events_table.user_id AND 
+	  (SELECT
+    	DISTINCT users_table.user_id
+     FROM
+     	users_table, events_table
+     WHERE
+     	users_table.user_id = events_table.user_id AND
      event_type IN (1,2,3,4)
      ORDER BY 1 DESC LIMIT 5
-     ) as foo 
+     ) as foo
 	  WHERE foo.user_id = cte.user_id;
 
 -- cancel at the first copy (push)
@@ -106,19 +113,19 @@ WITH cte AS (
 	)
 	SELECT dist_cte.user_id FROM local_cte join dist_cte on dist_cte.user_id=local_cte.user_id
 )
-SELECT 
-	count(*) 
-FROM 
+SELECT
+	count(*)
+FROM
 	cte,
-	  (SELECT 
-    	DISTINCT users_table.user_id 
-     FROM 
-     	users_table, events_table 
-     WHERE 
-     	users_table.user_id = events_table.user_id AND 
+	  (SELECT
+    	DISTINCT users_table.user_id
+     FROM
+     	users_table, events_table
+     WHERE
+     	users_table.user_id = events_table.user_id AND
      event_type IN (1,2,3,4)
      ORDER BY 1 DESC LIMIT 5
-     ) as foo 
+     ) as foo
 	  WHERE foo.user_id = cte.user_id;
 
 -- cancel at the second copy (pull)
@@ -133,19 +140,19 @@ WITH cte AS (
 	)
 	SELECT dist_cte.user_id FROM local_cte join dist_cte on dist_cte.user_id=local_cte.user_id
 )
-SELECT 
-	count(*) 
-FROM 
+SELECT
+	count(*)
+FROM
 	cte,
-	  (SELECT 
-    	DISTINCT users_table.user_id 
-     FROM 
-     	users_table, events_table 
-     WHERE 
-     	users_table.user_id = events_table.user_id AND 
+	  (SELECT
+    	DISTINCT users_table.user_id
+     FROM
+     	users_table, events_table
+     WHERE
+     	users_table.user_id = events_table.user_id AND
      event_type IN (1,2,3,4)
      ORDER BY 1 DESC LIMIT 5
-     ) as foo 
+     ) as foo
 	  WHERE foo.user_id = cte.user_id;
 
 -- cancel at the third copy (pull)
@@ -160,19 +167,19 @@ WITH cte AS (
 	)
 	SELECT dist_cte.user_id FROM local_cte join dist_cte on dist_cte.user_id=local_cte.user_id
 )
-SELECT 
-	count(*) 
-FROM 
+SELECT
+	count(*)
+FROM
 	cte,
-	  (SELECT 
-    	DISTINCT users_table.user_id 
-     FROM 
-     	users_table, events_table 
-     WHERE 
-     	users_table.user_id = events_table.user_id AND 
+	  (SELECT
+    	DISTINCT users_table.user_id
+     FROM
+     	users_table, events_table
+     WHERE
+     	users_table.user_id = events_table.user_id AND
      event_type IN (1,2,3,4)
      ORDER BY 1 DESC LIMIT 5
-     ) as foo 
+     ) as foo
 	  WHERE foo.user_id = cte.user_id;
 
 -- distributed update tests

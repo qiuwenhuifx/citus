@@ -2,11 +2,10 @@
 -- MULTI_SIZE_QUERIES
 --
 -- Test checks whether size of distributed tables can be obtained with citus_table_size.
--- To find the relation size and total relation size citus_relation_size and 
+-- To find the relation size and total relation size citus_relation_size and
 -- citus_total_relation_size are also tested.
 
 SET citus.next_shard_id TO 1390000;
-ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 1390000;
 
 -- Tests with invalid relation IDs
 SELECT citus_table_size(1);
@@ -21,6 +20,8 @@ SELECT citus_total_relation_size('non_distributed_table');
 DROP TABLE non_distributed_table;
 
 -- Tests on distributed table with replication factor > 1
+VACUUM (FULL) lineitem_hash_part;
+
 SELECT citus_table_size('lineitem_hash_part');
 SELECT citus_relation_size('lineitem_hash_part');
 SELECT citus_total_relation_size('lineitem_hash_part');

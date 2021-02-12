@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  * foreign_key_relationship.h
  *
- * Copyright (c) 2018, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -15,6 +15,8 @@
 #include "utils/hsearch.h"
 #include "nodes/primnodes.h"
 
+extern List * GetForeignKeyConnectedRelationIdList(Oid relationId);
+extern bool ConnectedToReferenceTableViaFKey(Oid relationId);
 extern List * ReferencedRelationIdList(Oid relationId);
 extern List * ReferencingRelationIdList(Oid relationId);
 extern void SetForeignConstraintRelationshipGraphInvalid(void);

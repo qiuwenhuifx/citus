@@ -7,6 +7,25 @@ ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 225000;
 SET citus.multi_shard_commit_protocol = '2pc';
 SET citus.shard_count TO 2;
 
+-- this function is dropped in Citus10, added here for tests
+CREATE OR REPLACE FUNCTION pg_catalog.master_create_distributed_table(table_name regclass,
+                                                                      distribution_column text,
+                                                                      distribution_method citus.distribution_type)
+    RETURNS void
+    LANGUAGE C STRICT
+    AS 'citus', $$master_create_distributed_table$$;
+COMMENT ON FUNCTION pg_catalog.master_create_distributed_table(table_name regclass,
+                                                               distribution_column text,
+                                                               distribution_method citus.distribution_type)
+    IS 'define the table distribution functions';
+
+-- this function is dropped in Citus10, added here for tests
+CREATE OR REPLACE FUNCTION pg_catalog.master_create_worker_shards(table_name text, shard_count integer,
+                                                                  replication_factor integer DEFAULT 2)
+    RETURNS void
+    AS 'citus', $$master_create_worker_shards$$
+    LANGUAGE C STRICT;
+
 -- Verify that a table name > 56 characters gets hashed properly.
 CREATE TABLE too_long_12345678901234567890123456789012345678901234567890 (
         col1 integer not null,
@@ -14,9 +33,9 @@ CREATE TABLE too_long_12345678901234567890123456789012345678901234567890 (
 SELECT master_create_distributed_table('too_long_12345678901234567890123456789012345678901234567890', 'col1', 'hash');
 SELECT master_create_worker_shards('too_long_12345678901234567890123456789012345678901234567890', '2', '2');
 
-\c - - - :worker_1_port
+\c - - :public_worker_1_host :worker_1_port
 \dt too_long_*
-\c - - - :master_port
+\c - - :master_host :master_port
 
 SET citus.shard_count TO 2;
 SET citus.shard_replication_factor TO 2;
@@ -52,18 +71,18 @@ ALTER TABLE name_lengths ADD UNIQUE (float_col_123456789012345678901234567890123
 ALTER TABLE name_lengths ADD EXCLUDE (int_col_12345678901234567890123456789012345678901234567890 WITH =);
 ALTER TABLE name_lengths ADD CHECK (date_col_12345678901234567890123456789012345678901234567890 > '2014-01-01'::date);
 
-\c - - - :worker_1_port
+\c - - :public_worker_1_host :worker_1_port
 SELECT "Column", "Type", "Modifiers" FROM table_desc WHERE relid='public.name_lengths_225002'::regclass ORDER BY 1 DESC, 2 DESC;
-\c - - - :master_port
+\c - - :master_host :master_port
 
 -- Placeholders for unsupported add constraints with EXPLICIT names that are too long
 ALTER TABLE name_lengths ADD CONSTRAINT nl_unique_12345678901234567890123456789012345678901234567890 UNIQUE (float_col_12345678901234567890123456789012345678901234567890);
 ALTER TABLE name_lengths ADD CONSTRAINT nl_exclude_12345678901234567890123456789012345678901234567890 EXCLUDE (int_col_12345678901234567890123456789012345678901234567890 WITH =);
 ALTER TABLE name_lengths ADD CONSTRAINT nl_checky_12345678901234567890123456789012345678901234567890 CHECK (date_col_12345678901234567890123456789012345678901234567890 >= '2014-01-01'::date);
 
-\c - - - :worker_1_port
+\c - - :public_worker_1_host :worker_1_port
 SELECT "Constraint", "Definition" FROM table_checks WHERE relid='public.name_lengths_225002'::regclass ORDER BY 1 DESC, 2 DESC;
-\c - - - :master_port
+\c - - :master_host :master_port
 
 -- Placeholders for RENAME operations
 \set VERBOSITY TERSE
@@ -76,24 +95,24 @@ ALTER TABLE name_lengths RENAME CONSTRAINT unique_123456789012345678901234567890
 
 CREATE INDEX tmp_idx_12345678901234567890123456789012345678901234567890 ON name_lengths(col2);
 
-\c - - - :worker_1_port
+\c - - :public_worker_1_host :worker_1_port
 SELECT "relname", "Column", "Type", "Definition" FROM index_attrs WHERE
     relname LIKE 'tmp_idx_%' ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC;
-\c - - - :master_port
+\c - - :master_host :master_port
 
 -- Verify that a new index name > 63 characters is auto-truncated
 -- by the parser/rewriter before further processing, just as in Postgres.
 CREATE INDEX tmp_idx_123456789012345678901234567890123456789012345678901234567890 ON name_lengths(col2);
 
-\c - - - :worker_1_port
+\c - - :public_worker_1_host :worker_1_port
 SELECT "relname", "Column", "Type", "Definition" FROM index_attrs WHERE
     relname LIKE 'tmp_idx_%' ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC;
-\c - - - :master_port
+\c - - :master_host :master_port
 
 SET citus.shard_count TO 2;
 SET citus.shard_replication_factor TO 2;
 
--- Verify that distributed tables with too-long names 
+-- Verify that distributed tables with too-long names
 -- for CHECK constraints are no trouble.
 CREATE TABLE sneaky_name_lengths (
 	col1 integer not null,
@@ -116,10 +135,10 @@ SELECT "Constraint", "Definition" FROM table_checks WHERE relid='public.sneaky_n
 SELECT master_create_distributed_table('sneaky_name_lengths', 'int_col_123456789012345678901234567890123456789012345678901234', 'hash');
 SELECT master_create_worker_shards('sneaky_name_lengths', '2', '2');
 
-\c - - - :worker_1_port
+\c - - :public_worker_1_host :worker_1_port
 \di public.sneaky*225006
 SELECT "Constraint", "Definition" FROM table_checks WHERE relid='public.sneaky_name_lengths_225006'::regclass ORDER BY 1 DESC, 2 DESC;
-\c - - - :master_port
+\c - - :master_host :master_port
 
 SET citus.shard_count TO 2;
 SET citus.shard_replication_factor TO 2;
@@ -135,9 +154,9 @@ CREATE TABLE sneaky_name_lengths (
         );
 SELECT create_distributed_table('sneaky_name_lengths', 'col1', 'hash');
 
-\c - - - :worker_1_port
+\c - - :public_worker_1_host :worker_1_port
 \di unique*225008
-\c - - - :master_port
+\c - - :master_host :master_port
 
 SET citus.shard_count TO 2;
 SET citus.shard_replication_factor TO 2;
@@ -151,9 +170,9 @@ CREATE TABLE too_long_12345678901234567890123456789012345678901234567890 (
         col2 integer not null);
 SELECT create_distributed_table('too_long_12345678901234567890123456789012345678901234567890', 'col1', 'hash');
 
-\c - - - :worker_1_port
+\c - - :public_worker_1_host :worker_1_port
 \dt *225000000000*
-\c - - - :master_port
+\c - - :master_host :master_port
 
 SET citus.shard_count TO 2;
 SET citus.shard_replication_factor TO 2;
@@ -171,10 +190,10 @@ SELECT shard_name(U&'elephant_!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B
 FROM pg_dist_shard
 WHERE logicalrelid = U&'elephant_!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D!0441!043B!043E!043D' UESCAPE '!'::regclass;
 
-\c - - - :worker_1_port
+\c - - :public_worker_1_host :worker_1_port
 \dt public.elephant_*
 \di public.elephant_*
-\c - - - :master_port
+\c - - :master_host :master_port
 
 SET citus.shard_count TO 2;
 SET citus.shard_replication_factor TO 2;

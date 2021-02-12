@@ -13,6 +13,8 @@
 CREATE SCHEMA functions_in_joins;
 SET search_path TO 'functions_in_joins';
 SET citus.next_shard_id TO 2500000;
+SET citus.replication_model to 'streaming';
+SET citus.shard_replication_factor to 1;
 
 CREATE TABLE table1 (id int, data int);
 SELECT create_distributed_table('table1','id');
@@ -32,6 +34,7 @@ SELECT * FROM table1 JOIN nextval('numbers') n ON (id = n) ORDER BY id ASC;
 CREATE FUNCTION add(integer, integer) RETURNS integer
 AS 'SELECT $1 + $2;'
 LANGUAGE SQL;
+SELECT create_distributed_function('add(integer,integer)');
 SELECT * FROM table1 JOIN add(3,5) sum ON (id = sum) ORDER BY id ASC;
 
 -- Check join of plpgsql functions
@@ -93,10 +96,12 @@ SELECT * FROM ROWS FROM (next_k_integers(5), next_k_integers(10)) AS f(a, b),
 
 
 -- Custom Type returning function used in a join
+RESET client_min_messages;
 CREATE TYPE min_and_max AS (
   minimum INT,
   maximum INT
 );
+SET client_min_messages TO DEBUG1;
 
 CREATE OR REPLACE FUNCTION max_and_min () RETURNS
   min_and_max AS $$
@@ -112,35 +117,58 @@ SELECT * FROM table1 JOIN max_and_min() m ON (m.maximum = data OR m.minimum = da
 
 -- The following tests will fail as we do not support  all joins on
 -- all kinds of functions
+-- In other words, we cannot recursively plan the functions and hence
+-- the query fails on the workers
 SET client_min_messages TO ERROR;
+\set VERBOSITY terse
 
 -- function joins in CTE results can create lateral joins that are not supported
-SELECT public.raise_failed_execution($cmd$
-WITH one_row AS (
-    SELECT * FROM table1 WHERE id=52
-    )
-SELECT table1.id, table1.data
-FROM one_row, table1, next_k_integers(one_row.id, 5) next_five_ids
-WHERE table1.id = next_five_ids;
-$cmd$);
+-- we execute the query within a function to consolidate the error messages
+-- between different executors
+CREATE FUNCTION raise_failed_execution_func_join(query text) RETURNS void AS $$
+BEGIN
+        EXECUTE query;
+        EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE 'failed to execute task%' THEN
+                RAISE 'Task failed to execute';
+        ELSIF SQLERRM LIKE '%does not exist%' THEN
+          RAISE 'Task failed to execute';
+        END IF;
+END;
+$$LANGUAGE plpgsql;
 
+SELECT raise_failed_execution_func_join($$
+  WITH one_row AS (
+      SELECT * FROM table1 WHERE id=52
+      )
+  SELECT table1.id, table1.data
+  FROM one_row, table1, next_k_integers(one_row.id, 5) next_five_ids
+  WHERE table1.id = next_five_ids;
+$$);
 
 -- a user-defined immutable function
 CREATE OR REPLACE FUNCTION the_answer_to_life()
   RETURNS INTEGER IMMUTABLE AS 'SELECT 42' LANGUAGE SQL;
-SELECT public.raise_failed_execution($cmd$
-SELECT * FROM table1 JOIN the_answer_to_life() the_answer ON (id = the_answer)
-$cmd$);
+
+SELECT raise_failed_execution_func_join($$
+  SELECT * FROM table1 JOIN the_answer_to_life() the_answer ON (id = the_answer);
+$$);
+
+SELECT raise_failed_execution_func_join($$
+  SELECT *
+  FROM table1
+         JOIN next_k_integers(10,5) WITH ORDINALITY next_integers
+           ON (id = next_integers.result);
+$$);
 
 -- WITH ORDINALITY clause
-SELECT public.raise_failed_execution($cmd$
-SELECT *
-FROM table1
-       JOIN next_k_integers(10,5) WITH ORDINALITY next_integers
-         ON (id = next_integers.result)
-ORDER BY id ASC;
-$cmd$);
-
+SELECT raise_failed_execution_func_join($$
+  SELECT *
+  FROM table1
+         JOIN next_k_integers(10,5) WITH ORDINALITY next_integers
+           ON (id = next_integers.result)
+  ORDER BY id ASC;
+$$);
 RESET client_min_messages;
 DROP SCHEMA functions_in_joins CASCADE;
 SET search_path TO DEFAULT;

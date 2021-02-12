@@ -3,8 +3,8 @@
 --
 
 -- many of the tests in this file is intended for testing non-fast-path
--- router planner, so we're explicitly disabling it in this file. 
--- We've bunch of other tests that triggers fast-path-router 
+-- router planner, so we're explicitly disabling it in this file.
+-- We've bunch of other tests that triggers fast-path-router
 SET citus.enable_fast_path_router_planner TO false;
 
 -- Tests covering PREPARE statements. Many of the queries are
@@ -110,7 +110,6 @@ ORDER BY
 	cust_nation,
 	l_year;
 
-SET citus.task_executor_type TO 'task-tracker';
 SET client_min_messages TO INFO;
 
 -- execute prepared statements
@@ -142,7 +141,6 @@ CREATE TEMP TABLE prepared_sql_test_7 AS EXECUTE prepared_test_7('UNITED KINGDOM
 SELECT * from prepared_sql_test_7;
 
 -- now, run some of the tests with real-time executor
-SET citus.task_executor_type TO 'real-time';
 
 -- execute prepared statements
 EXECUTE prepared_test_1;
@@ -178,6 +176,41 @@ EXECUTE prepared_insert('comment-3', '(3, 30)');
 EXECUTE prepared_insert('comment-4', '(4, 40)');
 EXECUTE prepared_insert('comment-5', '(5, 50)');
 EXECUTE prepared_insert('comment-6', '(6, 60)');
+
+-- to make this work, Citus adds the type casting for composite keys
+-- during the deparsing
+PREPARE prepared_custom_type_select(test_composite_type) AS
+	SELECT count(*) FROM router_executor_table WHERE id = 1 AND stats = $1;
+
+EXECUTE prepared_custom_type_select('(1,1)');
+EXECUTE prepared_custom_type_select('(1,1)');
+EXECUTE prepared_custom_type_select('(1,1)');
+EXECUTE prepared_custom_type_select('(1,1)');
+EXECUTE prepared_custom_type_select('(1,1)');
+EXECUTE prepared_custom_type_select('(1,1)');
+EXECUTE prepared_custom_type_select('(1,1)');
+
+CREATE SCHEMA internal_test_schema;
+SET search_path TO internal_test_schema;
+
+-- to make this work, Citus adds the type casting for composite keys
+-- during the deparsing
+PREPARE prepared_custom_type_select_with_search_path(public.test_composite_type) AS
+	SELECT count(*) FROM public.router_executor_table WHERE id = 1 AND stats = $1;
+
+EXECUTE prepared_custom_type_select_with_search_path('(1,1)');
+EXECUTE prepared_custom_type_select_with_search_path('(1,1)');
+EXECUTE prepared_custom_type_select_with_search_path('(1,1)');
+EXECUTE prepared_custom_type_select_with_search_path('(1,1)');
+EXECUTE prepared_custom_type_select_with_search_path('(1,1)');
+EXECUTE prepared_custom_type_select_with_search_path('(1,1)');
+EXECUTE prepared_custom_type_select_with_search_path('(1,1)');
+
+-- also show that it works even if we explicitly cast the type
+EXECUTE prepared_custom_type_select_with_search_path('(1,1)'::public.test_composite_type);
+
+DROP SCHEMA internal_test_schema CASCADE;
+SET search_path TO public;
 
 SELECT * FROM router_executor_table ORDER BY comment;
 
@@ -360,9 +393,6 @@ EXECUTE prepared_real_time_partition_column_select(4);
 EXECUTE prepared_real_time_partition_column_select(5);
 EXECUTE prepared_real_time_partition_column_select(6);
 
--- check task-tracker executor
-SET citus.task_executor_type TO 'task-tracker';
-
 PREPARE prepared_task_tracker_non_partition_column_select(int) AS
 	SELECT
 		prepare_table.key,
@@ -402,7 +432,6 @@ EXECUTE prepared_task_tracker_partition_column_select(4);
 EXECUTE prepared_task_tracker_partition_column_select(5);
 EXECUTE prepared_task_tracker_partition_column_select(6);
 
-SET citus.task_executor_type TO 'real-time';
 
 -- check updates
 PREPARE prepared_partition_parameter_update(int, int) AS

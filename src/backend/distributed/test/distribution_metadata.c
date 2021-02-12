@@ -5,7 +5,7 @@
  * This file contains functions to exercise distributed table metadata
  * functionality within Citus.
  *
- * Copyright (c) 2014-2016, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -21,12 +21,13 @@
 #include "catalog/pg_type.h"
 #include "distributed/distribution_column.h"
 #include "distributed/listutils.h"
-#include "distributed/master_metadata_utility.h"
-#include "distributed/master_protocol.h"
+#include "distributed/metadata_utility.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_join_order.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/pg_dist_shard.h"
+#include "distributed/query_utils.h"
 #include "distributed/resource_lock.h"
 #include "lib/stringinfo.h"
 #include "nodes/pg_list.h"
@@ -61,29 +62,25 @@ Datum
 load_shard_id_array(PG_FUNCTION_ARGS)
 {
 	Oid distributedTableId = PG_GETARG_OID(0);
-	ArrayType *shardIdArrayType = NULL;
-	ListCell *shardCell = NULL;
 	int shardIdIndex = 0;
 	Oid shardIdTypeId = INT8OID;
 
-	int shardIdCount = -1;
-	Datum *shardIdDatumArray = NULL;
 	List *shardList = LoadShardIntervalList(distributedTableId);
 
-	shardIdCount = list_length(shardList);
-	shardIdDatumArray = palloc0(shardIdCount * sizeof(Datum));
+	int shardIdCount = list_length(shardList);
+	Datum *shardIdDatumArray = palloc0(shardIdCount * sizeof(Datum));
 
-	foreach(shardCell, shardList)
+	ShardInterval *shardInterval = NULL;
+	foreach_ptr(shardInterval, shardList)
 	{
-		ShardInterval *shardId = (ShardInterval *) lfirst(shardCell);
-		Datum shardIdDatum = Int64GetDatum(shardId->shardId);
+		Datum shardIdDatum = Int64GetDatum(shardInterval->shardId);
 
 		shardIdDatumArray[shardIdIndex] = shardIdDatum;
 		shardIdIndex++;
 	}
 
-	shardIdArrayType = DatumArrayToArrayType(shardIdDatumArray, shardIdCount,
-											 shardIdTypeId);
+	ArrayType *shardIdArrayType = DatumArrayToArrayType(shardIdDatumArray, shardIdCount,
+														shardIdTypeId);
 
 	PG_RETURN_ARRAYTYPE_P(shardIdArrayType);
 }
@@ -102,12 +99,11 @@ load_shard_interval_array(PG_FUNCTION_ARGS)
 	Oid expectedType PG_USED_FOR_ASSERTS_ONLY = get_fn_expr_argtype(fcinfo->flinfo, 1);
 	ShardInterval *shardInterval = LoadShardInterval(shardId);
 	Datum shardIntervalArray[] = { shardInterval->minValue, shardInterval->maxValue };
-	ArrayType *shardIntervalArrayType = NULL;
 
 	Assert(expectedType == shardInterval->valueTypeId);
 
-	shardIntervalArrayType = DatumArrayToArrayType(shardIntervalArray, 2,
-												   shardInterval->valueTypeId);
+	ArrayType *shardIntervalArrayType = DatumArrayToArrayType(shardIntervalArray, 2,
+															  shardInterval->valueTypeId);
 
 	PG_RETURN_ARRAYTYPE_P(shardIntervalArrayType);
 }
@@ -117,40 +113,36 @@ load_shard_interval_array(PG_FUNCTION_ARGS)
  * load_shard_placement_array loads a shard interval using the provided ID
  * and returns an array of strings containing the node name and port for each
  * placement of the specified shard interval. If the second argument is true,
- * only finalized placements are returned; otherwise, all are. If no such shard
+ * only active placements are returned; otherwise, all are. If no such shard
  * interval can be found, this function raises an error instead.
  */
 Datum
 load_shard_placement_array(PG_FUNCTION_ARGS)
 {
 	int64 shardId = PG_GETARG_INT64(0);
-	bool onlyFinalized = PG_GETARG_BOOL(1);
-	ArrayType *placementArrayType = NULL;
+	bool onlyActive = PG_GETARG_BOOL(1);
 	List *placementList = NIL;
-	ListCell *placementCell = NULL;
-	int placementCount = -1;
 	int placementIndex = 0;
-	Datum *placementDatumArray = NULL;
 	Oid placementTypeId = TEXTOID;
 	StringInfo placementInfo = makeStringInfo();
 
-	if (onlyFinalized)
+	if (onlyActive)
 	{
-		placementList = FinalizedShardPlacementList(shardId);
+		placementList = ActiveShardPlacementList(shardId);
 	}
 	else
 	{
 		placementList = ShardPlacementList(shardId);
 	}
 
-	placementList = SortList(placementList, CompareShardPlacements);
+	placementList = SortList(placementList, CompareShardPlacementsByWorker);
 
-	placementCount = list_length(placementList);
-	placementDatumArray = palloc0(placementCount * sizeof(Datum));
+	int placementCount = list_length(placementList);
+	Datum *placementDatumArray = palloc0(placementCount * sizeof(Datum));
 
-	foreach(placementCell, placementList)
+	ShardPlacement *placement = NULL;
+	foreach_ptr(placement, placementList)
 	{
-		ShardPlacement *placement = (ShardPlacement *) lfirst(placementCell);
 		appendStringInfo(placementInfo, "%s:%d", placement->nodeName,
 						 placement->nodePort);
 
@@ -159,8 +151,9 @@ load_shard_placement_array(PG_FUNCTION_ARGS)
 		resetStringInfo(placementInfo);
 	}
 
-	placementArrayType = DatumArrayToArrayType(placementDatumArray, placementCount,
-											   placementTypeId);
+	ArrayType *placementArrayType = DatumArrayToArrayType(placementDatumArray,
+														  placementCount,
+														  placementTypeId);
 
 	PG_RETURN_ARRAYTYPE_P(placementArrayType);
 }
@@ -205,9 +198,9 @@ Datum
 is_distributed_table(PG_FUNCTION_ARGS)
 {
 	Oid distributedTableId = PG_GETARG_OID(0);
-	bool isDistributedTable = IsDistributedTable(distributedTableId);
+	bool isCitusTable = IsCitusTable(distributedTableId);
 
-	PG_RETURN_BOOL(isDistributedTable);
+	PG_RETURN_BOOL(isCitusTable);
 }
 
 
@@ -223,14 +216,12 @@ create_monolithic_shard_row(PG_FUNCTION_ARGS)
 	StringInfo minInfo = makeStringInfo();
 	StringInfo maxInfo = makeStringInfo();
 	uint64 newShardId = GetNextShardId();
-	text *maxInfoText = NULL;
-	text *minInfoText = NULL;
 
-	appendStringInfo(minInfo, "%d", INT32_MIN);
-	appendStringInfo(maxInfo, "%d", INT32_MAX);
+	appendStringInfo(minInfo, "%d", PG_INT32_MIN);
+	appendStringInfo(maxInfo, "%d", PG_INT32_MAX);
 
-	minInfoText = cstring_to_text(minInfo->data);
-	maxInfoText = cstring_to_text(maxInfo->data);
+	text *minInfoText = cstring_to_text(minInfo->data);
+	text *maxInfoText = cstring_to_text(maxInfo->data);
 
 	InsertShardRow(distributedTableId, newShardId, SHARD_STORAGE_TABLE, minInfoText,
 				   maxInfoText);
@@ -263,20 +254,17 @@ relation_count_in_query(PG_FUNCTION_ARGS)
 
 	char *queryStringChar = text_to_cstring(queryString);
 	List *parseTreeList = pg_parse_query(queryStringChar);
-	ListCell *parseTreeCell = NULL;
 
-	foreach(parseTreeCell, parseTreeList)
+	Node *parsetree = NULL;
+	foreach_ptr(parsetree, parseTreeList)
 	{
-		Node *parsetree = (Node *) lfirst(parseTreeCell);
-		ListCell *queryTreeCell = NULL;
-		List *queryTreeList = NIL;
+		List *queryTreeList = pg_analyze_and_rewrite((RawStmt *) parsetree,
+													 queryStringChar,
+													 NULL, 0, NULL);
 
-		queryTreeList = pg_analyze_and_rewrite((RawStmt *) parsetree, queryStringChar,
-											   NULL, 0, NULL);
-
-		foreach(queryTreeCell, queryTreeList)
+		Query *query = NULL;
+		foreach_ptr(query, queryTreeList)
 		{
-			Query *query = lfirst(queryTreeCell);
 			List *rangeTableList = NIL;
 
 			ExtractRangeTableRelationWalker((Node *) query, &rangeTableList);

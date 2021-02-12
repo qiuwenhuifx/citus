@@ -20,7 +20,7 @@ CREATE TABLE public.nation_local(
 \copy public.nation_local FROM STDIN with delimiter '|';
 0|ALGERIA|0|haggle. carefully final deposits detect slyly agai
 1|ARGENTINA|1|al foxes promise slyly according to the regular accounts. bold requests alon
-2|BRAZIL|1|y alongside of the pending deposits. carefully special packages are about the ironic forges. slyly special 
+2|BRAZIL|1|y alongside of the pending deposits. carefully special packages are about the ironic forges. slyly special
 3|CANADA|1|eas hang ironic, silent packages. slyly regular packages are furiously over the tithes. fluffily bold
 4|EGYPT|4|y above the carefully unusual theodolites. final dugouts are quickly across the furiously regular d
 5|ETHIOPIA|0|ven packages wake quickly. regu
@@ -87,7 +87,7 @@ SELECT master_create_distributed_table('nation_append_search_path', 'n_nationkey
 \copy nation_append_search_path FROM STDIN with delimiter '|';
 0|ALGERIA|0|haggle. carefully final deposits detect slyly agai
 1|ARGENTINA|1|al foxes promise slyly according to the regular accounts. bold requests alon
-2|BRAZIL|1|y alongside of the pending deposits. carefully special packages are about the ironic forges. slyly special 
+2|BRAZIL|1|y alongside of the pending deposits. carefully special packages are about the ironic forges. slyly special
 3|CANADA|1|eas hang ironic, silent packages. slyly regular packages are furiously over the tithes. fluffily bold
 4|EGYPT|4|y above the carefully unusual theodolites. final dugouts are quickly across the furiously regular d
 5|ETHIOPIA|0|ven packages wake quickly. regu
@@ -107,7 +107,7 @@ SELECT master_create_worker_shards('test_schema_support.nation_hash', 4, 2);
 -- test cursors
 SET search_path TO public;
 BEGIN;
-DECLARE test_cursor CURSOR FOR 
+DECLARE test_cursor CURSOR FOR
     SELECT *
         FROM test_schema_support.nation_append
         WHERE n_nationkey = 1;
@@ -119,7 +119,7 @@ END;
 -- test with search_path is set
 SET search_path TO test_schema_support;
 BEGIN;
-DECLARE test_cursor CURSOR FOR 
+DECLARE test_cursor CURSOR FOR
     SELECT *
         FROM nation_append
         WHERE n_nationkey = 1;
@@ -152,7 +152,7 @@ SET search_path TO public;
 \copy test_schema_support.nation_hash FROM STDIN with delimiter '|';
 0|ALGERIA|0|haggle. carefully final deposits detect slyly agai
 1|ARGENTINA|1|al foxes promise slyly according to the regular accounts. bold requests alon
-2|BRAZIL|1|y alongside of the pending deposits. carefully special packages are about the ironic forges. slyly special 
+2|BRAZIL|1|y alongside of the pending deposits. carefully special packages are about the ironic forges. slyly special
 3|CANADA|1|eas hang ironic, silent packages. slyly regular packages are furiously over the tithes. fluffily bold
 4|EGYPT|4|y above the carefully unusual theodolites. final dugouts are quickly across the furiously regular d
 5|ETHIOPIA|0|ven packages wake quickly. regu
@@ -322,14 +322,6 @@ SET search_path TO public;
 SELECT quote_ident(current_setting('lc_collate')) as current_locale \gset
 CREATE COLLATION test_schema_support.english (LOCALE = :current_locale);
 
--- create COLLATION in worker node 1 in schema
-\c - - - :worker_1_port
-CREATE COLLATION test_schema_support.english (LOCALE = :current_locale);
-
--- create COLLATION in worker node 2 in schema
-\c - - - :worker_2_port
-CREATE COLLATION test_schema_support.english (LOCALE = :current_locale);
-
 \c - - - :master_port
 
 CREATE TABLE test_schema_support.nation_hash_collation(
@@ -338,13 +330,14 @@ CREATE TABLE test_schema_support.nation_hash_collation(
     n_regionkey integer not null,
     n_comment varchar(152)
 );
+SELECT master_get_table_ddl_events('test_schema_support.nation_hash_collation') ORDER BY 1;
 SELECT master_create_distributed_table('test_schema_support.nation_hash_collation', 'n_nationkey', 'hash');
 SELECT master_create_worker_shards('test_schema_support.nation_hash_collation', 4, 2);
 
 \copy test_schema_support.nation_hash_collation FROM STDIN with delimiter '|';
 0|ALGERIA|0|haggle. carefully final deposits detect slyly agai
 1|ARGENTINA|1|al foxes promise slyly according to the regular accounts. bold requests alon
-2|BRAZIL|1|y alongside of the pending deposits. carefully special packages are about the ironic forges. slyly special 
+2|BRAZIL|1|y alongside of the pending deposits. carefully special packages are about the ironic forges. slyly special
 3|CANADA|1|eas hang ironic, silent packages. slyly regular packages are furiously over the tithes. fluffily bold
 4|EGYPT|4|y above the carefully unusual theodolites. final dugouts are quickly across the furiously regular d
 5|ETHIOPIA|0|ven packages wake quickly. regu
@@ -367,7 +360,7 @@ SELECT master_create_worker_shards('nation_hash_collation_search_path', 4, 2);
 \copy nation_hash_collation_search_path FROM STDIN with delimiter '|';
 0|ALGERIA|0|haggle. carefully final deposits detect slyly agai
 1|ARGENTINA|1|al foxes promise slyly according to the regular accounts. bold requests alon
-2|BRAZIL|1|y alongside of the pending deposits. carefully special packages are about the ironic forges. slyly special 
+2|BRAZIL|1|y alongside of the pending deposits. carefully special packages are about the ironic forges. slyly special
 3|CANADA|1|eas hang ironic, silent packages. slyly regular packages are furiously over the tithes. fluffily bold
 4|EGYPT|4|y above the carefully unusual theodolites. final dugouts are quickly across the furiously regular d
 5|ETHIOPIA|0|ven packages wake quickly. regu
@@ -380,15 +373,6 @@ SELECT n_comment FROM nation_hash_collation_search_path ORDER BY n_comment COLLA
 SET search_path TO public;
 CREATE TYPE test_schema_support.new_composite_type as (key1 text, key2 text);
 
--- create type in worker node 1 in schema
-\c - - - :worker_1_port
-CREATE TYPE test_schema_support.new_composite_type as (key1 text, key2 text);
-
--- create type in worker node 2 in schema
-\c - - - :worker_2_port
-CREATE TYPE test_schema_support.new_composite_type as (key1 text, key2 text);
-
-\c - - - :master_port
 CREATE TABLE test_schema_support.nation_hash_composite_types(
     n_nationkey integer not null,
     n_name char(25) not null,
@@ -542,7 +526,7 @@ SET search_path TO test_schema_support;
 \copy nation_append FROM STDIN with delimiter '|';
 0|ALGERIA|0| haggle. carefully final deposits detect slyly agai
 1|ARGENTINA|1|al foxes promise slyly according to the regular accounts. bold requests alon
-2|BRAZIL|1|y alongside of the pending deposits. carefully special packages are about the ironic forges. slyly special 
+2|BRAZIL|1|y alongside of the pending deposits. carefully special packages are about the ironic forges. slyly special
 3|CANADA|1|eas hang ironic, silent packages. slyly regular packages are furiously over the tithes. fluffily bold
 4|EGYPT|4|y above the carefully unusual theodolites. final dugouts are quickly across the furiously regular d
 5|ETHIOPIA|0|ven packages wake quickly. regu
@@ -589,7 +573,7 @@ SELECT create_distributed_table('test_schema_support_join_1.nation_hash', 'n_nat
 \copy test_schema_support_join_1.nation_hash FROM STDIN with delimiter '|';
 0|ALGERIA|0|haggle. carefully final deposits detect slyly agai
 1|ARGENTINA|1|al foxes promise slyly according to the regular accounts. bold requests alon
-2|BRAZIL|1|y alongside of the pending deposits. carefully special packages are about the ironic forges. slyly special 
+2|BRAZIL|1|y alongside of the pending deposits. carefully special packages are about the ironic forges. slyly special
 3|CANADA|1|eas hang ironic, silent packages. slyly regular packages are furiously over the tithes. fluffily bold
 4|EGYPT|4|y above the carefully unusual theodolites. final dugouts are quickly across the furiously regular d
 5|ETHIOPIA|0|ven packages wake quickly. regu
@@ -600,7 +584,7 @@ SELECT create_distributed_table('test_schema_support_join_1.nation_hash_2', 'n_n
 \copy test_schema_support_join_1.nation_hash_2 FROM STDIN with delimiter '|';
 0|ALGERIA|0|haggle. carefully final deposits detect slyly agai
 1|ARGENTINA|1|al foxes promise slyly according to the regular accounts. bold requests alon
-2|BRAZIL|1|y alongside of the pending deposits. carefully special packages are about the ironic forges. slyly special 
+2|BRAZIL|1|y alongside of the pending deposits. carefully special packages are about the ironic forges. slyly special
 3|CANADA|1|eas hang ironic, silent packages. slyly regular packages are furiously over the tithes. fluffily bold
 4|EGYPT|4|y above the carefully unusual theodolites. final dugouts are quickly across the furiously regular d
 5|ETHIOPIA|0|ven packages wake quickly. regu
@@ -611,20 +595,21 @@ SELECT create_distributed_table('test_schema_support_join_2.nation_hash', 'n_nat
 \copy test_schema_support_join_2.nation_hash FROM STDIN with delimiter '|';
 0|ALGERIA|0|haggle. carefully final deposits detect slyly agai
 1|ARGENTINA|1|al foxes promise slyly according to the regular accounts. bold requests alon
-2|BRAZIL|1|y alongside of the pending deposits. carefully special packages are about the ironic forges. slyly special 
+2|BRAZIL|1|y alongside of the pending deposits. carefully special packages are about the ironic forges. slyly special
 3|CANADA|1|eas hang ironic, silent packages. slyly regular packages are furiously over the tithes. fluffily bold
 4|EGYPT|4|y above the carefully unusual theodolites. final dugouts are quickly across the furiously regular d
 5|ETHIOPIA|0|ven packages wake quickly. regu
 \.
 
+SET citus.enable_repartition_joins to ON;
 -- check when search_path is public,
 -- join of two tables which are in different schemas,
 -- join on partition column
 SET search_path TO public;
-SELECT 
+SELECT
     count (*)
 FROM
-    test_schema_support_join_1.nation_hash n1, test_schema_support_join_2.nation_hash n2 
+    test_schema_support_join_1.nation_hash n1, test_schema_support_join_2.nation_hash n2
 WHERE
     n1.n_nationkey = n2.n_nationkey;
 
@@ -632,10 +617,10 @@ WHERE
 -- join of two tables which are in different schemas,
 -- join on partition column
 SET search_path TO test_schema_support_join_1;
-SELECT 
+SELECT
     count (*)
 FROM
-    nation_hash n1, test_schema_support_join_2.nation_hash n2 
+    nation_hash n1, test_schema_support_join_2.nation_hash n2
 WHERE
     n1.n_nationkey = n2.n_nationkey;
 
@@ -643,10 +628,10 @@ WHERE
 -- join of two tables which are in same schemas,
 -- join on partition column
 SET search_path TO public;
-SELECT 
+SELECT
     count (*)
 FROM
-    test_schema_support_join_1.nation_hash n1, test_schema_support_join_1.nation_hash_2 n2 
+    test_schema_support_join_1.nation_hash n1, test_schema_support_join_1.nation_hash_2 n2
 WHERE
     n1.n_nationkey = n2.n_nationkey;
 
@@ -654,24 +639,23 @@ WHERE
 -- join of two tables which are in same schemas,
 -- join on partition column
 SET search_path TO test_schema_support_join_1;
-SELECT 
+SELECT
     count (*)
 FROM
-    nation_hash n1, nation_hash_2 n2 
+    nation_hash n1, nation_hash_2 n2
 WHERE
     n1.n_nationkey = n2.n_nationkey;
 
 -- single repartition joins
-SET citus.task_executor_type TO "task-tracker";
 
 -- check when search_path is public,
 -- join of two tables which are in different schemas,
 -- join on partition column and non-partition column
 SET search_path TO public;
-SELECT 
+SELECT
     count (*)
 FROM
-    test_schema_support_join_1.nation_hash n1, test_schema_support_join_2.nation_hash n2 
+    test_schema_support_join_1.nation_hash n1, test_schema_support_join_2.nation_hash n2
 WHERE
     n1.n_nationkey = n2.n_regionkey;
 
@@ -679,10 +663,10 @@ WHERE
 -- join of two tables which are in different schemas,
 -- join on partition column and non-partition column
 SET search_path TO test_schema_support_join_1;
-SELECT 
+SELECT
     count (*)
 FROM
-    nation_hash n1, test_schema_support_join_2.nation_hash n2 
+    nation_hash n1, test_schema_support_join_2.nation_hash n2
 WHERE
     n1.n_nationkey = n2.n_regionkey;
 
@@ -690,23 +674,23 @@ WHERE
 -- join of two tables which are in same schemas,
 -- join on partition column and non-partition column
 SET search_path TO test_schema_support_join_1;
-SELECT 
+SELECT
     count (*)
 FROM
-    nation_hash n1, nation_hash_2 n2 
+    nation_hash n1, nation_hash_2 n2
 WHERE
     n1.n_nationkey = n2.n_regionkey;
 
--- hash repartition joins 
+-- hash repartition joins
 
 -- check when search_path is public,
 -- join of two tables which are in different schemas,
 -- join on non-partition column
 SET search_path TO public;
-SELECT 
+SELECT
     count (*)
 FROM
-    test_schema_support_join_1.nation_hash n1, test_schema_support_join_2.nation_hash n2 
+    test_schema_support_join_1.nation_hash n1, test_schema_support_join_2.nation_hash n2
 WHERE
     n1.n_regionkey = n2.n_regionkey;
 
@@ -714,10 +698,10 @@ WHERE
 -- join of two tables which are in different schemas,
 -- join on non-partition column
 SET search_path TO test_schema_support_join_1;
-SELECT 
+SELECT
     count (*)
 FROM
-    nation_hash n1, test_schema_support_join_2.nation_hash n2 
+    nation_hash n1, test_schema_support_join_2.nation_hash n2
 WHERE
     n1.n_regionkey = n2.n_regionkey;
 
@@ -725,29 +709,175 @@ WHERE
 -- join of two tables which are in same schemas,
 -- join on non-partition column
 SET search_path TO test_schema_support_join_1;
-SELECT 
+SELECT
     count (*)
 FROM
-    nation_hash n1, nation_hash_2 n2 
+    nation_hash n1, nation_hash_2 n2
 WHERE
     n1.n_regionkey = n2.n_regionkey;
 
--- set task_executor back to real-time
-SET citus.task_executor_type TO "real-time";
+-- set task_executor back to adaptive
 
 
 -- test ALTER TABLE SET SCHEMA
--- we expect that it will warn out
 SET search_path TO public;
-ALTER TABLE test_schema_support.nation_hash SET SCHEMA public;
 
--- we will use this function in next test
-CREATE FUNCTION run_command_on_coordinator_and_workers(p_sql text)
-RETURNS void LANGUAGE plpgsql AS $$
-BEGIN
-     EXECUTE p_sql;
-     PERFORM run_command_on_workers(p_sql);
-END;$$;
+CREATE SCHEMA old_schema;
+CREATE TABLE old_schema.table_set_schema(id int);
+SELECT create_distributed_table('old_schema.table_set_schema', 'id');
+CREATE SCHEMA new_schema;
+
+SELECT objid::oid::regnamespace as "Distributed Schemas"
+    FROM citus.pg_dist_object
+    WHERE objid::oid::regnamespace IN ('old_schema', 'new_schema');
+\c - - - :worker_1_port
+SELECT table_schema AS "Shards' Schema"
+    FROM information_schema.tables
+    WHERE table_name LIKE 'table\_set\_schema\_%' AND
+          table_schema IN ('old_schema', 'new_schema', 'public')
+    GROUP BY table_schema;
+\c - - - :master_port
+
+ALTER TABLE old_schema.table_set_schema SET SCHEMA new_schema;
+
+SELECT objid::oid::regnamespace as "Distributed Schemas"
+    FROM citus.pg_dist_object
+    WHERE objid::oid::regnamespace IN ('old_schema', 'new_schema');
+\c - - - :worker_1_port
+SELECT table_schema AS "Shards' Schema"
+    FROM information_schema.tables
+    WHERE table_name LIKE 'table\_set\_schema\_%' AND
+          table_schema IN ('old_schema', 'new_schema', 'public')
+    GROUP BY table_schema;
+\c - - - :master_port
+SELECT * FROM new_schema.table_set_schema;
+
+DROP SCHEMA old_schema CASCADE;
+DROP SCHEMA new_schema CASCADE;
+
+
+-- test ALTER TABLE SET SCHEMA from public
+CREATE TABLE table_set_schema(id int);
+SELECT create_distributed_table('table_set_schema', 'id');
+CREATE SCHEMA new_schema;
+
+SELECT objid::oid::regnamespace as "Distributed Schemas"
+    FROM citus.pg_dist_object
+    WHERE objid='new_schema'::regnamespace::oid;
+\c - - - :worker_1_port
+SELECT table_schema AS "Shards' Schema"
+    FROM information_schema.tables
+    WHERE table_name LIKE 'table\_set\_schema\_%' AND
+          table_schema IN ('new_schema', 'public')
+    GROUP BY table_schema;
+\c - - - :master_port
+
+ALTER TABLE table_set_schema SET SCHEMA new_schema;
+
+SELECT objid::oid::regnamespace as "Distributed Schemas"
+    FROM citus.pg_dist_object
+    WHERE objid='new_schema'::regnamespace::oid;
+\c - - - :worker_1_port
+SELECT table_schema AS "Shards' Schema"
+    FROM information_schema.tables
+    WHERE table_name LIKE 'table\_set\_schema\_%' AND
+          table_schema IN ('new_schema', 'public')
+    GROUP BY table_schema;
+\c - - - :master_port
+SELECT * FROM new_schema.table_set_schema;
+
+DROP SCHEMA new_schema CASCADE;
+
+
+-- test ALTER TABLE SET SCHEMA when a search path is set
+CREATE SCHEMA old_schema;
+CREATE TABLE old_schema.table_set_schema(id int);
+SELECT create_distributed_table('old_schema.table_set_schema', 'id');
+CREATE TABLE table_set_schema(id int);
+SELECT create_distributed_table('table_set_schema', 'id');
+CREATE SCHEMA new_schema;
+
+SELECT objid::oid::regnamespace as "Distributed Schemas"
+    FROM citus.pg_dist_object
+    WHERE objid::oid::regnamespace IN ('old_schema', 'new_schema');
+\c - - - :worker_1_port
+SELECT table_schema AS "Shards' Schema", COUNT(*) AS "Counts"
+    FROM information_schema.tables
+    WHERE table_name LIKE 'table\_set\_schema\_%' AND
+          table_schema IN ('old_schema', 'new_schema', 'public')
+    GROUP BY table_schema;
+\c - - - :master_port
+
+SET search_path TO old_schema;
+ALTER TABLE table_set_schema SET SCHEMA new_schema;
+
+SELECT objid::oid::regnamespace as "Distributed Schemas"
+    FROM citus.pg_dist_object
+    WHERE objid::oid::regnamespace IN ('old_schema', 'new_schema');
+\c - - - :worker_1_port
+SELECT table_schema AS "Shards' Schema", COUNT(*) AS "Counts"
+    FROM information_schema.tables
+    WHERE table_name LIKE 'table\_set\_schema\_%' AND
+          table_schema IN ('old_schema', 'new_schema', 'public')
+    GROUP BY table_schema;
+\c - - - :master_port
+SELECT * FROM new_schema.table_set_schema;
+
+SET search_path to public;
+DROP SCHEMA old_schema CASCADE;
+DROP SCHEMA new_schema CASCADE;
+DROP TABLE table_set_schema;
+
+
+-- test ALTER TABLE SET SCHEMA with nonexisting schemas and table
+-- expect all to give error
+CREATE SCHEMA existing_schema;
+CREATE SCHEMA another_existing_schema;
+CREATE TABLE existing_schema.table_set_schema(id int);
+SELECT create_distributed_table('existing_schema.table_set_schema', 'id');
+ALTER TABLE non_existent_schema.table_set_schema SET SCHEMA another_existing_schema;
+ALTER TABLE non_existent_schema.non_existent_table SET SCHEMA another_existing_schema;
+ALTER TABLE non_existent_schema.table_set_schema SET SCHEMA another_non_existent_schema;
+ALTER TABLE non_existent_schema.non_existent_table SET SCHEMA another_non_existent_schema;
+ALTER TABLE existing_schema.non_existent_table SET SCHEMA another_existing_schema;
+ALTER TABLE existing_schema.non_existent_table SET SCHEMA non_existent_schema;
+ALTER TABLE existing_schema.table_set_schema SET SCHEMA non_existent_schema;
+
+
+-- test ALTER TABLE IF EXISTS SET SCHEMA with nonexisting schemas and table
+ALTER TABLE IF EXISTS non_existent_schema.table_set_schema SET SCHEMA another_existing_schema;
+ALTER TABLE IF EXISTS non_existent_schema.non_existent_table SET SCHEMA another_existing_schema;
+ALTER TABLE IF EXISTS non_existent_schema.table_set_schema SET SCHEMA another_non_existent_schema;
+ALTER TABLE IF EXISTS non_existent_schema.non_existent_table SET SCHEMA another_non_existent_schema;
+ALTER TABLE IF EXISTS existing_schema.non_existent_table SET SCHEMA another_existing_schema;
+ALTER TABLE IF EXISTS existing_schema.non_existent_table SET SCHEMA non_existent_schema;
+ALTER TABLE IF EXISTS existing_schema.table_set_schema SET SCHEMA non_existent_schema;
+ALTER TABLE IF EXISTS non_existent_table SET SCHEMA another_existing_schema;
+ALTER TABLE IF EXISTS non_existent_table SET SCHEMA non_existent_schema;
+DROP SCHEMA existing_schema, another_existing_schema CASCADE;
+
+
+-- test ALTER TABLE SET SCHEMA with interesting names
+CREATE SCHEMA "cItuS.T E E N'sSchema";
+CREATE SCHEMA "citus-teen's scnd schm.";
+
+CREATE TABLE "cItuS.T E E N'sSchema"."be$t''t*ble" (id int);
+
+SELECT create_distributed_table('"cItuS.T E E N''sSchema"."be$t''''t*ble"', 'id');
+
+ALTER TABLE "cItuS.T E E N'sSchema"."be$t''t*ble" SET SCHEMA "citus-teen's scnd schm.";
+
+\c - - - :worker_1_port
+SELECT table_schema AS "Shards' Schema"
+    FROM information_schema.tables
+    WHERE table_name LIKE 'be$t''''t*ble%'
+    GROUP BY table_schema;
+\c - - - :master_port
+
+SELECT * FROM "citus-teen's scnd schm."."be$t''t*ble";
+
+DROP SCHEMA "cItuS.T E E N'sSchema", "citus-teen's scnd schm." CASCADE;
+
 
 -- test schema propagation with user other than current user
 SELECT run_command_on_coordinator_and_workers('CREATE USER "test-user"');
@@ -785,7 +915,6 @@ SELECT sum(result::int) FROM run_command_on_placements('run_test_schema.test_tab
 SELECT sum(result::int) FROM run_command_on_shards('run_test_schema.test_table','SELECT pg_table_size(''%s'')');
 
 -- test capital letters on both table and schema names
-SET citus.task_executor_type to "real-time";
 -- create schema with weird names
 CREATE SCHEMA "CiTuS.TeeN";
 CREATE SCHEMA "CiTUS.TEEN2";
@@ -809,46 +938,46 @@ INSERT INTO "CiTuS.TeeN"."TeeNTabLE.1!?!" VALUES(1, 1),(1, 0),(0, 1),(2, 3),(3, 
 INSERT INTO "CiTUS.TEEN2"."CAPITAL_TABLE" VALUES(0, 1),(1, 0),(2, 1),(4, 3),(3, 2),(4, 4);
 
 -- join on tables with weird names
-SELECT * 
-FROM "CiTuS.TeeN"."TeeNTabLE.1!?!", "CiTUS.TEEN2"."CAPITAL_TABLE" 
+SELECT *
+FROM "CiTuS.TeeN"."TeeNTabLE.1!?!", "CiTUS.TEEN2"."CAPITAL_TABLE"
 WHERE "CiTUS.TEEN2"."CAPITAL_TABLE".i = "CiTuS.TeeN"."TeeNTabLE.1!?!"."TeNANt_Id"
 ORDER BY 1,2,3,4;
 
 -- add group by, having, order by clauses
-SELECT * 
-FROM "CiTuS.TeeN"."TeeNTabLE.1!?!", "CiTUS.TEEN2"."CAPITAL_TABLE" 
+SELECT *
+FROM "CiTuS.TeeN"."TeeNTabLE.1!?!", "CiTUS.TEEN2"."CAPITAL_TABLE"
 WHERE "CiTUS.TEEN2"."CAPITAL_TABLE".i = "CiTuS.TeeN"."TeeNTabLE.1!?!"."TeNANt_Id"
-GROUP BY "TeNANt_Id", id, i, j 
+GROUP BY "TeNANt_Id", id, i, j
 HAVING "TeNANt_Id" > 0 AND j >= id ORDER BY "TeNANt_Id";
 
-SELECT * 
+SELECT *
 FROM "CiTuS.TeeN"."TeeNTabLE.1!?!" join "CiTUS.TEEN2"."CAPITAL_TABLE" on
 ("CiTUS.TEEN2"."CAPITAL_TABLE".i = "CiTuS.TeeN"."TeeNTabLE.1!?!"."TeNANt_Id")
-GROUP BY "TeNANt_Id", id, i, j 
+GROUP BY "TeNANt_Id", id, i, j
 HAVING "TeNANt_Id" > 0 AND j >= id
 ORDER BY 1,2,3,4;
 
 -- run with CTEs
 WITH "cTE" AS (
-  SELECT * 
+  SELECT *
   FROM "CiTuS.TeeN"."TeeNTabLE.1!?!"
 )
 SELECT * FROM "cTE" join "CiTUS.TEEN2"."CAPITAL_TABLE" on
 ("cTE"."TeNANt_Id" = "CiTUS.TEEN2"."CAPITAL_TABLE".i)
-GROUP BY "TeNANt_Id", id, i, j 
+GROUP BY "TeNANt_Id", id, i, j
 HAVING "TeNANt_Id" > 0 AND j >= id
 ORDER BY 1,2,3,4;
 
 SET search_path to "CiTuS.TeeN";
 -- and subqueries
-SELECT * 
+SELECT *
 FROM (
-      SELECT * 
+      SELECT *
       FROM "TeeNTabLE.1!?!"
       ) "cTE"
 join "CiTUS.TEEN2"."CAPITAL_TABLE" on
 ("cTE"."TeNANt_Id" = "CiTUS.TEEN2"."CAPITAL_TABLE".i)
-GROUP BY "TeNANt_Id", id, i, j 
+GROUP BY "TeNANt_Id", id, i, j
 HAVING "TeNANt_Id" > 0 AND j >= id
 ORDER BY 1,2,3,4;
 
@@ -862,9 +991,36 @@ DELETE FROM "CiTuS.TeeN"."TeeNTabLE.1!?!" WHERE "TeNANt_Id"=1;
 -- Some more DDL
 ALTER TABLE "CiTuS.TeeN"."TeeNTabLE.1!?!" ADD CONSTRAINT "ConsNAmE<>" PRIMARY KEY ("TeNANt_Id");
 
+-- test schema rename propagation
+CREATE SCHEMA foo;
+CREATE TABLE foo.test (x int, y int);
+SELECT create_distributed_table('foo.test', 'x');
+INSERT INTO foo.test VALUES (1, 1), (2, 2);
+ALTER SCHEMA foo rename to bar;
+SELECT COUNT(*) FROM bar.test;
+
+-- test propagation with weird name
+ALTER SCHEMA "CiTuS.TeeN" RENAME TO "Citus'Teen123";
+SELECT * FROM "Citus'Teen123"."TeeNTabLE.1!?!" ORDER BY id;
+
+-- test error
+INSERT INTO bar.test VALUES (3,3), (4,4), (5,5), (6,6), (7,7), (8,8), (9,9);
+
+BEGIN;
+    SELECT COUNT(*) FROM bar.test;
+    ALTER SCHEMA bar RENAME TO foo;
+ROLLBACK;
+
+BEGIN;
+    SET LOCAL citus.multi_shard_modify_mode TO 'sequential';
+    SELECT COUNT(*) FROM bar.test;
+    ALTER SCHEMA bar RENAME TO foo;
+ROLLBACK;
+
 -- Clean up the created schema
 DROP SCHEMA run_test_schema CASCADE;
 DROP SCHEMA test_schema_support_join_1 CASCADE;
 DROP SCHEMA test_schema_support_join_2 CASCADE;
-DROP SCHEMA "CiTuS.TeeN" CASCADE;
+DROP SCHEMA "Citus'Teen123" CASCADE;
 DROP SCHEMA "CiTUS.TEEN2" CASCADE;
+DROP SCHEMA bar CASCADE;

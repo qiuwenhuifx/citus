@@ -4,7 +4,7 @@
  *	  Type and function declarations for optimizing multi-relation based logical
  *	  plans.
  *
- * Copyright (c) 2012-2016, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  * $Id$
  *
@@ -14,7 +14,7 @@
 #ifndef MULTI_LOGICAL_OPTIMIZER_H
 #define MULTI_LOGICAL_OPTIMIZER_H
 
-#include "distributed/master_metadata_utility.h"
+#include "distributed/metadata_utility.h"
 #include "distributed/multi_logical_planner.h"
 #include "distributed/relation_restriction_equivalence.h"
 
@@ -26,6 +26,8 @@
 #define ARRAY_CAT_AGGREGATE_NAME "array_cat_agg"
 #define JSONB_CAT_AGGREGATE_NAME "jsonb_cat_agg"
 #define JSON_CAT_AGGREGATE_NAME "json_cat_agg"
+#define WORKER_PARTIAL_AGGREGATE_NAME "worker_partial_agg"
+#define COORD_COMBINE_AGGREGATE_NAME "coord_combine_agg"
 #define WORKER_COLUMN_FORMAT "worker_column_%d"
 
 /* Definitions related to count(distinct) approximations */
@@ -75,8 +77,33 @@ typedef enum
 	AGGREGATE_HLL_ADD = 16,
 	AGGREGATE_HLL_UNION = 17,
 	AGGREGATE_TOPN_ADD_AGG = 18,
-	AGGREGATE_TOPN_UNION_AGG = 19
+	AGGREGATE_TOPN_UNION_AGG = 19,
+	AGGREGATE_ANY_VALUE = 20,
+
+	/* support for github.com/tvondra/tdigest */
+	AGGREGATE_TDIGEST_COMBINE = 21,
+	AGGREGATE_TDIGEST_ADD_DOUBLE = 22,
+	AGGREGATE_TDIGEST_PERCENTILE_ADD_DOUBLE = 23,
+	AGGREGATE_TDIGEST_PERCENTILE_ADD_DOUBLEARRAY = 24,
+	AGGREGATE_TDIGEST_PERCENTILE_TDIGEST_DOUBLE = 25,
+	AGGREGATE_TDIGEST_PERCENTILE_TDIGEST_DOUBLEARRAY = 26,
+	AGGREGATE_TDIGEST_PERCENTILE_OF_ADD_DOUBLE = 27,
+	AGGREGATE_TDIGEST_PERCENTILE_OF_ADD_DOUBLEARRAY = 28,
+	AGGREGATE_TDIGEST_PERCENTILE_OF_TDIGEST_DOUBLE = 29,
+	AGGREGATE_TDIGEST_PERCENTILE_OF_TDIGEST_DOUBLEARRAY = 30,
+
+	/* AGGREGATE_CUSTOM must come last */
+	AGGREGATE_CUSTOM_COMBINE = 31,
+	AGGREGATE_CUSTOM_ROW_GATHER = 32,
 } AggregateType;
+
+
+/* Enumeration for citus.coordinator_aggregation GUC */
+typedef enum
+{
+	COORDINATOR_AGGREGATION_DISABLED,
+	COORDINATOR_AGGREGATION_ROW_GATHER,
+} CoordinatorAggregationStrategyType;
 
 
 /*
@@ -122,13 +149,15 @@ static const char *const AggregateNames[] = {
 	"json_agg", "json_object_agg",
 	"bit_and", "bit_or", "bool_and", "bool_or", "every",
 	"hll_add_agg", "hll_union_agg",
-	"topn_add_agg", "topn_union_agg"
+	"topn_add_agg", "topn_union_agg",
+	"any_value"
 };
 
 
 /* Config variable managed via guc.c */
 extern int LimitClauseRowFetchCount;
 extern double CountDistinctErrorRate;
+extern int CoordinatorAggregationStrategy;
 
 
 /* Function declaration for optimizing logical plans */
@@ -145,7 +174,8 @@ extern bool ExtractQueryWalker(Node *node, List **queryList);
 extern bool IsPartitionColumn(Expr *columnExpression, Query *query);
 extern void FindReferencedTableColumn(Expr *columnExpression, List *parentQueryList,
 									  Query *query, Oid *relationId, Var **column);
-
+extern char * WorkerColumnName(AttrNumber resno);
 extern bool IsGroupBySubsetOfDistinct(List *groupClauses, List *distinctClauses);
+extern bool TargetListHasAggregates(List *targetEntryList);
 
 #endif   /* MULTI_LOGICAL_OPTIMIZER_H */

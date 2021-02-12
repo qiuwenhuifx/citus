@@ -40,7 +40,6 @@ CREATE FUNCTION sql_test_no_4() RETURNS bigint AS '
 		o_orderkey = l_orderkey;
 ' LANGUAGE SQL;
 
-SET citus.task_executor_type TO 'task-tracker';
 SET client_min_messages TO INFO;
 
 -- now, run plain SQL functions
@@ -51,7 +50,6 @@ SELECT sql_test_no_4();
 
 -- run the tests which do not require re-partition
 -- with real-time executor
-SET citus.task_executor_type TO 'real-time';
 
 -- now, run plain SQL functions
 SELECT sql_test_no_1();
@@ -137,7 +135,7 @@ $$ LANGUAGE SQL STABLE;
 CREATE OR REPLACE FUNCTION test_parameterized_sql_function_in_subquery_where(org_id_val integer)
 RETURNS TABLE (a bigint)
 AS $$
-    SELECT count(*) AS count_val from test_parameterized_sql as t1 where 
+    SELECT count(*) AS count_val from test_parameterized_sql as t1 where
     org_id IN (SELECT org_id FROM test_parameterized_sql as t2 WHERE t2.org_id = t1.org_id AND org_id = org_id_val);
 $$ LANGUAGE SQL STABLE;
 
@@ -146,11 +144,31 @@ INSERT INTO test_parameterized_sql VALUES(1, 1);
 
 -- all of them should fail
 SELECT * FROM test_parameterized_sql_function(1);
-SELECT test_parameterized_sql_function(1);
 SELECT test_parameterized_sql_function_in_subquery_where(1);
 
-DROP TABLE temp_table;
-DROP TABLE test_parameterized_sql;
+-- postgres behaves slightly differently for the following
+-- query where the target list is empty
+SELECT test_parameterized_sql_function(1);
+
+-- test that sql function calls are treated as multi-statement transactions
+-- and are rolled back properly. Single-row inserts for not-replicated tables
+-- don't go over 2PC if they are not part of a bigger transaction.
+CREATE TABLE table_with_unique_constraint (a int UNIQUE);
+SELECT create_distributed_table('table_with_unique_constraint', 'a');
+
+INSERT INTO table_with_unique_constraint VALUES (1), (2), (3);
+
+CREATE OR REPLACE FUNCTION insert_twice() RETURNS VOID
+AS $$
+  INSERT INTO table_with_unique_constraint VALUES (4);
+  INSERT INTO table_with_unique_constraint VALUES (4);
+$$ LANGUAGE SQL;
+
+SELECT insert_twice();
+
+SELECT * FROM table_with_unique_constraint ORDER BY a;
+
+DROP TABLE temp_table, test_parameterized_sql, table_with_unique_constraint;
 
 -- clean-up functions
 DROP FUNCTION sql_test_no_1();

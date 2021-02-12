@@ -5,7 +5,7 @@
  *	This file contains functions for monitoring the distributed transactions
  *	accross the cluster.
  *
- * Copyright (c) 2018, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -24,10 +24,11 @@
 #include "distributed/connection_management.h"
 #include "distributed/listutils.h"
 #include "distributed/lock_graph.h"
-#include "distributed/master_protocol.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/remote_commands.h"
 #include "distributed/transaction_identifier.h"
+#include "distributed/tuplestore.h"
 #include "executor/spi.h"
 #include "nodes/execnodes.h"
 #include "storage/ipc.h"
@@ -67,8 +68,8 @@
  *
  *  In other words, the following types of queries won't be observed in these
  *  views:
- *      - Router queries that are not inside transaction blocks
- *      - Real-time queries that are not inside transaction blocks
+ *      - Single-shard queries that are not inside transaction blocks
+ *      - Multi-shard select queries that are not inside transaction blocks
  *      - Task-tracker queries
  *
  *
@@ -229,6 +230,8 @@ typedef struct CitusDistStat
 static List * CitusStatActivity(const char *statQuery);
 static void ReturnCitusDistStats(List *citusStatsList, FunctionCallInfo fcinfo);
 static CitusDistStat * ParseCitusDistStat(PGresult *result, int64 rowIndex);
+static void ReplaceInitiatorNodeIdentifier(int initiator_node_identifier,
+										   CitusDistStat *citusDistStat);
 
 /* utility functions to parse the fields from PGResult */
 static text * ParseTextField(PGresult *result, int rowIndex, int colIndex);
@@ -266,11 +269,9 @@ PG_FUNCTION_INFO_V1(citus_worker_stat_activity);
 Datum
 citus_dist_stat_activity(PG_FUNCTION_ARGS)
 {
-	List *citusDistStatStatements = NIL;
-
 	CheckCitusVersion(ERROR);
 
-	citusDistStatStatements = CitusStatActivity(CITUS_DIST_STAT_ACTIVITY_QUERY);
+	List *citusDistStatStatements = CitusStatActivity(CITUS_DIST_STAT_ACTIVITY_QUERY);
 
 	ReturnCitusDistStats(citusDistStatStatements, fcinfo);
 
@@ -286,11 +287,9 @@ citus_dist_stat_activity(PG_FUNCTION_ARGS)
 Datum
 citus_worker_stat_activity(PG_FUNCTION_ARGS)
 {
-	List *citusWorkerStatStatements = NIL;
-
 	CheckCitusVersion(ERROR);
 
-	citusWorkerStatStatements = CitusStatActivity(CITUS_WORKER_STAT_ACTIVITY_QUERY);
+	List *citusWorkerStatStatements = CitusStatActivity(CITUS_WORKER_STAT_ACTIVITY_QUERY);
 
 	ReturnCitusDistStats(citusWorkerStatStatements, fcinfo);
 
@@ -312,13 +311,8 @@ citus_worker_stat_activity(PG_FUNCTION_ARGS)
 static List *
 CitusStatActivity(const char *statQuery)
 {
-	List *citusStatsList = NIL;
-
-	List *workerNodeList = ActivePrimaryNodeList();
-	ListCell *workerNodeCell = NULL;
-	char *nodeUser = NULL;
+	List *workerNodeList = ActivePrimaryNonCoordinatorNodeList(NoLock);
 	List *connectionList = NIL;
-	ListCell *connectionCell = NULL;
 
 	/*
 	 * For the local node, we can avoid opening connections. This might be
@@ -326,32 +320,34 @@ CitusStatActivity(const char *statQuery)
 	 * the authentication for self-connection via any user who calls the citus
 	 * stat activity functions.
 	 */
-	citusStatsList = GetLocalNodeCitusDistStat(statQuery);
+	List *citusStatsList = GetLocalNodeCitusDistStat(statQuery);
 
 	/*
 	 * We prefer to connect with the current user to the remote nodes. This will
 	 * ensure that we have the same privilage restrictions that pg_stat_activity
 	 * enforces.
 	 */
-	nodeUser = CurrentUserName();
+	char *nodeUser = CurrentUserName();
+
+	int32 localGroupId = GetLocalGroupId();
 
 	/* open connections in parallel */
-	foreach(workerNodeCell, workerNodeList)
+	WorkerNode *workerNode = NULL;
+	foreach_ptr(workerNode, workerNodeList)
 	{
-		WorkerNode *workerNode = (WorkerNode *) lfirst(workerNodeCell);
-		char *nodeName = workerNode->workerName;
+		const char *nodeName = workerNode->workerName;
 		int nodePort = workerNode->workerPort;
-		MultiConnection *connection = NULL;
 		int connectionFlags = 0;
 
-		if (workerNode->groupId == GetLocalGroupId())
+		if (workerNode->groupId == localGroupId)
 		{
 			/* we already get these stats via GetLocalNodeCitusDistStat() */
 			continue;
 		}
 
-		connection = StartNodeUserDatabaseConnection(connectionFlags, nodeName, nodePort,
-													 nodeUser, NULL);
+		MultiConnection *connection = StartNodeUserDatabaseConnection(connectionFlags,
+																	  nodeName, nodePort,
+																	  nodeUser, NULL);
 
 		connectionList = lappend(connectionList, connection);
 	}
@@ -359,12 +355,10 @@ CitusStatActivity(const char *statQuery)
 	FinishConnectionListEstablishment(connectionList);
 
 	/* send commands in parallel */
-	foreach(connectionCell, connectionList)
+	MultiConnection *connection = NULL;
+	foreach_ptr(connection, connectionList)
 	{
-		MultiConnection *connection = (MultiConnection *) lfirst(connectionCell);
-		int querySent = false;
-
-		querySent = SendRemoteCommand(connection, statQuery);
+		int querySent = SendRemoteCommand(connection, statQuery);
 		if (querySent == 0)
 		{
 			ReportConnectionError(connection, WARNING);
@@ -372,24 +366,19 @@ CitusStatActivity(const char *statQuery)
 	}
 
 	/* receive query results */
-	foreach(connectionCell, connectionList)
+	foreach_ptr(connection, connectionList)
 	{
-		MultiConnection *connection = (MultiConnection *) lfirst(connectionCell);
-		PGresult *result = NULL;
 		bool raiseInterrupts = true;
-		int64 rowIndex = 0;
-		int64 rowCount = 0;
-		int64 colCount = 0;
 
-		result = GetRemoteCommandResult(connection, raiseInterrupts);
+		PGresult *result = GetRemoteCommandResult(connection, raiseInterrupts);
 		if (!IsResponseOK(result))
 		{
 			ReportResultError(connection, result, WARNING);
 			continue;
 		}
 
-		rowCount = PQntuples(result);
-		colCount = PQnfields(result);
+		int64 rowCount = PQntuples(result);
+		int64 colCount = PQnfields(result);
 
 		if (colCount != CITUS_DIST_STAT_ACTIVITY_QUERY_COLS)
 		{
@@ -402,7 +391,7 @@ CitusStatActivity(const char *statQuery)
 			continue;
 		}
 
-		for (rowIndex = 0; rowIndex < rowCount; rowIndex++)
+		for (int64 rowIndex = 0; rowIndex < rowCount; rowIndex++)
 		{
 			CitusDistStat *citusDistStat = ParseCitusDistStat(result, rowIndex);
 
@@ -433,10 +422,6 @@ GetLocalNodeCitusDistStat(const char *statQuery)
 {
 	List *citusStatsList = NIL;
 
-	List *workerNodeList = NIL;
-	ListCell *workerNodeCell = NULL;
-	int localGroupId = -1;
-
 	if (IsCoordinator())
 	{
 		/*
@@ -449,17 +434,16 @@ GetLocalNodeCitusDistStat(const char *statQuery)
 		return citusStatsList;
 	}
 
-	localGroupId = GetLocalGroupId();
+	int32 localGroupId = GetLocalGroupId();
 
 	/* get the current worker's node stats */
-	workerNodeList = ActivePrimaryNodeList();
-	foreach(workerNodeCell, workerNodeList)
+	List *workerNodeList = ActivePrimaryNonCoordinatorNodeList(NoLock);
+	WorkerNode *workerNode = NULL;
+	foreach_ptr(workerNode, workerNodeList)
 	{
-		WorkerNode *workerNode = (WorkerNode *) lfirst(workerNodeCell);
-
 		if (workerNode->groupId == localGroupId)
 		{
-			char *nodeName = workerNode->workerName;
+			const char *nodeName = workerNode->workerName;
 			int nodePort = workerNode->workerPort;
 
 			citusStatsList = LocalNodeCitusDistStat(statQuery, nodeName, nodePort);
@@ -485,56 +469,12 @@ static CitusDistStat *
 ParseCitusDistStat(PGresult *result, int64 rowIndex)
 {
 	CitusDistStat *citusDistStat = (CitusDistStat *) palloc0(sizeof(CitusDistStat));
-	int initiator_node_identifier = 0;
-	WorkerNode *initiatorWorkerNode = NULL;
 
-	/*
-	 * Replace initiator_node_identifier with initiator_node_hostname
-	 * and initiator_node_port given that those are a lot more useful.
-	 *
-	 * The rules are following:
-	 *    - If initiator_node_identifier belongs to a worker, simply get it
-	 *      from the metadata
-	 *   - If the initiator_node_identifier belongs to the coordinator and
-	 *     we're executing the function on the coordinator, get the localhost
-	 *     and port
-	 *   - If the initiator_node_identifier belongs to the coordinator and
-	 *     we're executing the function on a worker node, manually mark it
-	 *     as "coordinator_host" given that we cannot know the host and port
-	 *   - If the initiator_node_identifier doesn't equal to zero, we know that
-	 *     it is a worker query initiated outside of a distributed
-	 *     transaction. However, we cannot know which node has initiated
-	 *     the worker query.
-	 */
-	initiator_node_identifier =
+
+	int initiator_node_identifier =
 		PQgetisnull(result, rowIndex, 0) ? -1 : ParseIntField(result, rowIndex, 0);
-	if (initiator_node_identifier > 0)
-	{
-		bool nodeExists = false;
 
-		initiatorWorkerNode = PrimaryNodeForGroup(initiator_node_identifier, &nodeExists);
-
-		/* a query should run on an existing node */
-		Assert(nodeExists);
-		citusDistStat->master_query_host_name =
-			cstring_to_text(initiatorWorkerNode->workerName);
-		citusDistStat->master_query_host_port = initiatorWorkerNode->workerPort;
-	}
-	else if (initiator_node_identifier == 0 && IsCoordinator())
-	{
-		citusDistStat->master_query_host_name = cstring_to_text(coordinator_host_name);
-		citusDistStat->master_query_host_port = PostPortNumber;
-	}
-	else if (initiator_node_identifier == 0)
-	{
-		citusDistStat->master_query_host_name = cstring_to_text(coordinator_host_name);
-		citusDistStat->master_query_host_port = 0;
-	}
-	else
-	{
-		citusDistStat->master_query_host_name = NULL;
-		citusDistStat->master_query_host_port = 0;
-	}
+	ReplaceInitiatorNodeIdentifier(initiator_node_identifier, citusDistStat);
 
 	citusDistStat->distributed_transaction_number = ParseIntField(result, rowIndex, 1);
 	citusDistStat->distributed_transaction_stamp =
@@ -566,6 +506,65 @@ ParseCitusDistStat(PGresult *result, int64 rowIndex)
 }
 
 
+static void
+ReplaceInitiatorNodeIdentifier(int initiator_node_identifier,
+							   CitusDistStat *citusDistStat)
+{
+	WorkerNode *initiatorWorkerNode = NULL;
+
+	/*
+	 * Replace initiator_node_identifier with initiator_node_hostname
+	 * and initiator_node_port given that those are a lot more useful.
+	 *
+	 * The rules are following:
+	 *    - If initiator_node_identifier belongs to a worker, simply get it
+	 *      from the metadata
+	 *   - If the initiator_node_identifier belongs to the coordinator and
+	 *     we're executing the function on the coordinator, get the localhost
+	 *     and port
+	 *   - If the initiator_node_identifier belongs to the coordinator and
+	 *     we're executing the function on a worker node, manually mark it
+	 *     as "coordinator_host" given that we cannot know the host and port
+	 *   - If the initiator_node_identifier doesn't equal to zero, we know that
+	 *     it is a worker query initiated outside of a distributed
+	 *     transaction. However, we cannot know which node has initiated
+	 *     the worker query.
+	 */
+	if (initiator_node_identifier > 0)
+	{
+		bool nodeExists = false;
+
+		initiatorWorkerNode = PrimaryNodeForGroup(initiator_node_identifier, &nodeExists);
+
+		/* a query should run on an existing node */
+		Assert(nodeExists);
+		if (initiatorWorkerNode == NULL)
+		{
+			ereport(ERROR, (errmsg("no primary node found for group %d",
+								   initiator_node_identifier)));
+		}
+		citusDistStat->master_query_host_name =
+			cstring_to_text(initiatorWorkerNode->workerName);
+		citusDistStat->master_query_host_port = initiatorWorkerNode->workerPort;
+	}
+	else if (initiator_node_identifier == 0 && IsCoordinator())
+	{
+		citusDistStat->master_query_host_name = cstring_to_text(coordinator_host_name);
+		citusDistStat->master_query_host_port = PostPortNumber;
+	}
+	else if (initiator_node_identifier == 0)
+	{
+		citusDistStat->master_query_host_name = cstring_to_text(coordinator_host_name);
+		citusDistStat->master_query_host_port = 0;
+	}
+	else
+	{
+		citusDistStat->master_query_host_name = NULL;
+		citusDistStat->master_query_host_port = 0;
+	}
+}
+
+
 /*
  * LocalNodeCitusDistStat simply executes the given query via SPI and parses
  * the results back in a list for further processing.
@@ -577,14 +576,11 @@ static List *
 LocalNodeCitusDistStat(const char *statQuery, const char *hostname, int port)
 {
 	List *localNodeCitusDistStatList = NIL;
-	int spiConnectionResult = 0;
-	int spiQueryResult = 0;
 	bool readOnly = true;
-	uint32 rowIndex = 0;
 
 	MemoryContext upperContext = CurrentMemoryContext, oldContext = NULL;
 
-	spiConnectionResult = SPI_connect();
+	int spiConnectionResult = SPI_connect();
 	if (spiConnectionResult != SPI_OK_CONNECT)
 	{
 		ereport(WARNING, (errmsg("could not connect to SPI manager to get "
@@ -595,7 +591,7 @@ LocalNodeCitusDistStat(const char *statQuery, const char *hostname, int port)
 		return NIL;
 	}
 
-	spiQueryResult = SPI_execute(statQuery, readOnly, 0);
+	int spiQueryResult = SPI_execute(statQuery, readOnly, 0);
 	if (spiQueryResult != SPI_OK_SELECT)
 	{
 		ereport(WARNING, (errmsg("execution was not successful while trying to get "
@@ -615,15 +611,13 @@ LocalNodeCitusDistStat(const char *statQuery, const char *hostname, int port)
 	 */
 	oldContext = MemoryContextSwitchTo(upperContext);
 
-	for (rowIndex = 0; rowIndex < SPI_processed; rowIndex++)
+	for (uint64 rowIndex = 0; rowIndex < SPI_processed; rowIndex++)
 	{
-		HeapTuple row = NULL;
 		TupleDesc rowDescriptor = SPI_tuptable->tupdesc;
-		CitusDistStat *citusDistStat = NULL;
 
 		/* we use pointers from the tuple, so copy it before processing */
-		row = SPI_copytuple(SPI_tuptable->vals[rowIndex]);
-		citusDistStat = HeapTupleToCitusDistStat(row, rowDescriptor);
+		HeapTuple row = SPI_copytuple(SPI_tuptable->vals[rowIndex]);
+		CitusDistStat *citusDistStat = HeapTupleToCitusDistStat(row, rowDescriptor);
 
 		/*
 		 * Add the query_host_name and query_host_port which denote where
@@ -656,55 +650,10 @@ static CitusDistStat *
 HeapTupleToCitusDistStat(HeapTuple result, TupleDesc rowDescriptor)
 {
 	CitusDistStat *citusDistStat = (CitusDistStat *) palloc0(sizeof(CitusDistStat));
-	int initiator_node_identifier = 0;
-	WorkerNode *initiatorWorkerNode = NULL;
 
-	/*
-	 * Replace initiator_node_identifier with initiator_node_hostname
-	 * and initiator_node_port given that those are a lot more useful.
-	 *
-	 * The rules are following:
-	 *    - If initiator_node_identifier belongs to a worker, simply get it
-	 *      from the metadata
-	 *   - If the initiator_node_identifier belongs to the coordinator and
-	 *     we're executing the function on the coordinator, get the localhost
-	 *     and port
-	 *   - If the initiator_node_identifier belongs to the coordinator and
-	 *     we're executing the function on a worker node, manually mark it
-	 *     as "coordinator_host" given that we cannot know the host and port
-	 *   - If the initiator_node_identifier doesn't equal to zero, we know that
-	 *     it is a worker query initiated outside of a distributed
-	 *     transaction. However, we cannot know which node has initiated
-	 *     the worker query.
-	 */
-	initiator_node_identifier = ParseIntFieldFromHeapTuple(result, rowDescriptor, 1);
-	if (initiator_node_identifier > 0)
-	{
-		bool nodeExists = false;
+	int initiator_node_identifier = ParseIntFieldFromHeapTuple(result, rowDescriptor, 1);
 
-		initiatorWorkerNode = PrimaryNodeForGroup(initiator_node_identifier, &nodeExists);
-
-		/* a query should run on an existing node */
-		Assert(nodeExists);
-		citusDistStat->master_query_host_name =
-			cstring_to_text(initiatorWorkerNode->workerName);
-		citusDistStat->master_query_host_port = initiatorWorkerNode->workerPort;
-	}
-	else if (initiator_node_identifier == 0 && IsCoordinator())
-	{
-		citusDistStat->master_query_host_name = cstring_to_text(coordinator_host_name);
-		citusDistStat->master_query_host_port = PostPortNumber;
-	}
-	else if (initiator_node_identifier == 0)
-	{
-		citusDistStat->master_query_host_name = cstring_to_text(coordinator_host_name);
-		citusDistStat->master_query_host_port = 0;
-	}
-	else
-	{
-		citusDistStat->master_query_host_name = NULL;
-		citusDistStat->master_query_host_port = 0;
-	}
+	ReplaceInitiatorNodeIdentifier(initiator_node_identifier, citusDistStat);
 
 	citusDistStat->distributed_transaction_number =
 		ParseIntFieldFromHeapTuple(result, rowDescriptor, 2);
@@ -751,10 +700,9 @@ HeapTupleToCitusDistStat(HeapTuple result, TupleDesc rowDescriptor)
 static int64
 ParseIntFieldFromHeapTuple(HeapTuple tuple, TupleDesc tupdesc, int colIndex)
 {
-	Datum resultDatum;
 	bool isNull = false;
 
-	resultDatum = SPI_getbinval(tuple, tupdesc, colIndex, &isNull);
+	Datum resultDatum = SPI_getbinval(tuple, tupdesc, colIndex, &isNull);
 	if (isNull)
 	{
 		return 0;
@@ -771,10 +719,9 @@ ParseIntFieldFromHeapTuple(HeapTuple tuple, TupleDesc tupdesc, int colIndex)
 static text *
 ParseTextFieldFromHeapTuple(HeapTuple tuple, TupleDesc tupdesc, int colIndex)
 {
-	Datum resultDatum;
 	bool isNull = false;
 
-	resultDatum = SPI_getbinval(tuple, tupdesc, colIndex, &isNull);
+	Datum resultDatum = SPI_getbinval(tuple, tupdesc, colIndex, &isNull);
 	if (isNull)
 	{
 		return NULL;
@@ -791,10 +738,9 @@ ParseTextFieldFromHeapTuple(HeapTuple tuple, TupleDesc tupdesc, int colIndex)
 static Name
 ParseNameFieldFromHeapTuple(HeapTuple tuple, TupleDesc tupdesc, int colIndex)
 {
-	Datum resultDatum;
 	bool isNull = false;
 
-	resultDatum = SPI_getbinval(tuple, tupdesc, colIndex, &isNull);
+	Datum resultDatum = SPI_getbinval(tuple, tupdesc, colIndex, &isNull);
 	if (isNull)
 	{
 		return NULL;
@@ -811,10 +757,9 @@ ParseNameFieldFromHeapTuple(HeapTuple tuple, TupleDesc tupdesc, int colIndex)
 static inet *
 ParseInetFieldFromHeapTuple(HeapTuple tuple, TupleDesc tupdesc, int colIndex)
 {
-	Datum resultDatum;
 	bool isNull = false;
 
-	resultDatum = SPI_getbinval(tuple, tupdesc, colIndex, &isNull);
+	Datum resultDatum = SPI_getbinval(tuple, tupdesc, colIndex, &isNull);
 	if (isNull)
 	{
 		return NULL;
@@ -831,10 +776,9 @@ ParseInetFieldFromHeapTuple(HeapTuple tuple, TupleDesc tupdesc, int colIndex)
 static TimestampTz
 ParseTimestampTzFieldFromHeapTuple(HeapTuple tuple, TupleDesc tupdesc, int colIndex)
 {
-	Datum resultDatum;
 	bool isNull = false;
 
-	resultDatum = SPI_getbinval(tuple, tupdesc, colIndex, &isNull);
+	Datum resultDatum = SPI_getbinval(tuple, tupdesc, colIndex, &isNull);
 	if (isNull)
 	{
 		return DT_NOBEGIN;
@@ -851,10 +795,9 @@ ParseTimestampTzFieldFromHeapTuple(HeapTuple tuple, TupleDesc tupdesc, int colIn
 static TransactionId
 ParseXIDFieldFromHeapTuple(HeapTuple tuple, TupleDesc tupdesc, int colIndex)
 {
-	Datum resultDatum;
 	bool isNull = false;
 
-	resultDatum = SPI_getbinval(tuple, tupdesc, colIndex, &isNull);
+	Datum resultDatum = SPI_getbinval(tuple, tupdesc, colIndex, &isNull);
 	if (isNull)
 	{
 		/*
@@ -875,18 +818,14 @@ ParseXIDFieldFromHeapTuple(HeapTuple tuple, TupleDesc tupdesc, int colIndex)
 static text *
 ParseTextField(PGresult *result, int rowIndex, int colIndex)
 {
-	char *resultString = NULL;
-	Datum resultStringDatum = 0;
-	Datum textDatum = 0;
-
 	if (PQgetisnull(result, rowIndex, colIndex))
 	{
 		return NULL;
 	}
 
-	resultString = PQgetvalue(result, rowIndex, colIndex);
-	resultStringDatum = CStringGetDatum(resultString);
-	textDatum = DirectFunctionCall1(textin, resultStringDatum);
+	char *resultString = PQgetvalue(result, rowIndex, colIndex);
+	Datum resultStringDatum = CStringGetDatum(resultString);
+	Datum textDatum = DirectFunctionCall1(textin, resultStringDatum);
 
 	return (text *) DatumGetPointer(textDatum);
 }
@@ -899,8 +838,6 @@ ParseTextField(PGresult *result, int rowIndex, int colIndex)
 static Name
 ParseNameField(PGresult *result, int rowIndex, int colIndex)
 {
-	char *resultString = NULL;
-	Datum resultStringDatum = 0;
 	Datum nameDatum = 0;
 
 	if (PQgetisnull(result, rowIndex, colIndex))
@@ -908,8 +845,8 @@ ParseNameField(PGresult *result, int rowIndex, int colIndex)
 		return (Name) nameDatum;
 	}
 
-	resultString = PQgetvalue(result, rowIndex, colIndex);
-	resultStringDatum = CStringGetDatum(resultString);
+	char *resultString = PQgetvalue(result, rowIndex, colIndex);
+	Datum resultStringDatum = CStringGetDatum(resultString);
 	nameDatum = DirectFunctionCall1(namein, resultStringDatum);
 
 	return (Name) DatumGetPointer(nameDatum);
@@ -923,18 +860,14 @@ ParseNameField(PGresult *result, int rowIndex, int colIndex)
 static inet *
 ParseInetField(PGresult *result, int rowIndex, int colIndex)
 {
-	char *resultString = NULL;
-	Datum resultStringDatum = 0;
-	Datum inetDatum = 0;
-
 	if (PQgetisnull(result, rowIndex, colIndex))
 	{
 		return NULL;
 	}
 
-	resultString = PQgetvalue(result, rowIndex, colIndex);
-	resultStringDatum = CStringGetDatum(resultString);
-	inetDatum = DirectFunctionCall1(inet_in, resultStringDatum);
+	char *resultString = PQgetvalue(result, rowIndex, colIndex);
+	Datum resultStringDatum = CStringGetDatum(resultString);
+	Datum inetDatum = DirectFunctionCall1(inet_in, resultStringDatum);
 
 	return DatumGetInetP(inetDatum);
 }
@@ -947,10 +880,6 @@ ParseInetField(PGresult *result, int rowIndex, int colIndex)
 static TransactionId
 ParseXIDField(PGresult *result, int rowIndex, int colIndex)
 {
-	char *resultString = NULL;
-	Datum resultStringDatum = 0;
-	Datum XIDDatum = 0;
-
 	if (PQgetisnull(result, rowIndex, colIndex))
 	{
 		/*
@@ -960,9 +889,9 @@ ParseXIDField(PGresult *result, int rowIndex, int colIndex)
 		return PG_UINT32_MAX;
 	}
 
-	resultString = PQgetvalue(result, rowIndex, colIndex);
-	resultStringDatum = CStringGetDatum(resultString);
-	XIDDatum = DirectFunctionCall1(xidin, resultStringDatum);
+	char *resultString = PQgetvalue(result, rowIndex, colIndex);
+	Datum resultStringDatum = CStringGetDatum(resultString);
+	Datum XIDDatum = DirectFunctionCall1(xidin, resultStringDatum);
 
 	return DatumGetTransactionId(XIDDatum);
 }
@@ -974,49 +903,12 @@ ParseXIDField(PGresult *result, int rowIndex, int colIndex)
 static void
 ReturnCitusDistStats(List *citusStatsList, FunctionCallInfo fcinfo)
 {
-	ReturnSetInfo *resultInfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	TupleDesc tupleDesc = NULL;
-	Tuplestorestate *tupleStore = NULL;
-	MemoryContext per_query_ctx = NULL;
-	MemoryContext oldContext = NULL;
+	TupleDesc tupleDesc;
+	Tuplestorestate *tupleStore = SetupTuplestore(fcinfo, &tupleDesc);
 
-	ListCell *citusStatsCell = NULL;
-
-	/* check to see if caller supports us returning a tuplestore */
-	if (resultInfo == NULL || !IsA(resultInfo, ReturnSetInfo))
+	CitusDistStat *citusDistStat = NULL;
+	foreach_ptr(citusDistStat, citusStatsList)
 	{
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg(
-					 "set-valued function called in context that cannot accept a set")));
-	}
-	if (!(resultInfo->allowedModes & SFRM_Materialize))
-	{
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("materialize mode required, but it is not " \
-						"allowed in this context")));
-	}
-
-	/* Build a tuple descriptor for our result type */
-	if (get_call_result_type(fcinfo, NULL, &tupleDesc) != TYPEFUNC_COMPOSITE)
-	{
-		elog(ERROR, "return type must be a row type");
-	}
-
-	per_query_ctx = resultInfo->econtext->ecxt_per_query_memory;
-	oldContext = MemoryContextSwitchTo(per_query_ctx);
-
-	tupleStore = tuplestore_begin_heap(true, false, work_mem);
-	resultInfo->returnMode = SFRM_Materialize;
-	resultInfo->setResult = tupleStore;
-	resultInfo->setDesc = tupleDesc;
-	MemoryContextSwitchTo(oldContext);
-
-	foreach(citusStatsCell, citusStatsList)
-	{
-		CitusDistStat *citusDistStat = (CitusDistStat *) lfirst(citusStatsCell);
-
 		Datum values[CITUS_DIST_STAT_ACTIVITY_COLS];
 		bool nulls[CITUS_DIST_STAT_ACTIVITY_COLS];
 

@@ -1,3 +1,9 @@
+-- We have two different output files for this failure test because the
+-- failure behaviour of SAVEPOINT and RELEASE commands are different if
+-- we use the executor. If we use it, these commands error out if any of
+-- the placement commands fail. Otherwise, we might mark the placement
+-- as invalid and continue with a WARNING.
+
 SELECT citus.mitmproxy('conn.allow()');
 
 SET citus.shard_count = 2;
@@ -33,11 +39,11 @@ SELECT * FROM artists WHERE id IN (4, 5);
 SELECT citus.mitmproxy('conn.onQuery(query="^RELEASE").kill()');
 
 BEGIN;
-INSERT INTO artists VALUES (5, 'Asher Lev');
+UPDATE artists SET name='a';
 SAVEPOINT s1;
 DELETE FROM artists WHERE id=4;
 RELEASE SAVEPOINT s1;
-COMMIT;
+ROLLBACK;
 
 SELECT * FROM artists WHERE id IN (4, 5);
 
@@ -182,7 +188,21 @@ WHERE shardstate = 3 AND shardid IN (
 ) RETURNING placementid;
 TRUNCATE researchers;
 
+-- test that we don't mark reference placements unhealthy
+CREATE TABLE ref(a int, b int);
+SELECT create_reference_table('ref');
+
+SELECT citus.mitmproxy('conn.onQuery(query="^ROLLBACK").kill()');
+BEGIN;
+SAVEPOINT start;
+INSERT INTO ref VALUES (1001,2);
+SELECT * FROM ref;
+ROLLBACK TO SAVEPOINT start;
+SELECT * FROM ref;
+END;
+
 -- clean up
 SELECT citus.mitmproxy('conn.allow()');
 DROP TABLE artists;
 DROP TABLE researchers;
+DROP TABLE ref;

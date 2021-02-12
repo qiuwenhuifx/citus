@@ -4,12 +4,12 @@
  *	  definition of the "server" relation (pg_dist_placement).
  *
  * This table keeps information on remote shards and their whereabouts on the
- * master node. The table's contents are updated and used as follows: (i) the
+ * coordinator node. The table's contents are updated and used as follows: (i) the
  * worker nodes send periodic reports about the shards they contain, and (ii)
- * the master reconciles these shard reports, and determines outdated, under-
+ * the coordinator reconciles these shard reports, and determines outdated, under-
  * and over-replicated shards.
  *
- * Copyright (c) 2012-2016, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -25,7 +25,7 @@ typedef struct FormData_pg_dist_placement
 {
 	int64 placementid;          /* global placementId on remote node */
 	int64 shardid;              /* global shardId on remote node */
-	int32 shardstate;           /* shard state on remote node; see RelayFileState */
+	int32 shardstate;           /* shard state on remote node; see ShardState */
 	int64 shardlength;          /* shard length on remote node; stored as bigint */
 	int32 groupid;              /* the group the shard is placed on */
 } FormData_pg_dist_placement;

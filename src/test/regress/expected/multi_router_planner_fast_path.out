@@ -2,12 +2,12 @@ CREATE SCHEMA fast_path_router_select;
 SET search_path TO fast_path_router_select;
 SET citus.next_shard_id TO 1840000;
 -- all the tests in this file is intended for testing fast-path
--- router planner, so we're explicitly enabling itin this file. 
--- We've bunch of other tests that triggers non-fast-path-router 
+-- router planner, so we're explicitly enabling itin this file.
+-- We've bunch of other tests that triggers non-fast-path-router
 -- planner (note this is already true by default)
 SET citus.enable_fast_path_router_planner TO true;
 -- ===================================================================
--- test router planner functionality for via fast path on 
+-- test router planner functionality for via fast path on
 -- single shard select queries
 -- ===================================================================
 CREATE TABLE articles_hash (
@@ -36,16 +36,16 @@ CREATE TABLE authors_range ( name varchar(20), id bigint );
 SET citus.shard_replication_factor TO 1;
 SET citus.shard_count TO 2;
 SELECT create_distributed_table('articles_hash', 'author_id');
- create_distributed_table 
---------------------------
- 
+ create_distributed_table
+---------------------------------------------------------------------
+
 (1 row)
 
 CREATE TABLE authors_reference ( name varchar(20), id bigint );
 SELECT create_reference_table('authors_reference');
- create_reference_table 
-------------------------
- 
+ create_reference_table
+---------------------------------------------------------------------
+
 (1 row)
 
 -- create a bunch of test data
@@ -62,16 +62,14 @@ INSERT INTO articles_hash VALUES (1,  1, 'arsenous', 9572), (2,  2, 'abducing', 
 								 (40, 10, 'attemper', 14976),(41,  1, 'aznavour', 11814),(42,  2, 'ausable', 15885),(43,  3, 'affixal', 12723),
 								 (44,  4, 'anteport', 16793),(45,  5, 'afrasia', 864),(46,  6, 'atlanta', 17702),(47,  7, 'abeyance', 1772),
 								 (48,  8, 'alkylic', 18610),(49,  9, 'anyone', 2681),(50, 10, 'anjanette', 19519);
-SET citus.task_executor_type TO 'real-time';
 SET client_min_messages TO 'DEBUG2';
 -- test simple select for a single row
 SELECT * FROM articles_hash WHERE author_id = 10 AND id = 50;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 10
- id | author_id |   title   | word_count 
-----+-----------+-----------+------------
+DEBUG:  query has a single distribution column value: 10
+ id | author_id |   title   | word_count
+---------------------------------------------------------------------
  50 |        10 | anjanette |      19519
 (1 row)
 
@@ -79,10 +77,9 @@ DETAIL:  distribution column value: 10
 SELECT title FROM articles_hash WHERE author_id = 10;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 10
-   title    
-------------
+DEBUG:  query has a single distribution column value: 10
+   title
+---------------------------------------------------------------------
  aggrandize
  absentness
  andelee
@@ -96,10 +93,9 @@ SELECT title, word_count FROM articles_hash
 	ORDER BY word_count DESC NULLS LAST;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 10
-   title    | word_count 
-------------+------------
+DEBUG:  query has a single distribution column value: 10
+   title    | word_count
+---------------------------------------------------------------------
  anjanette  |      19519
  aggrandize |      17277
  attemper   |      14976
@@ -114,10 +110,9 @@ SELECT title, id FROM articles_hash
 	LIMIT 2;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 5
-  title  | id 
----------+----
+DEBUG:  query has a single distribution column value: 5
+  title  | id
+---------------------------------------------------------------------
  aruru   |  5
  adversa | 15
 (2 rows)
@@ -129,9 +124,8 @@ SELECT title, author_id FROM articles_hash
 	WHERE author_id = 7 OR author_id = 8
 	ORDER BY author_id ASC, id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-    title    | author_id 
--------------+-----------
+    title    | author_id
+---------------------------------------------------------------------
  aseptic     |         7
  auriga      |         7
  arsenous    |         7
@@ -153,17 +147,17 @@ SELECT author_id, sum(word_count) AS corpus_size FROM articles_hash
 	ORDER BY sum(word_count) DESC;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- author_id | corpus_size 
------------+-------------
+DEBUG:  query has a single distribution column value: 1
+ author_id | corpus_size
+---------------------------------------------------------------------
          1 |       35894
 (1 row)
 
 -- fast path planner only support = operator
-SELECT * FROM articles_hash WHERE author_id <= 1; 
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+SELECT * FROM articles_hash WHERE author_id <= 1;
+DEBUG:  Router planner cannot handle multi-shard select queries
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -171,11 +165,10 @@ SELECT * FROM articles_hash WHERE author_id <= 1;
  41 |         1 | aznavour     |      11814
 (5 rows)
 
-SELECT * FROM articles_hash WHERE author_id IN (1, 3); 
+SELECT * FROM articles_hash WHERE author_id IN (1, 3);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
   3 |         3 | asternal     |      10480
  11 |         1 | alamo        |       1347
@@ -191,11 +184,11 @@ DEBUG:  Plan is router executable
 -- queries with CTEs cannot go through fast-path planning
 WITH first_author AS ( SELECT id FROM articles_hash WHERE author_id = 1)
 SELECT * FROM first_author;
+DEBUG:  CTE first_author is going to be inlined via distributed planning
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id 
-----
+DEBUG:  query has a single distribution column value: 1
+ id
+---------------------------------------------------------------------
   1
  11
  21
@@ -207,11 +200,12 @@ DETAIL:  distribution column value: 1
 WITH id_author AS ( SELECT id, author_id FROM articles_hash WHERE author_id = 1),
 id_title AS (SELECT id, title from articles_hash WHERE author_id = 1)
 SELECT * FROM id_author, id_title WHERE id_author.id = id_title.id;
+DEBUG:  CTE id_author is going to be inlined via distributed planning
+DEBUG:  CTE id_title is going to be inlined via distributed planning
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id | id |    title     
-----+-----------+----+--------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id | id |    title
+---------------------------------------------------------------------
   1 |         1 |  1 | arsenous
  11 |         1 | 11 | alamo
  21 |         1 | 21 | arcading
@@ -220,86 +214,70 @@ DETAIL:  distribution column value: 1
 (5 rows)
 
 -- this is a different case where each CTE is recursively planned and those goes
--- through the fast-path router planner, but the top level join is not  
+-- through the fast-path router planner, but the top level join is not
 WITH id_author AS ( SELECT id, author_id FROM articles_hash WHERE author_id = 1),
 id_title AS (SELECT id, title from articles_hash WHERE author_id = 2)
 SELECT * FROM id_author, id_title WHERE id_author.id = id_title.id;
-DEBUG:  generating subplan 12_1 for CTE id_author: SELECT id, author_id FROM fast_path_router_select.articles_hash WHERE (author_id OPERATOR(pg_catalog.=) 1)
+DEBUG:  CTE id_author is going to be inlined via distributed planning
+DEBUG:  CTE id_title is going to be inlined via distributed planning
+DEBUG:  cannot run command which targets multiple shards
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
-DEBUG:  generating subplan 12_2 for CTE id_title: SELECT id, title FROM fast_path_router_select.articles_hash WHERE (author_id OPERATOR(pg_catalog.=) 2)
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  query has a single distribution column value: 2
+DEBUG:  generating subplan XXX_1 for subquery SELECT id, title FROM fast_path_router_select.articles_hash WHERE (author_id OPERATOR(pg_catalog.=) 2)
+DEBUG:  Plan XXX query after replacing subqueries and CTEs: SELECT id_author.id, id_author.author_id, id_title.id, id_title.title FROM (SELECT articles_hash.id, articles_hash.author_id FROM fast_path_router_select.articles_hash WHERE (articles_hash.author_id OPERATOR(pg_catalog.=) 1)) id_author, (SELECT intermediate_result.id, intermediate_result.title FROM read_intermediate_result('XXX_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, title character varying(20))) id_title WHERE (id_author.id OPERATOR(pg_catalog.=) id_title.id)
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 2
-DEBUG:  Plan 12 query after replacing subqueries and CTEs: SELECT id_author.id, id_author.author_id, id_title.id, id_title.title FROM (SELECT intermediate_result.id, intermediate_result.author_id FROM read_intermediate_result('12_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, author_id bigint)) id_author, (SELECT intermediate_result.id, intermediate_result.title FROM read_intermediate_result('12_2'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, title character varying(20))) id_title WHERE (id_author.id OPERATOR(pg_catalog.=) id_title.id)
-DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- id | author_id | id | title 
-----+-----------+----+-------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id | id | title
+---------------------------------------------------------------------
 (0 rows)
 
-CREATE TABLE company_employees (company_id int, employee_id int, manager_id int); 
+CREATE TABLE company_employees (company_id int, employee_id int, manager_id int);
 SELECT master_create_distributed_table('company_employees', 'company_id', 'hash');
- master_create_distributed_table 
----------------------------------
- 
+ master_create_distributed_table
+---------------------------------------------------------------------
+
 (1 row)
 
+-- do not print notices from workers since the order is not deterministic
+SET client_min_messages TO DEFAULT;
 SELECT master_create_worker_shards('company_employees', 4, 1);
-DEBUG:  schema "fast_path_router_select" already exists, skipping
-DETAIL:  NOTICE from localhost:57637
-DEBUG:  schema "fast_path_router_select" already exists, skipping
-DETAIL:  NOTICE from localhost:57638
-DEBUG:  schema "fast_path_router_select" already exists, skipping
-DETAIL:  NOTICE from localhost:57637
-DEBUG:  schema "fast_path_router_select" already exists, skipping
-DETAIL:  NOTICE from localhost:57638
- master_create_worker_shards 
------------------------------
- 
+ master_create_worker_shards
+---------------------------------------------------------------------
+
 (1 row)
 
+SET client_min_messages TO 'DEBUG2';
 INSERT INTO company_employees values(1, 1, 0);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
 INSERT INTO company_employees values(1, 2, 1);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
 INSERT INTO company_employees values(1, 3, 1);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
 INSERT INTO company_employees values(1, 4, 2);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
 INSERT INTO company_employees values(1, 5, 4);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
 INSERT INTO company_employees values(3, 1, 0);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 3
+DEBUG:  query has a single distribution column value: 3
 INSERT INTO company_employees values(3, 15, 1);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 3
+DEBUG:  query has a single distribution column value: 3
 INSERT INTO company_employees values(3, 3, 1);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 3
+DEBUG:  query has a single distribution column value: 3
 -- recursive CTEs are also cannot go through fast
 -- path planning
 WITH RECURSIVE hierarchy as (
 	SELECT *, 1 AS level
 		FROM company_employees
-		WHERE company_id = 1 and manager_id = 0 
+		WHERE company_id = 1 and manager_id = 0
 	UNION
 	SELECT ce.*, (h.level+1)
 		FROM hierarchy h JOIN company_employees ce
@@ -308,10 +286,9 @@ WITH RECURSIVE hierarchy as (
 				ce.company_id = 1))
 SELECT * FROM hierarchy WHERE LEVEL <= 2;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- company_id | employee_id | manager_id | level 
-------------+-------------+------------+-------
+DEBUG:  query has a single distribution column value: 1
+ company_id | employee_id | manager_id | level
+---------------------------------------------------------------------
           1 |           1 |          0 |     1
           1 |           2 |          1 |     2
           1 |           3 |          1 |     2
@@ -321,30 +298,26 @@ WITH update_article AS (
     UPDATE articles_hash SET word_count = 10 WHERE id = 1 AND word_count = 9 RETURNING *
 )
 SELECT * FROM update_article;
-DEBUG:  data-modifying statements are not supported in the WITH clauses of distributed queries
-DEBUG:  generating subplan 24_1 for CTE update_article: UPDATE fast_path_router_select.articles_hash SET word_count = 10 WHERE ((id OPERATOR(pg_catalog.=) 1) AND (word_count OPERATOR(pg_catalog.=) 9)) RETURNING id, author_id, title, word_count
+DEBUG:  Router planner cannot handle multi-shard select queries
+DEBUG:  generating subplan XXX_1 for CTE update_article: UPDATE fast_path_router_select.articles_hash SET word_count = 10 WHERE ((id OPERATOR(pg_catalog.=) 1) AND (word_count OPERATOR(pg_catalog.=) 9)) RETURNING id, author_id, title, word_count
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DEBUG:  Plan 24 query after replacing subqueries and CTEs: SELECT id, author_id, title, word_count FROM (SELECT intermediate_result.id, intermediate_result.author_id, intermediate_result.title, intermediate_result.word_count FROM read_intermediate_result('24_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, author_id bigint, title character varying(20), word_count integer)) update_article
+DEBUG:  Plan XXX query after replacing subqueries and CTEs: SELECT id, author_id, title, word_count FROM (SELECT intermediate_result.id, intermediate_result.author_id, intermediate_result.title, intermediate_result.word_count FROM read_intermediate_result('XXX_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, author_id bigint, title character varying(20), word_count integer)) update_article
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- id | author_id | title | word_count 
-----+-----------+-------+------------
+ id | author_id | title | word_count
+---------------------------------------------------------------------
 (0 rows)
 
 WITH delete_article AS (
     DELETE FROM articles_hash WHERE id = 1 AND word_count = 10 RETURNING *
 )
 SELECT * FROM delete_article;
-DEBUG:  data-modifying statements are not supported in the WITH clauses of distributed queries
-DEBUG:  generating subplan 26_1 for CTE delete_article: DELETE FROM fast_path_router_select.articles_hash WHERE ((id OPERATOR(pg_catalog.=) 1) AND (word_count OPERATOR(pg_catalog.=) 10)) RETURNING id, author_id, title, word_count
+DEBUG:  Router planner cannot handle multi-shard select queries
+DEBUG:  generating subplan XXX_1 for CTE delete_article: DELETE FROM fast_path_router_select.articles_hash WHERE ((id OPERATOR(pg_catalog.=) 1) AND (word_count OPERATOR(pg_catalog.=) 10)) RETURNING id, author_id, title, word_count
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DEBUG:  Plan 26 query after replacing subqueries and CTEs: SELECT id, author_id, title, word_count FROM (SELECT intermediate_result.id, intermediate_result.author_id, intermediate_result.title, intermediate_result.word_count FROM read_intermediate_result('26_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, author_id bigint, title character varying(20), word_count integer)) delete_article
+DEBUG:  Plan XXX query after replacing subqueries and CTEs: SELECT id, author_id, title, word_count FROM (SELECT intermediate_result.id, intermediate_result.author_id, intermediate_result.title, intermediate_result.word_count FROM read_intermediate_result('XXX_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, author_id bigint, title character varying(20), word_count integer)) delete_article
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- id | author_id | title | word_count 
-----+-----------+-------+------------
+ id | author_id | title | word_count
+---------------------------------------------------------------------
 (0 rows)
 
 -- grouping sets are supported via fast-path
@@ -356,10 +329,9 @@ SELECT
 	ORDER BY id, subtitle;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | subtitle | count 
-----+----------+-------
+DEBUG:  query has a single distribution column value: 1
+ id | subtitle | count
+---------------------------------------------------------------------
   1 |          |     1
  11 |          |     1
  21 |          |     1
@@ -378,15 +350,15 @@ SELECT
 	WHERE author_id = 1 or author_id = 2
 	GROUP BY GROUPING SETS ((id),(subtitle))
 	ORDER BY id, subtitle;
+DEBUG:  Router planner cannot handle multi-shard select queries
 ERROR:  could not run distributed query with GROUPING SETS, CUBE, or ROLLUP
 HINT:  Consider using an equality filter on the distributed table's partition column.
 -- queries which involve functions in FROM clause are not supported via fast path planning
 SELECT * FROM articles_hash, position('om' in 'Thomas') WHERE author_id = 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |    title     | word_count | position 
-----+-----------+--------------+------------+----------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id |    title     | word_count | position
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572 |        3
  11 |         1 | alamo        |       1347 |        3
  21 |         1 | arcading     |       5890 |        3
@@ -399,10 +371,9 @@ SELECT * FROM articles_hash
 WHERE author_id IN (SELECT author_id FROM articles_hash WHERE author_id = 2)
 ORDER BY articles_hash.id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 2
- id | author_id |   title    | word_count 
-----+-----------+------------+------------
+DEBUG:  query has a single distribution column value: 2
+ id | author_id |   title    | word_count
+---------------------------------------------------------------------
   2 |         2 | abducing   |      13642
  12 |         2 | archiblast |      18185
  22 |         2 | antipope   |       2728
@@ -414,11 +385,14 @@ DETAIL:  distribution column value: 2
 SELECT articles_hash.id,test.word_count
 FROM articles_hash, (SELECT id, word_count FROM articles_hash) AS test WHERE test.id = articles_hash.id
 ORDER BY test.word_count DESC, articles_hash.id LIMIT 5;
-DEBUG:  generating subplan 32_1 for subquery SELECT id, word_count FROM fast_path_router_select.articles_hash
-DEBUG:  Plan 32 query after replacing subqueries and CTEs: SELECT articles_hash.id, test.word_count FROM fast_path_router_select.articles_hash, (SELECT intermediate_result.id, intermediate_result.word_count FROM read_intermediate_result('32_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, word_count integer)) test WHERE (test.id OPERATOR(pg_catalog.=) articles_hash.id) ORDER BY test.word_count DESC, articles_hash.id LIMIT 5
+DEBUG:  Router planner cannot handle multi-shard select queries
+DEBUG:  Router planner cannot handle multi-shard select queries
+DEBUG:  generating subplan XXX_1 for subquery SELECT id, word_count FROM fast_path_router_select.articles_hash
+DEBUG:  Plan XXX query after replacing subqueries and CTEs: SELECT articles_hash.id, test.word_count FROM fast_path_router_select.articles_hash, (SELECT intermediate_result.id, intermediate_result.word_count FROM read_intermediate_result('XXX_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, word_count integer)) test WHERE (test.id OPERATOR(pg_catalog.=) articles_hash.id) ORDER BY test.word_count DESC, articles_hash.id LIMIT 5
+DEBUG:  Router planner cannot handle multi-shard select queries
 DEBUG:  push down of limit count: 5
- id | word_count 
-----+------------
+ id | word_count
+---------------------------------------------------------------------
  50 |      19519
  14 |      19094
  48 |      18610
@@ -427,16 +401,17 @@ DEBUG:  push down of limit count: 5
 (5 rows)
 
 SELECT articles_hash.id,test.word_count
-FROM articles_hash, (SELECT id, word_count FROM articles_hash) AS test 
+FROM articles_hash, (SELECT id, word_count FROM articles_hash) AS test
 WHERE test.id = articles_hash.id and articles_hash.author_id = 1
 ORDER BY articles_hash.id;
-DEBUG:  generating subplan 34_1 for subquery SELECT id, word_count FROM fast_path_router_select.articles_hash
-DEBUG:  Plan 34 query after replacing subqueries and CTEs: SELECT articles_hash.id, test.word_count FROM fast_path_router_select.articles_hash, (SELECT intermediate_result.id, intermediate_result.word_count FROM read_intermediate_result('34_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, word_count integer)) test WHERE ((test.id OPERATOR(pg_catalog.=) articles_hash.id) AND (articles_hash.author_id OPERATOR(pg_catalog.=) 1)) ORDER BY articles_hash.id
+DEBUG:  Router planner cannot handle multi-shard select queries
+DEBUG:  Router planner cannot handle multi-shard select queries
+DEBUG:  generating subplan XXX_1 for subquery SELECT id, word_count FROM fast_path_router_select.articles_hash
+DEBUG:  Plan XXX query after replacing subqueries and CTEs: SELECT articles_hash.id, test.word_count FROM fast_path_router_select.articles_hash, (SELECT intermediate_result.id, intermediate_result.word_count FROM read_intermediate_result('XXX_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, word_count integer)) test WHERE ((test.id OPERATOR(pg_catalog.=) articles_hash.id) AND (articles_hash.author_id OPERATOR(pg_catalog.=) 1)) ORDER BY articles_hash.id
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | word_count 
-----+------------
+DEBUG:  query has a single distribution column value: 1
+ id | word_count
+---------------------------------------------------------------------
   1 |       9572
  11 |       1347
  21 |       5890
@@ -447,19 +422,17 @@ DETAIL:  distribution column value: 1
 -- subqueries are not supported in SELECT clause
 SELECT a.title AS name, (SELECT a2.id FROM articles_hash a2 WHERE a.id = a2.id  LIMIT 1)
 						 AS special_price FROM articles_hash a;
-DEBUG:  skipping recursive planning for the subquery since it contains references to outer queries
-ERROR:  could not run distributed query with subquery outside the FROM and WHERE clauses
-HINT:  Consider using an equality filter on the distributed table's partition column.
+DEBUG:  Router planner cannot handle multi-shard select queries
+ERROR:  complex joins are only supported when all distributed tables are co-located and joined on their distribution columns
 -- simple lookup query just works
 SELECT *
 	FROM articles_hash
 	WHERE author_id = 1;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -473,9 +446,8 @@ SELECT *
 	FROM articles_hash
 	WHERE author_id = 1 OR author_id = 17;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -489,10 +461,9 @@ SELECT id as article_id, word_count * id as random_value
 	WHERE author_id = 1;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- article_id | random_value 
-------------+--------------
+DEBUG:  query has a single distribution column value: 1
+ article_id | random_value
+---------------------------------------------------------------------
           1 |         9572
          11 |        14817
          21 |       123690
@@ -506,10 +477,9 @@ SELECT a.author_id as first_author, b.word_count as second_word_count
 	WHERE a.author_id = 10 and a.author_id = b.author_id
 	LIMIT 3;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 10
- first_author | second_word_count 
---------------+-------------------
+DEBUG:  query has a single distribution column value: 10
+ first_author | second_word_count
+---------------------------------------------------------------------
            10 |             17277
            10 |              1820
            10 |              6363
@@ -522,10 +492,9 @@ SELECT *
 	LIMIT 3;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |  title   | word_count 
-----+-----------+----------+------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id |  title   | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous |       9572
  11 |         1 | alamo    |       1347
  21 |         1 | arcading |       5890
@@ -539,10 +508,9 @@ SELECT *
 	OFFSET 1;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |  title   | word_count 
-----+-----------+----------+------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id |  title   | word_count
+---------------------------------------------------------------------
  11 |         1 | alamo    |       1347
  21 |         1 | arcading |       5890
 (2 rows)
@@ -556,15 +524,13 @@ SELECT *
 	OFFSET 1;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
  31 |         1 | athwartships |       7271
  21 |         1 | arcading     |       5890
 (2 rows)
 
-	
 -- single shard select with group by on non-partition column goes through fast-path planning
 SELECT id
 	FROM articles_hash
@@ -573,10 +539,9 @@ SELECT id
 	ORDER BY id;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id 
-----
+DEBUG:  query has a single distribution column value: 1
+ id
+---------------------------------------------------------------------
   1
  11
  21
@@ -591,10 +556,9 @@ SELECT DISTINCT id
 	ORDER BY id;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id 
-----
+DEBUG:  query has a single distribution column value: 1
+ id
+---------------------------------------------------------------------
   1
  11
  21
@@ -608,10 +572,9 @@ SELECT avg(word_count)
 	WHERE author_id = 2;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 2
-        avg         
---------------------
+DEBUG:  query has a single distribution column value: 2
+        avg
+---------------------------------------------------------------------
  12356.400000000000
 (1 row)
 
@@ -622,10 +585,9 @@ SELECT max(word_count) as max, min(word_count) as min,
 	WHERE author_id = 2;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 2
-  max  | min  |  sum  | cnt 
--------+------+-------+-----
+DEBUG:  query has a single distribution column value: 2
+  max  | min  |  sum  | cnt
+---------------------------------------------------------------------
  18185 | 2728 | 61782 |   5
 (1 row)
 
@@ -636,10 +598,9 @@ SELECT max(word_count)
 	GROUP BY author_id;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
-  max  
--------
+DEBUG:  query has a single distribution column value: 1
+  max
+---------------------------------------------------------------------
  11814
 (1 row)
 
@@ -651,9 +612,8 @@ SELECT * FROM (
 ) AS combination
 ORDER BY id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
   3 |         3 | asternal     |      10480
  11 |         1 | alamo        |       1347
@@ -671,8 +631,6 @@ SELECT LEFT(title, 1) FROM articles_hash WHERE author_id = 1
 -- top-level union queries are supported through recursive planning
 SET client_min_messages to 'NOTICE';
 ERROR:  syntax error at or near "SET"
-LINE 3: SET client_min_messages to 'NOTICE';
-        ^
 -- unions in subqueries are not supported via fast-path planning
 SELECT * FROM (
 	(SELECT * FROM articles_hash WHERE author_id = 1)
@@ -681,10 +639,9 @@ SELECT * FROM (
 ORDER BY 1, 2
 LIMIT 5;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -694,16 +651,15 @@ DETAIL:  distribution column value: 1
 
 -- Test various filtering options for router plannable check
 SET client_min_messages to 'DEBUG2';
--- cannot go through fast-path if there is 
+-- cannot go through fast-path if there is
 -- explicit coercion
 SELECT *
 	FROM articles_hash
 	WHERE author_id = 1::bigint;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -711,7 +667,7 @@ DETAIL:  distribution column value: 1
  41 |         1 | aznavour     |      11814
 (5 rows)
 
--- can go through fast-path if there is 
+-- can go through fast-path if there is
 -- implicit coercion
 -- This doesn't work see the related issue
 -- reported https://github.com/citusdata/citus/issues/2605
@@ -723,10 +679,9 @@ SELECT *
 	WHERE author_id = 68719476736; -- this is bigint
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 68719476736
- id | author_id | title | word_count 
-----+-----------+-------+------------
+DEBUG:  query has a single distribution column value: 68719476736
+ id | author_id | title | word_count
+---------------------------------------------------------------------
 (0 rows)
 
 -- cannot go through fast-path due to
@@ -735,10 +690,9 @@ SELECT *
 	FROM articles_hash
 	WHERE author_id = 1 and author_id >= 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -751,8 +705,9 @@ DETAIL:  distribution column value: 1
 SELECT *
 	FROM articles_hash
 	WHERE author_id = 1 or id = 1;
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+DEBUG:  Router planner cannot handle multi-shard select queries
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -760,7 +715,6 @@ SELECT *
  41 |         1 | aznavour     |      11814
 (5 rows)
 
-	
 -- goes through fast-path planning because
 -- the dist. key is ANDed with the rest of the
 -- filters
@@ -769,10 +723,9 @@ SELECT *
 	WHERE author_id = 1 and (id = 1 or id = 41);
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |  title   | word_count 
-----+-----------+----------+------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id |  title   | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous |       9572
  41 |         1 | aznavour |      11814
 (2 rows)
@@ -782,8 +735,9 @@ DETAIL:  distribution column value: 1
 SELECT *
 	FROM articles_hash
 	WHERE author_id = 1 and id = 1 or id = 41;
- id | author_id |  title   | word_count 
-----+-----------+----------+------------
+DEBUG:  Router planner cannot handle multi-shard select queries
+ id | author_id |  title   | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous |       9572
  41 |         1 | aznavour |      11814
 (2 rows)
@@ -796,18 +750,18 @@ SELECT *
 	WHERE author_id = 1 and (id = random()::int  * 0);
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id | title | word_count 
-----+-----------+-------+------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id | title | word_count
+---------------------------------------------------------------------
 (0 rows)
 
 -- not router plannable due to function call on the right side
 SELECT *
 	FROM articles_hash
 	WHERE author_id = (random()::int  * 0 + 1);
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+DEBUG:  Router planner cannot handle multi-shard select queries
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -815,17 +769,15 @@ SELECT *
  41 |         1 | aznavour     |      11814
 (5 rows)
 
-	
 -- Citus does not qualify this as a fast-path because
--- dist_key = func() 
+-- dist_key = func()
 SELECT *
 	FROM articles_hash
 	WHERE author_id = abs(-1);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -834,12 +786,13 @@ DETAIL:  distribution column value: 1
 (5 rows)
 
 -- Citus does not qualify this as a fast-path because
--- dist_key = func() 
+-- dist_key = func()
 SELECT *
 	FROM articles_hash
 	WHERE 1 = abs(author_id);
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+DEBUG:  Router planner cannot handle multi-shard select queries
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -848,12 +801,13 @@ SELECT *
 (5 rows)
 
 -- Citus does not qualify this as a fast-path because
--- dist_key = func() 
+-- dist_key = func()
 SELECT *
 	FROM articles_hash
 	WHERE author_id = abs(author_id - 2);
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+DEBUG:  Router planner cannot handle multi-shard select queries
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -868,10 +822,9 @@ SELECT *
 	WHERE author_id = 1 and (id = abs(id - 2));
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |  title   | word_count 
-----+-----------+----------+------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id |  title   | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous |       9572
 (1 row)
 
@@ -879,8 +832,9 @@ DETAIL:  distribution column value: 1
 SELECT *
 	FROM articles_hash
 	WHERE (author_id = 1) is true;
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+DEBUG:  Router planner cannot handle multi-shard select queries
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -893,10 +847,9 @@ SELECT *
 	FROM articles_hash
 	WHERE (author_id = 1) = true;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -908,64 +861,64 @@ DETAIL:  distribution column value: 1
 SELECT count(*) FROM articles_hash WHERE (author_id = 15) AND (id = 1 OR word_count > 5);
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 15
- count 
--------
+DEBUG:  query has a single distribution column value: 15
+ count
+---------------------------------------------------------------------
      0
 (1 row)
 
 SELECT count(*) FROM articles_hash WHERE (author_id = 15) OR (id = 1 AND word_count > 5);
- count 
--------
+DEBUG:  Router planner cannot handle multi-shard select queries
+ count
+---------------------------------------------------------------------
      1
 (1 row)
 
 SELECT count(*) FROM articles_hash WHERE (id = 15) OR (author_id = 1 AND word_count > 5);
- count 
--------
+DEBUG:  Router planner cannot handle multi-shard select queries
+ count
+---------------------------------------------------------------------
      6
 (1 row)
 
 SELECT count(*) FROM articles_hash WHERE (id = 15) AND (author_id = 1 OR word_count > 5);
- count 
--------
+DEBUG:  Router planner cannot handle multi-shard select queries
+ count
+---------------------------------------------------------------------
      1
 (1 row)
 
 SELECT count(*) FROM articles_hash WHERE (id = 15) AND (author_id = 1 AND (word_count > 5 OR id  = 2));
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- count 
--------
+DEBUG:  query has a single distribution column value: 1
+ count
+---------------------------------------------------------------------
      0
 (1 row)
 
 SELECT count(*) FROM articles_hash WHERE (id = 15) AND (title ilike 'a%' AND (word_count > 5 OR author_id  = 2));
- count 
--------
+DEBUG:  Router planner cannot handle multi-shard select queries
+ count
+---------------------------------------------------------------------
      1
 (1 row)
 
 SELECT count(*) FROM articles_hash WHERE (id = 15) AND (title ilike 'a%' AND (word_count > 5 AND author_id  = 2));
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 2
- count 
--------
+DEBUG:  query has a single distribution column value: 2
+ count
+---------------------------------------------------------------------
      0
 (1 row)
 
 SELECT count(*) FROM articles_hash WHERE (id = 15) AND (title ilike 'a%' AND ((word_count > 5 OR title ilike 'b%' ) AND (author_id  = 2 AND word_count > 50)));
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 2
- count 
--------
+DEBUG:  query has a single distribution column value: 2
+ count
+---------------------------------------------------------------------
      0
 (1 row)
 
@@ -975,10 +928,9 @@ SELECT *
 	WHERE (author_id = 1) and id between 0 and 20;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |  title   | word_count 
-----+-----------+----------+------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id |  title   | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous |       9572
  11 |         1 | alamo    |       1347
 (2 rows)
@@ -989,10 +941,9 @@ SELECT *
 	WHERE (author_id = 1) and (id = 1 or id = 31) and title like '%s';
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  31 |         1 | athwartships |       7271
 (2 rows)
@@ -1003,10 +954,9 @@ SELECT *
 	WHERE (id = 1 or id = 31) and title like '%s' and (author_id = 1);
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  31 |         1 | athwartships |       7271
 (2 rows)
@@ -1017,10 +967,9 @@ SELECT *
 	WHERE (title like '%s' or title like 'a%') and (author_id = 1);
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -1034,25 +983,23 @@ SELECT *
 	WHERE (title like '%s' or title like 'a%') and (author_id = 1) and (word_count < 3000 or word_count > 8000);
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |  title   | word_count 
-----+-----------+----------+------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id |  title   | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous |       9572
  11 |         1 | alamo    |       1347
  41 |         1 | aznavour |      11814
 (3 rows)
 
 -- window functions are supported with fast-path router plannable
-SELECT LAG(title, 1) over (ORDER BY word_count) prev, title, word_count 
+SELECT LAG(title, 1) over (ORDER BY word_count) prev, title, word_count
 	FROM articles_hash
 	WHERE author_id = 5;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 5
-   prev   |  title   | word_count 
-----------+----------+------------
+DEBUG:  query has a single distribution column value: 5
+   prev   |  title   | word_count
+---------------------------------------------------------------------
           | afrasia  |        864
  afrasia  | adversa  |       3164
  adversa  | antehall |       7707
@@ -1060,16 +1007,15 @@ DETAIL:  distribution column value: 5
  aminate  | aruru    |      11389
 (5 rows)
 
-SELECT LAG(title, 1) over (ORDER BY word_count) prev, title, word_count 
+SELECT LAG(title, 1) over (ORDER BY word_count) prev, title, word_count
 	FROM articles_hash
 	WHERE author_id = 5
 	ORDER BY word_count DESC;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 5
-   prev   |  title   | word_count 
-----------+----------+------------
+DEBUG:  query has a single distribution column value: 5
+   prev   |  title   | word_count
+---------------------------------------------------------------------
  aminate  | aruru    |      11389
  antehall | aminate  |       9089
  adversa  | antehall |       7707
@@ -1082,10 +1028,9 @@ SELECT id, MIN(id) over (order by word_count)
 	WHERE author_id = 1;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | min 
-----+-----
+DEBUG:  query has a single distribution column value: 1
+ id | min
+---------------------------------------------------------------------
  11 |  11
  21 |  11
  31 |  11
@@ -1098,10 +1043,9 @@ SELECT id, word_count, AVG(word_count) over (order by word_count)
 	WHERE author_id = 1;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | word_count |          avg          
-----+------------+-----------------------
+DEBUG:  query has a single distribution column value: 1
+ id | word_count |          avg
+---------------------------------------------------------------------
  11 |       1347 | 1347.0000000000000000
  21 |       5890 | 3618.5000000000000000
  31 |       7271 | 4836.0000000000000000
@@ -1109,15 +1053,14 @@ DETAIL:  distribution column value: 1
  41 |      11814 | 7178.8000000000000000
 (5 rows)
 
-SELECT word_count, rank() OVER (PARTITION BY author_id ORDER BY word_count)  
-	FROM articles_hash 
+SELECT word_count, rank() OVER (PARTITION BY author_id ORDER BY word_count)
+	FROM articles_hash
 	WHERE author_id = 1;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- word_count | rank 
-------------+------
+DEBUG:  query has a single distribution column value: 1
+ word_count | rank
+---------------------------------------------------------------------
        1347 |    1
        5890 |    2
        7271 |    3
@@ -1128,7 +1071,7 @@ DETAIL:  distribution column value: 1
 -- some more tests on complex target lists
 SELECT DISTINCT ON (author_id, id) author_id, id,
 	MIN(id) over (order by avg(word_count)) * AVG(id * 5.2 + (1.0/max(word_count))) over (order by max(word_count)) as t1,
-	count(*) FILTER (WHERE title LIKE 'al%') as cnt_with_filter, 
+	count(*) FILTER (WHERE title LIKE 'al%') as cnt_with_filter,
 	count(*) FILTER (WHERE '0300030' LIKE '%3%') as cnt_with_filter_2,
 	avg(case when id > 2 then char_length(word_count::text) * (id * strpos(word_count::text, '1')) end) as case_cnt,
 	COALESCE(strpos(avg(word_count)::text, '1'), 20)
@@ -1139,10 +1082,9 @@ SELECT DISTINCT ON (author_id, id) author_id, id,
 	ORDER BY author_id, id, sum(word_count) - avg(char_length(title)) DESC, COALESCE(array_upper(ARRAY[max(id)],1) * 5,0) DESC;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- author_id | id |              t1              | cnt_with_filter | cnt_with_filter_2 |        case_cnt        | coalesce 
------------+----+------------------------------+-----------------+-------------------+------------------------+----------
+DEBUG:  query has a single distribution column value: 1
+ author_id | id |              t1              | cnt_with_filter | cnt_with_filter_2 |        case_cnt        | coalesce
+---------------------------------------------------------------------
          1 |  1 |      83.20028854345579490574 |               0 |                 1 |                        |        0
          1 | 11 |     629.20816629547141796586 |               1 |                 1 |    44.0000000000000000 |        1
          1 | 21 |     915.20501693381380745499 |               0 |                 1 | 0.00000000000000000000 |        0
@@ -1151,58 +1093,53 @@ DETAIL:  distribution column value: 1
 (5 rows)
 
 -- where false queries are router plannable but not fast-path
-SELECT * 
+SELECT *
 	FROM articles_hash
 	WHERE false;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- id | author_id | title | word_count 
-----+-----------+-------+------------
+ id | author_id | title | word_count
+---------------------------------------------------------------------
 (0 rows)
 
 -- fast-path with false
-SELECT * 
+SELECT *
 	FROM articles_hash
 	WHERE author_id = 1 and false;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- id | author_id | title | word_count 
-----+-----------+-------+------------
+ id | author_id | title | word_count
+---------------------------------------------------------------------
 (0 rows)
 
 -- fast-path with false
-SELECT * 
+SELECT *
 	FROM articles_hash
 	WHERE author_id = 1 and 1=0;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id | title | word_count 
-----+-----------+-------+------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id | title | word_count
+---------------------------------------------------------------------
 (0 rows)
 
-SELECT * 
+SELECT *
 	FROM articles_hash
 	WHERE null and author_id = 1;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- id | author_id | title | word_count 
-----+-----------+-------+------------
+ id | author_id | title | word_count
+---------------------------------------------------------------------
 (0 rows)
 
 -- we cannot qualify dist_key = X operator Y via
 -- fast-path planning
-SELECT * 
+SELECT *
 	FROM articles_hash
 	WHERE author_id = 1 + 1;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 2
- id | author_id |   title    | word_count 
-----+-----------+------------+------------
+DEBUG:  query has a single distribution column value: 2
+ id | author_id |   title    | word_count
+---------------------------------------------------------------------
   2 |         2 | abducing   |      13642
  12 |         2 | archiblast |      18185
  22 |         2 | antipope   |       2728
@@ -1212,37 +1149,36 @@ DETAIL:  distribution column value: 2
 
 -- where false with immutable function returning false
 -- goes through fast-path
-SELECT * 
+SELECT *
 	FROM articles_hash a
 	WHERE a.author_id = 10 and int4eq(1, 2);
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 10
- id | author_id | title | word_count 
-----+-----------+-------+------------
+DEBUG:  query has a single distribution column value: 10
+ id | author_id | title | word_count
+---------------------------------------------------------------------
 (0 rows)
 
 -- partition_column is null clause does not prune out any shards,
 -- all shards remain after shard pruning, not router plannable
 -- not fast-path router either
-SELECT * 
+SELECT *
 	FROM articles_hash a
 	WHERE a.author_id is null;
- id | author_id | title | word_count 
-----+-----------+-------+------------
+DEBUG:  Router planner cannot handle multi-shard select queries
+ id | author_id | title | word_count
+---------------------------------------------------------------------
 (0 rows)
 
 -- partition_column equals to null clause prunes out all shards
 -- no shards after shard pruning, router plannable
 -- not fast-path router either
-SELECT * 
+SELECT *
 	FROM articles_hash a
 	WHERE a.author_id = null;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- id | author_id | title | word_count 
-----+-----------+-------+------------
+ id | author_id | title | word_count
+---------------------------------------------------------------------
 (0 rows)
 
 -- union/difference /intersection with where false
@@ -1255,10 +1191,9 @@ SELECT * FROM (
 ) AS combination
 ORDER BY id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -1274,21 +1209,19 @@ SELECT * FROM (
 ) AS combination WHERE false
 ORDER BY id;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- id | author_id | title | word_count 
-----+-----------+-------+------------
+ id | author_id | title | word_count
+---------------------------------------------------------------------
 (0 rows)
 
 -- window functions with where false
-SELECT word_count, rank() OVER (PARTITION BY author_id ORDER BY word_count)  
-	FROM articles_hash 
+SELECT word_count, rank() OVER (PARTITION BY author_id ORDER BY word_count)
+	FROM articles_hash
 	WHERE author_id = 1 and 1=0;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- word_count | rank 
-------------+------
+DEBUG:  query has a single distribution column value: 1
+ word_count | rank
+---------------------------------------------------------------------
 (0 rows)
 
 -- create a dummy function to be used in filtering
@@ -1299,20 +1232,35 @@ BEGIN
     RETURN md5($1::text);
 END;
 $$ LANGUAGE 'plpgsql' IMMUTABLE;
--- fast path router plannable, but errors 
-SELECT * FROM articles_hash
-	WHERE
-		someDummyFunction('articles_hash') = md5('articles_hash') AND author_id = 1
-	ORDER BY
-		author_id, id
-	LIMIT 5;
-DEBUG:  Distributed planning for a fast-path router query
-DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
-WARNING:  relation "fast_path_router_select.articles_hash" does not exist
-CONTEXT:  while executing command on localhost:57637
-ERROR:  could not receive query results
+-- we execute the query within a function to consolidate the error messages
+-- between different executors
+CREATE FUNCTION raise_failed_execution_f_router(query text) RETURNS void AS $$
+BEGIN
+        EXECUTE query;
+        EXCEPTION WHEN OTHERS THEN
+        IF SQLERRM LIKE '%failed to execute task%' THEN
+                RAISE 'Task failed to execute';
+        ELSIF SQLERRM LIKE '%does not exist%' THEN
+          RAISE 'Task failed to execute';
+        ELSIF SQLERRM LIKE '%could not receive query results%' THEN
+          	RAISE 'Task failed to execute';
+        END IF;
+END;
+$$LANGUAGE plpgsql;
+SET client_min_messages TO ERROR;
+\set VERBOSITY terse
+-- fast path router plannable, but errors
+SELECT raise_failed_execution_f_router($$
+	SELECT * FROM articles_hash
+		WHERE
+			someDummyFunction('articles_hash') = md5('articles_hash') AND author_id = 1
+		ORDER BY
+			author_id, id
+		LIMIT 5;
+$$);
+ERROR:  Task failed to execute
+\set VERBOSITY DEFAULT
+SET client_min_messages TO DEFAULT;
 -- temporarily turn off debug messages before dropping the function
 SET client_min_messages TO 'NOTICE';
 DROP FUNCTION someDummyFunction(regclass);
@@ -1320,7 +1268,7 @@ SET client_min_messages TO 'DEBUG2';
 -- complex query hitting a single shard and a fast-path
 SELECT
 	count(DISTINCT CASE
-			WHEN 
+			WHEN
 				word_count > 100
 			THEN
 				id
@@ -1333,10 +1281,9 @@ SELECT
 		author_id = 5;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 5
- c 
----
+DEBUG:  query has a single distribution column value: 5
+ c
+---------------------------------------------------------------------
  5
 (1 row)
 
@@ -1348,10 +1295,9 @@ SELECT *
 	ORDER BY id;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -1369,10 +1315,9 @@ SELECT *
 	ORDER BY id;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -1384,24 +1329,23 @@ END;
 WARNING:  there is no transaction in progress
 -- cursor queries are fast-path router plannable
 BEGIN;
-DECLARE test_cursor CURSOR FOR 
+DECLARE test_cursor CURSOR FOR
 	SELECT *
 		FROM articles_hash
 		WHERE author_id = 1
 		ORDER BY id;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
 FETCH test_cursor;
- id | author_id |  title   | word_count 
-----+-----------+----------+------------
+ id | author_id |  title   | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous |       9572
 (1 row)
 
 FETCH ALL test_cursor;
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
  31 |         1 | athwartships |       7271
@@ -1409,13 +1353,13 @@ FETCH ALL test_cursor;
 (4 rows)
 
 FETCH test_cursor; -- fetch one row after the last
- id | author_id | title | word_count 
-----+-----------+-------+------------
+ id | author_id | title | word_count
+---------------------------------------------------------------------
 (0 rows)
 
 FETCH BACKWARD test_cursor;
- id | author_id |  title   | word_count 
-----+-----------+----------+------------
+ id | author_id |  title   | word_count
+---------------------------------------------------------------------
  41 |         1 | aznavour |      11814
 (1 row)
 
@@ -1428,14 +1372,12 @@ COPY (
 	ORDER BY id) TO STDOUT;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
 1	1	arsenous	9572
 11	1	alamo	1347
 21	1	arcading	5890
 31	1	athwartships	7271
 41	1	aznavour	11814
-	
 -- table creation queries inside can be fast-path router plannable
 CREATE TEMP TABLE temp_articles_hash as
 	SELECT *
@@ -1444,18 +1386,16 @@ CREATE TEMP TABLE temp_articles_hash as
 	ORDER BY id;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
--- fast-path router plannable queries may include filter for aggragates
+DEBUG:  query has a single distribution column value: 1
+-- fast-path router plannable queries may include filter for aggregates
 SELECT count(*), count(*) FILTER (WHERE id < 3)
 	FROM articles_hash
 	WHERE author_id = 1;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- count | count 
--------+-------
+DEBUG:  query has a single distribution column value: 1
+ count | count
+---------------------------------------------------------------------
      5 |     1
 (1 row)
 
@@ -1467,10 +1407,9 @@ PREPARE author_1_articles as
 EXECUTE author_1_articles;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -1479,8 +1418,8 @@ DETAIL:  distribution column value: 1
 (5 rows)
 
 EXECUTE author_1_articles;
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -1489,8 +1428,8 @@ EXECUTE author_1_articles;
 (5 rows)
 
 EXECUTE author_1_articles;
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -1499,8 +1438,8 @@ EXECUTE author_1_articles;
 (5 rows)
 
 EXECUTE author_1_articles;
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -1509,8 +1448,8 @@ EXECUTE author_1_articles;
 (5 rows)
 
 EXECUTE author_1_articles;
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -1519,8 +1458,8 @@ EXECUTE author_1_articles;
 (5 rows)
 
 EXECUTE author_1_articles;
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -1534,12 +1473,10 @@ PREPARE author_articles(int) as
 	FROM articles_hash
 	WHERE author_id = $1;
 EXECUTE author_articles(1);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -1548,12 +1485,10 @@ DETAIL:  distribution column value: 1
 (5 rows)
 
 EXECUTE author_articles(1);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -1562,12 +1497,10 @@ DETAIL:  distribution column value: 1
 (5 rows)
 
 EXECUTE author_articles(1);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -1576,12 +1509,10 @@ DETAIL:  distribution column value: 1
 (5 rows)
 
 EXECUTE author_articles(1);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -1590,12 +1521,10 @@ DETAIL:  distribution column value: 1
 (5 rows)
 
 EXECUTE author_articles(1);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -1604,12 +1533,10 @@ DETAIL:  distribution column value: 1
 (5 rows)
 
 EXECUTE author_articles(1);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -1617,6 +1544,62 @@ DETAIL:  distribution column value: 1
  41 |         1 | aznavour     |      11814
 (5 rows)
 
+EXECUTE author_articles(NULL);
+ id | author_id | title | word_count
+---------------------------------------------------------------------
+(0 rows)
+
+EXECUTE author_articles(NULL);
+ id | author_id | title | word_count
+---------------------------------------------------------------------
+(0 rows)
+
+EXECUTE author_articles(NULL);
+ id | author_id | title | word_count
+---------------------------------------------------------------------
+(0 rows)
+
+EXECUTE author_articles(NULL);
+ id | author_id | title | word_count
+---------------------------------------------------------------------
+(0 rows)
+
+EXECUTE author_articles(NULL);
+ id | author_id | title | word_count
+---------------------------------------------------------------------
+(0 rows)
+
+EXECUTE author_articles(NULL);
+ id | author_id | title | word_count
+---------------------------------------------------------------------
+(0 rows)
+
+EXECUTE author_articles(NULL);
+ id | author_id | title | word_count
+---------------------------------------------------------------------
+(0 rows)
+
+PREPARE author_articles_update(int) AS
+	UPDATE articles_hash SET title = 'test' WHERE author_id = $1;
+EXECUTE author_articles_update(NULL);
+DEBUG:  Deferred pruning for a fast-path router query
+DEBUG:  Creating router plan
+EXECUTE author_articles_update(NULL);
+DEBUG:  Deferred pruning for a fast-path router query
+DEBUG:  Creating router plan
+EXECUTE author_articles_update(NULL);
+DEBUG:  Deferred pruning for a fast-path router query
+DEBUG:  Creating router plan
+EXECUTE author_articles_update(NULL);
+DEBUG:  Deferred pruning for a fast-path router query
+DEBUG:  Creating router plan
+EXECUTE author_articles_update(NULL);
+DEBUG:  Deferred pruning for a fast-path router query
+DEBUG:  Creating router plan
+EXECUTE author_articles_update(NULL);
+DEBUG:  Deferred pruning for a fast-path router query
+DEBUG:  Creating router plan
+EXECUTE author_articles_update(NULL);
 -- queries inside plpgsql functions could be router plannable
 CREATE OR REPLACE FUNCTION author_articles_max_id() RETURNS int AS $$
 DECLARE
@@ -1628,46 +1611,46 @@ BEGIN
 	return max_id;
 END;
 $$ LANGUAGE plpgsql;
--- we don't want too many details. though we're omitting 
--- "DETAIL:  distribution column value:", we see it acceptable 
+-- we don't want too many details. though we're omitting
+-- "DETAIL:  distribution column value:", we see it acceptable
 -- since the query results verifies the correctness
 \set VERBOSITY terse
 SELECT author_articles_max_id();
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- author_articles_max_id 
-------------------------
+DEBUG:  query has a single distribution column value: 1
+ author_articles_max_id
+---------------------------------------------------------------------
                      41
 (1 row)
 
 SELECT author_articles_max_id();
- author_articles_max_id 
-------------------------
+ author_articles_max_id
+---------------------------------------------------------------------
                      41
 (1 row)
 
 SELECT author_articles_max_id();
- author_articles_max_id 
-------------------------
+ author_articles_max_id
+---------------------------------------------------------------------
                      41
 (1 row)
 
 SELECT author_articles_max_id();
- author_articles_max_id 
-------------------------
+ author_articles_max_id
+---------------------------------------------------------------------
                      41
 (1 row)
 
 SELECT author_articles_max_id();
- author_articles_max_id 
-------------------------
+ author_articles_max_id
+---------------------------------------------------------------------
                      41
 (1 row)
 
 SELECT author_articles_max_id();
- author_articles_max_id 
-------------------------
+ author_articles_max_id
+---------------------------------------------------------------------
                      41
 (1 row)
 
@@ -1683,56 +1666,50 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 SELECT author_articles_max_id(1);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- author_articles_max_id 
-------------------------
+ author_articles_max_id
+---------------------------------------------------------------------
                      41
 (1 row)
 
 SELECT author_articles_max_id(1);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- author_articles_max_id 
-------------------------
+ author_articles_max_id
+---------------------------------------------------------------------
                      41
 (1 row)
 
 SELECT author_articles_max_id(1);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- author_articles_max_id 
-------------------------
+ author_articles_max_id
+---------------------------------------------------------------------
                      41
 (1 row)
 
 SELECT author_articles_max_id(1);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- author_articles_max_id 
-------------------------
+ author_articles_max_id
+---------------------------------------------------------------------
                      41
 (1 row)
 
 SELECT author_articles_max_id(1);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- author_articles_max_id 
-------------------------
+ author_articles_max_id
+---------------------------------------------------------------------
                      41
 (1 row)
 
 SELECT author_articles_max_id(1);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- author_articles_max_id 
-------------------------
+ author_articles_max_id
+---------------------------------------------------------------------
                      41
 (1 row)
 
@@ -1750,9 +1727,9 @@ $$ LANGUAGE plpgsql;
 SELECT * FROM author_articles_id_word_count();
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- id | word_count 
-----+------------
+DEBUG:  query has a single distribution column value: 1
+ id | word_count
+---------------------------------------------------------------------
   1 |       9572
  11 |       1347
  21 |       5890
@@ -1761,8 +1738,8 @@ DEBUG:  Plan is router executable
 (5 rows)
 
 SELECT * FROM author_articles_id_word_count();
- id | word_count 
-----+------------
+ id | word_count
+---------------------------------------------------------------------
   1 |       9572
  11 |       1347
  21 |       5890
@@ -1771,8 +1748,8 @@ SELECT * FROM author_articles_id_word_count();
 (5 rows)
 
 SELECT * FROM author_articles_id_word_count();
- id | word_count 
-----+------------
+ id | word_count
+---------------------------------------------------------------------
   1 |       9572
  11 |       1347
  21 |       5890
@@ -1781,8 +1758,8 @@ SELECT * FROM author_articles_id_word_count();
 (5 rows)
 
 SELECT * FROM author_articles_id_word_count();
- id | word_count 
-----+------------
+ id | word_count
+---------------------------------------------------------------------
   1 |       9572
  11 |       1347
  21 |       5890
@@ -1791,8 +1768,8 @@ SELECT * FROM author_articles_id_word_count();
 (5 rows)
 
 SELECT * FROM author_articles_id_word_count();
- id | word_count 
-----+------------
+ id | word_count
+---------------------------------------------------------------------
   1 |       9572
  11 |       1347
  21 |       5890
@@ -1801,8 +1778,8 @@ SELECT * FROM author_articles_id_word_count();
 (5 rows)
 
 SELECT * FROM author_articles_id_word_count();
- id | word_count 
-----+------------
+ id | word_count
+---------------------------------------------------------------------
   1 |       9572
  11 |       1347
  21 |       5890
@@ -1822,11 +1799,10 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 SELECT * FROM author_articles_id_word_count(1);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- id | word_count 
-----+------------
+ id | word_count
+---------------------------------------------------------------------
   1 |       9572
  11 |       1347
  21 |       5890
@@ -1835,11 +1811,10 @@ DEBUG:  Plan is router executable
 (5 rows)
 
 SELECT * FROM author_articles_id_word_count(1);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- id | word_count 
-----+------------
+ id | word_count
+---------------------------------------------------------------------
   1 |       9572
  11 |       1347
  21 |       5890
@@ -1848,11 +1823,10 @@ DEBUG:  Plan is router executable
 (5 rows)
 
 SELECT * FROM author_articles_id_word_count(1);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- id | word_count 
-----+------------
+ id | word_count
+---------------------------------------------------------------------
   1 |       9572
  11 |       1347
  21 |       5890
@@ -1861,11 +1835,10 @@ DEBUG:  Plan is router executable
 (5 rows)
 
 SELECT * FROM author_articles_id_word_count(1);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- id | word_count 
-----+------------
+ id | word_count
+---------------------------------------------------------------------
   1 |       9572
  11 |       1347
  21 |       5890
@@ -1874,11 +1847,10 @@ DEBUG:  Plan is router executable
 (5 rows)
 
 SELECT * FROM author_articles_id_word_count(1);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- id | word_count 
-----+------------
+ id | word_count
+---------------------------------------------------------------------
   1 |       9572
  11 |       1347
  21 |       5890
@@ -1887,11 +1859,10 @@ DEBUG:  Plan is router executable
 (5 rows)
 
 SELECT * FROM author_articles_id_word_count(1);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
- id | word_count 
-----+------------
+ id | word_count
+---------------------------------------------------------------------
   1 |       9572
  11 |       1347
  21 |       5890
@@ -1903,127 +1874,102 @@ DEBUG:  Plan is router executable
 -- insert .. select via coordinator could also
 -- use fast-path queries
 PREPARE insert_sel(int, int) AS
-INSERT INTO articles_hash 
+INSERT INTO articles_hash
 	SELECT * FROM articles_hash WHERE author_id = $2 AND word_count = $1 OFFSET 0;
 EXECUTE insert_sel(1,1);
 DEBUG:  OFFSET clauses are not allowed in distributed INSERT ... SELECT queries
-DEBUG:  Collecting INSERT ... SELECT results on coordinator
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  Collecting INSERT ... SELECT results on coordinator
 EXECUTE insert_sel(1,1);
 DEBUG:  OFFSET clauses are not allowed in distributed INSERT ... SELECT queries
-DEBUG:  Collecting INSERT ... SELECT results on coordinator
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  Collecting INSERT ... SELECT results on coordinator
 EXECUTE insert_sel(1,1);
 DEBUG:  OFFSET clauses are not allowed in distributed INSERT ... SELECT queries
-DEBUG:  Collecting INSERT ... SELECT results on coordinator
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  Collecting INSERT ... SELECT results on coordinator
 EXECUTE insert_sel(1,1);
 DEBUG:  OFFSET clauses are not allowed in distributed INSERT ... SELECT queries
-DEBUG:  Collecting INSERT ... SELECT results on coordinator
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  Collecting INSERT ... SELECT results on coordinator
 EXECUTE insert_sel(1,1);
 DEBUG:  OFFSET clauses are not allowed in distributed INSERT ... SELECT queries
-DEBUG:  Collecting INSERT ... SELECT results on coordinator
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  Collecting INSERT ... SELECT results on coordinator
 EXECUTE insert_sel(1,1);
 DEBUG:  OFFSET clauses are not allowed in distributed INSERT ... SELECT queries
-DEBUG:  Collecting INSERT ... SELECT results on coordinator
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  Collecting INSERT ... SELECT results on coordinator
 -- one final interesting preperad statement
 -- where one of the filters is on the target list
 PREPARE fast_path_agg_filter(int, int) AS
-	SELECT 
-		count(*) FILTER (WHERE word_count=$1) 
-	FROM 
-		articles_hash 
+	SELECT
+		count(*) FILTER (WHERE word_count=$1)
+	FROM
+		articles_hash
 	WHERE author_id = $2;
 EXECUTE fast_path_agg_filter(1,1);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- count 
--------
+ count
+---------------------------------------------------------------------
      0
 (1 row)
 
 EXECUTE fast_path_agg_filter(2,2);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 2
- count 
--------
+ count
+---------------------------------------------------------------------
      0
 (1 row)
 
 EXECUTE fast_path_agg_filter(3,3);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 3
- count 
--------
+ count
+---------------------------------------------------------------------
      0
 (1 row)
 
 EXECUTE fast_path_agg_filter(4,4);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 4
- count 
--------
+ count
+---------------------------------------------------------------------
      0
 (1 row)
 
 EXECUTE fast_path_agg_filter(5,5);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 5
- count 
--------
+ count
+---------------------------------------------------------------------
      0
 (1 row)
 
 EXECUTE fast_path_agg_filter(6,6);
-DEBUG:  Distributed planning for a fast-path router query
+DEBUG:  Deferred pruning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 6
- count 
--------
+ count
+---------------------------------------------------------------------
      0
 (1 row)
 
 -- views internally become subqueries, so not fast-path router query
-CREATE VIEW test_view AS 
+CREATE VIEW test_view AS
 	SELECT * FROM articles_hash WHERE author_id = 1;
 SELECT * FROM test_view;
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+DEBUG:  query has a single distribution column value: 1
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -2036,11 +1982,10 @@ CREATE MATERIALIZED VIEW mv_articles_hash_empty AS
 	SELECT * FROM articles_hash WHERE author_id = 1;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
+DEBUG:  query has a single distribution column value: 1
 SELECT * FROM mv_articles_hash_empty;
- id | author_id |    title     | word_count 
-----+-----------+--------------+------------
+ id | author_id |    title     | word_count
+---------------------------------------------------------------------
   1 |         1 | arsenous     |       9572
  11 |         1 | alamo        |       1347
  21 |         1 | arcading     |       5890
@@ -2048,17 +1993,14 @@ SELECT * FROM mv_articles_hash_empty;
  41 |         1 | aznavour     |      11814
 (5 rows)
 
--- fast-path router planner/executor is enabled for task-tracker executor
-SET citus.task_executor_type to 'task-tracker';
 SELECT id
 	FROM articles_hash
 	WHERE author_id = 1;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id 
-----
+DEBUG:  query has a single distribution column value: 1
+ id
+---------------------------------------------------------------------
   1
  11
  21
@@ -2066,20 +2008,18 @@ DETAIL:  distribution column value: 1
  41
 (5 rows)
 
--- insert query is router plannable even under task-tracker
 INSERT INTO articles_hash VALUES (51, 1, 'amateus', 1814), (52, 1, 'second amateus', 2824);
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
+DEBUG:  query has a single distribution column value: 1
 -- verify insert is successfull (not router plannable and executable)
 SELECT id
 	FROM articles_hash
 	WHERE author_id = 1;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 1
- id 
-----
+DEBUG:  query has a single distribution column value: 1
+ id
+---------------------------------------------------------------------
   1
  11
  21
@@ -2097,7 +2037,7 @@ CREATE TABLE collections_list (
 	collection_id integer,
 	value numeric
 ) PARTITION BY LIST (collection_id );
-CREATE TABLE collections_list_1 
+CREATE TABLE collections_list_1
 	PARTITION OF collections_list (key, ts, collection_id, value)
 	FOR VALUES IN ( 1 );
 CREATE TABLE collections_list_2
@@ -2106,9 +2046,9 @@ CREATE TABLE collections_list_2
 -- we don't need many shards
 SET citus.shard_count TO 2;
 SELECT create_distributed_table('collections_list', 'key');
- create_distributed_table 
---------------------------
- 
+ create_distributed_table
+---------------------------------------------------------------------
+
 (1 row)
 
 INSERT INTO collections_list SELECT i % 10, now(), (i % 2) + 1, i*i FROM generate_series(0, 50)i;
@@ -2116,65 +2056,58 @@ SET client_min_messages to 'DEBUG2';
 SELECT count(*) FROM collections_list WHERE key = 4;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 4
- count 
--------
+DEBUG:  query has a single distribution column value: 4
+ count
+---------------------------------------------------------------------
      5
 (1 row)
 
 SELECT count(*) FROM collections_list_1 WHERE key = 4;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 4
- count 
--------
+DEBUG:  query has a single distribution column value: 4
+ count
+---------------------------------------------------------------------
      5
 (1 row)
 
 SELECT count(*) FROM collections_list_2 WHERE key = 4;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 4
- count 
--------
+DEBUG:  query has a single distribution column value: 4
+ count
+---------------------------------------------------------------------
      0
 (1 row)
 
 UPDATE collections_list SET value = 15 WHERE key = 4;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 4
+DEBUG:  query has a single distribution column value: 4
 SELECT count(*) FILTER (where value = 15) FROM collections_list WHERE key = 4;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 4
- count 
--------
+DEBUG:  query has a single distribution column value: 4
+ count
+---------------------------------------------------------------------
      5
 (1 row)
 
 SELECT count(*) FILTER (where value = 15) FROM collections_list_1 WHERE key = 4;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 4
- count 
--------
+DEBUG:  query has a single distribution column value: 4
+ count
+---------------------------------------------------------------------
      5
 (1 row)
 
 SELECT count(*) FILTER (where value = 15) FROM collections_list_2 WHERE key = 4;
 DEBUG:  Distributed planning for a fast-path router query
 DEBUG:  Creating router plan
-DEBUG:  Plan is router executable
-DETAIL:  distribution column value: 4
- count 
--------
+DEBUG:  query has a single distribution column value: 4
+ count
+---------------------------------------------------------------------
      0
 (1 row)
 
@@ -2197,8 +2130,9 @@ DROP TABLE articles_append;
 DROP TABLE collections_list;
 RESET search_path;
 DROP SCHEMA fast_path_router_select CASCADE;
-NOTICE:  drop cascades to 4 other objects
+NOTICE:  drop cascades to 5 other objects
 DETAIL:  drop cascades to table fast_path_router_select.articles_hash
+drop cascades to function fast_path_router_select.raise_failed_execution_f_router(text)
 drop cascades to function fast_path_router_select.author_articles_max_id(integer)
 drop cascades to function fast_path_router_select.author_articles_id_word_count(integer)
 drop cascades to view fast_path_router_select.test_view

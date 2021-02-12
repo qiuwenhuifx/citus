@@ -129,7 +129,7 @@ WHERE logicalrelid = 'citus_mx_schema_for_xacts.objects_for_xacts'::regclass;
 SET citus.shard_replication_factor TO 1;
 SET citus.replication_model TO streaming;
 
--- now show that we can rollback on creating mx table, but shards remain.... 
+-- now show that we can rollback on creating mx table, but shards remain....
 BEGIN;
 CREATE SCHEMA IF NOT EXISTS citus_mx_schema_for_xacts;
 SET search_path TO citus_mx_schema_for_xacts;
@@ -154,8 +154,8 @@ SELECT count(*) FROM pg_tables WHERE tablename = 'objects_for_xacts2' and schema
 -- shard also does not exist since we create shards in a transaction
 SELECT count(*) FROM pg_tables WHERE tablename LIKE 'objects_for_xacts2_%' and schemaname = 'citus_mx_schema_for_xacts';
 
--- make sure that master_drop_all_shards does not work from the worker nodes
-SELECT master_drop_all_shards('citus_mx_schema_for_xacts.objects_for_xacts'::regclass, 'citus_mx_schema_for_xacts', 'objects_for_xacts');
+-- make sure that citus_drop_all_shards does not work from the worker nodes
+SELECT citus_drop_all_shards('citus_mx_schema_for_xacts.objects_for_xacts'::regclass, 'citus_mx_schema_for_xacts', 'objects_for_xacts');
 
 -- Ensure pg_dist_transaction is empty for test
 SELECT recover_prepared_transactions();
@@ -196,38 +196,24 @@ SELECT run_command_on_workers($$CREATE USER no_access_mx;$$);
 
 SET ROLE no_access_mx;
 
-SELECT raise_failed_aclcheck($$ 
+SELECT raise_failed_aclcheck($$
     DROP TABLE distributed_mx_table;
 $$);
 
-SELECT raise_failed_aclcheck($$ 
+SELECT raise_failed_aclcheck($$
     SELECT master_remove_distributed_table_metadata_from_workers('distributed_mx_table'::regclass, 'public', 'distributed_mx_table');
  $$);
 
-SELECT raise_failed_aclcheck($$ 
-    SELECT master_drop_all_shards('distributed_mx_table'::regclass, 'public', 'distributed_mx_table');
+SELECT raise_failed_aclcheck($$
+    SELECT citus_drop_all_shards('distributed_mx_table'::regclass, 'public', 'distributed_mx_table');
 $$);
-SELECT raise_failed_aclcheck($$ 
+SELECT raise_failed_aclcheck($$
     SELECT master_remove_partition_metadata('distributed_mx_table'::regclass, 'public', 'distributed_mx_table');
 $$);
-SELECT raise_failed_aclcheck($$ 
-    SELECT master_drop_sequences(ARRAY['public.distributed_mx_table_some_val_seq']);
-$$);
-SELECT raise_failed_aclcheck($$ 
-    SELECT master_drop_sequences(ARRAY['distributed_mx_table_some_val_seq']);
-$$);
-
-SELECT master_drop_sequences(ARRAY['non_existing_schema.distributed_mx_table_some_val_seq']);
-SELECT master_drop_sequences(ARRAY['']);
-SELECT master_drop_sequences(ARRAY['public.']);
-SELECT master_drop_sequences(ARRAY['public.distributed_mx_table_some_val_seq_not_existing']);
 
 -- make sure that we can drop unrelated tables/sequences
 CREATE TABLE unrelated_table(key serial);
 DROP TABLE unrelated_table;
-
--- doesn't error out but it has no effect, so no need to error out
-SELECT master_drop_sequences(NULL);
 
 \c - postgres - :master_port
 
@@ -247,19 +233,19 @@ BEGIN
 END;
 $$LANGUAGE plpgsql;
 
-SELECT raise_failed_aclcheck($$ 
+SELECT raise_failed_aclcheck($$
     DROP TABLE distributed_mx_table;
 $$);
 
-SELECT raise_failed_aclcheck($$ 
+SELECT raise_failed_aclcheck($$
     SELECT master_remove_distributed_table_metadata_from_workers('distributed_mx_table'::regclass, 'public', 'distributed_mx_table');
  $$);
 
-SELECT raise_failed_aclcheck($$ 
+SELECT raise_failed_aclcheck($$
     SELECT master_drop_sequences(ARRAY['public.distributed_mx_table_some_val_seq']);
 $$);
 
-SELECT master_drop_all_shards('distributed_mx_table'::regclass, 'public', 'distributed_mx_table');
+SELECT citus_drop_all_shards('distributed_mx_table'::regclass, 'public', 'distributed_mx_table');
 SELECT master_remove_partition_metadata('distributed_mx_table'::regclass, 'public', 'distributed_mx_table');
 
 -- make sure that we can drop unrelated tables/sequences

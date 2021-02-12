@@ -5,10 +5,7 @@ SET citus.next_shard_id TO 1660000;
 
 SET citus.shard_count TO 4;
 SET citus.shard_replication_factor TO 1;
-
--- print major version number for version-specific tests
-SHOW server_version \gset
-SELECT substring(:'server_version', '\d+')::int AS server_version;
+SET citus.enable_repartition_joins to ON;
 
 --
 -- Distributed Partitioned Table Creation Tests
@@ -50,34 +47,34 @@ SELECT * FROM partitioning_test ORDER BY 1;
 SELECT * FROM partitioning_hash_test ORDER BY 1;
 
 -- see partitioned table and its partitions are distributed
-SELECT 
-	logicalrelid 
-FROM 
-	pg_dist_partition 
-WHERE 
+SELECT
+	logicalrelid
+FROM
+	pg_dist_partition
+WHERE
 	logicalrelid IN ('partitioning_test', 'partitioning_test_2009', 'partitioning_test_2010')
 ORDER BY 1;
 
-SELECT 
-	logicalrelid, count(*) 
-FROM pg_dist_shard 
+SELECT
+	logicalrelid, count(*)
+FROM pg_dist_shard
 	WHERE logicalrelid IN ('partitioning_test', 'partitioning_test_2009', 'partitioning_test_2010')
 GROUP BY
 	logicalrelid
 ORDER BY
 	1,2;
 
-SELECT 
-	logicalrelid 
-FROM 
-	pg_dist_partition 
-WHERE 
+SELECT
+	logicalrelid
+FROM
+	pg_dist_partition
+WHERE
 	logicalrelid IN ('partitioning_hash_test', 'partitioning_hash_test_0', 'partitioning_hash_test_1')
 ORDER BY 1;
 
-SELECT 
-	logicalrelid, count(*) 
-FROM pg_dist_shard 
+SELECT
+	logicalrelid, count(*)
+FROM pg_dist_shard
 	WHERE logicalrelid IN ('partitioning_hash_test', 'partitioning_hash_test_0', 'partitioning_hash_test_1')
 GROUP BY
 	logicalrelid
@@ -88,17 +85,17 @@ ORDER BY
 CREATE TABLE partitioning_test_2011 PARTITION OF partitioning_test FOR VALUES FROM ('2011-01-01') TO ('2012-01-01');
 
 -- new partition is automatically distributed as well
-SELECT 
-	logicalrelid 
-FROM 
-	pg_dist_partition 
-WHERE 
+SELECT
+	logicalrelid
+FROM
+	pg_dist_partition
+WHERE
 	logicalrelid IN ('partitioning_test', 'partitioning_test_2011')
 ORDER BY 1;
 
-SELECT 
-	logicalrelid, count(*) 
-FROM pg_dist_shard 
+SELECT
+	logicalrelid, count(*)
+FROM pg_dist_shard
 	WHERE logicalrelid IN ('partitioning_test', 'partitioning_test_2011')
 GROUP BY
 	logicalrelid
@@ -115,17 +112,17 @@ INSERT INTO partitioning_test_2012 VALUES (6, '2012-07-07');
 ALTER TABLE partitioning_test ATTACH PARTITION partitioning_test_2012 FOR VALUES FROM ('2012-01-01') TO ('2013-01-01');
 
 -- attached partition is distributed as well
-SELECT 
-	logicalrelid 
-FROM 
-	pg_dist_partition 
-WHERE 
+SELECT
+	logicalrelid
+FROM
+	pg_dist_partition
+WHERE
 	logicalrelid IN ('partitioning_test', 'partitioning_test_2012')
 ORDER BY 1;
 
-SELECT 
-	logicalrelid, count(*) 
-FROM pg_dist_shard 
+SELECT
+	logicalrelid, count(*)
+FROM pg_dist_shard
 	WHERE logicalrelid IN ('partitioning_test', 'partitioning_test_2012')
 GROUP BY
 	logicalrelid
@@ -339,7 +336,7 @@ CREATE INDEX partitioning_2009_index ON partitioning_test_2009(id);
 CREATE INDEX CONCURRENTLY partitioned_2010_index ON partitioning_test_2010(id);
 
 -- see index is created
-SELECT tablename, indexname FROM pg_indexes WHERE tablename LIKE 'partitioning_test%' ORDER BY indexname;
+SELECT tablename, indexname FROM pg_indexes WHERE tablename LIKE 'partitioning_test_%' ORDER BY indexname;
 
 -- test drop
 -- indexes created on parent table can only be dropped on parent table
@@ -360,7 +357,7 @@ FOR VALUES FROM (0) TO (10);
 CREATE INDEX non_distributed_partitioned_table_index ON non_distributed_partitioned_table(a);
 
 -- see index is created
-SELECT tablename, indexname FROM pg_indexes WHERE tablename LIKE 'non_distributed%' ORDER BY indexname;
+SELECT tablename, indexname FROM pg_indexes WHERE tablename LIKE 'non_distributed_partitioned_table_%' ORDER BY indexname;
 
 -- drop the index and see it is dropped
 DROP INDEX non_distributed_partitioned_table_index;
@@ -392,7 +389,7 @@ SELECT
 FROM
     information_schema.table_constraints
 WHERE
-    table_name = 'partitioning_test_2009' AND 
+    table_name = 'partitioning_test_2009' AND
     constraint_name = 'partitioning_2009_primary';
 
 -- however, you can add primary key if it contains both distribution and partition key
@@ -474,9 +471,9 @@ SELECT right(table_name, 7)::int as shardid, * FROM (
 	json_array_elements_text(result::json)::json )).*
 	FROM run_command_on_workers($$
 		SELECT
-			COALESCE(json_agg(row_to_json(q)), '[]'::json) 
+			COALESCE(json_agg(row_to_json(q)), '[]'::json)
 		FROM (
-			SELECT 
+			SELECT
 				table_name, constraint_name, constraint_type
 			FROM information_schema.table_constraints
 			WHERE
@@ -640,40 +637,40 @@ SELECT ("final_query"."event_types") as types, count(*) AS sumOfEventType
 FROM
   (SELECT *, random()
    FROM
-     (SELECT 
+     (SELECT
         "t"."user_id", "t"."time", unnest("t"."collected_events") AS "event_types"
       FROM
-        (SELECT 
+        (SELECT
             "t1"."user_id", min("t1"."time") AS "time", array_agg(("t1"."event") ORDER BY TIME ASC, event DESC) AS collected_events
          FROM(
-                  (SELECT 
+                  (SELECT
                     "events"."user_id", "events"."time", 0 AS event
-                   FROM 
+                   FROM
                     partitioned_events_table as  "events"
-                   WHERE 
+                   WHERE
                     event_type IN (1, 2) )
-               UNION 
-                    (SELECT 
+               UNION
+                    (SELECT
                         "events"."user_id", "events"."time", 1 AS event
-                     FROM 
+                     FROM
                         partitioned_events_table as "events"
-                     WHERE 
+                     WHERE
                         event_type IN (3, 4) )
-               UNION 
-                    (SELECT 
+               UNION
+                    (SELECT
                         "events"."user_id", "events"."time", 2 AS event
-                     FROM 
+                     FROM
                         partitioned_events_table as  "events"
-                     WHERE 
+                     WHERE
                         event_type IN (5, 6) )
-               UNION 
-                    (SELECT 
+               UNION
+                    (SELECT
                         "events"."user_id", "events"."time", 3 AS event
-                     FROM 
+                     FROM
                         partitioned_events_table as "events"
-                     WHERE 
+                     WHERE
                         event_type IN (1, 6))) t1
-         GROUP BY "t1"."user_id") AS t) "q" 
+         GROUP BY "t1"."user_id") AS t) "q"
 ) AS final_query
 GROUP BY types
 ORDER BY types;
@@ -681,73 +678,73 @@ ORDER BY types;
 -- UNION and JOIN on both partitioned and regular tables
 SELECT ("final_query"."event_types") as types, count(*) AS sumOfEventType
 FROM
-  (SELECT 
+  (SELECT
       *, random()
     FROM
-     (SELECT 
+     (SELECT
         "t"."user_id", "t"."time", unnest("t"."collected_events") AS "event_types"
       FROM
-        (SELECT 
+        (SELECT
             "t1"."user_id", min("t1"."time") AS "time", array_agg(("t1"."event") ORDER BY TIME ASC, event DESC) AS collected_events
           FROM (
-                (SELECT 
+                (SELECT
                     *
                  FROM
-                   (SELECT 
+                   (SELECT
                           "events"."time", 0 AS event, "events"."user_id"
-                    FROM 
+                    FROM
                       partitioned_events_table as "events"
-                    WHERE 
-                      event_type IN (1, 2)) events_subquery_1) 
-                UNION 
+                    WHERE
+                      event_type IN (1, 2)) events_subquery_1)
+                UNION
                  (SELECT *
                   FROM
                     (
                           SELECT * FROM
                           (
-                              SELECT 
+                              SELECT
                                 max("events"."time"),
                                 0 AS event,
                                 "events"."user_id"
-                              FROM 
+                              FROM
                                 events_table as  "events", users_table as "users"
-                              WHERE 
+                              WHERE
                                 events.user_id = users.user_id AND
                                 event_type IN (1, 2)
                                 GROUP BY   "events"."user_id"
                           ) as events_subquery_5
                      ) events_subquery_2)
-               UNION 
+               UNION
                  (SELECT *
                   FROM
-                    (SELECT 
+                    (SELECT
                         "events"."time", 2 AS event, "events"."user_id"
-                     FROM 
+                     FROM
                         partitioned_events_table as  "events"
-                     WHERE 
+                     WHERE
                       event_type IN (3, 4)) events_subquery_3)
-               UNION 
+               UNION
                  (SELECT *
                   FROM
                     (SELECT
                        "events"."time", 3 AS event, "events"."user_id"
-                     FROM 
+                     FROM
                       events_table as "events"
-                     WHERE 
+                     WHERE
                       event_type IN (5, 6)) events_subquery_4)
                  ) t1
-         GROUP BY "t1"."user_id") AS t) "q" 
+         GROUP BY "t1"."user_id") AS t) "q"
 INNER JOIN
-     (SELECT 
+     (SELECT
         "users"."user_id"
-      FROM 
+      FROM
         partitioned_users_table as "users"
-      WHERE 
-        value_1 > 2 and value_1 < 5) AS t 
+      WHERE
+        value_1 > 2 and value_1 < 5) AS t
      ON (t.user_id = q.user_id)) as final_query
-GROUP BY 
+GROUP BY
   types
-ORDER BY 
+ORDER BY
   types;
 
 -- test LIST partitioning
@@ -779,37 +776,37 @@ WHERE
 SELECT
 count(*) AS cnt, "generated_group_field"
  FROM
-  (SELECT 
+  (SELECT
       "eventQuery"."user_id", random(), generated_group_field
    FROM
-     (SELECT 
+     (SELECT
         "multi_group_wrapper_1".*, generated_group_field, random()
       FROM
         (SELECT *
          FROM
-           (SELECT 
+           (SELECT
               "list_partitioned_events_table"."time", "list_partitioned_events_table"."user_id" as event_user_id
-            FROM 
+            FROM
              list_partitioned_events_table as "list_partitioned_events_table"
-            WHERE 
+            WHERE
               user_id > 2) "temp_data_queries"
            INNER JOIN
-           (SELECT 
+           (SELECT
               "users"."user_id"
-            FROM 
+            FROM
               partitioned_users_table as "users"
-            WHERE 
-              user_id > 2 and value_2 = 1) "user_filters_1" 
+            WHERE
+              user_id > 2 and value_2 = 1) "user_filters_1"
            ON ("temp_data_queries".event_user_id = "user_filters_1".user_id)) AS "multi_group_wrapper_1"
         LEFT JOIN
-        (SELECT 
+        (SELECT
             "users"."user_id" AS "user_id", value_2 AS "generated_group_field"
-         FROM 
+         FROM
           partitioned_users_table as "users") "left_group_by_1"
-        ON ("left_group_by_1".user_id = "multi_group_wrapper_1".event_user_id)) "eventQuery") "pushedDownQuery" 
+        ON ("left_group_by_1".user_id = "multi_group_wrapper_1".event_user_id)) "eventQuery") "pushedDownQuery"
   GROUP BY
     "generated_group_field"
-  ORDER BY 
+  ORDER BY
     cnt DESC, generated_group_field ASC
   LIMIT 10;
 
@@ -866,13 +863,10 @@ SELECT * FROM partitioning_locks ORDER BY 1, 2;
 SELECT relation::regclass, locktype, mode FROM pg_locks WHERE relation::regclass::text LIKE 'partitioning_locks%' AND pid = pg_backend_pid() ORDER BY 1, 2, 3;
 COMMIT;
 
--- test locks on task-tracker SELECT
-SET citus.task_executor_type TO 'task-tracker';
 BEGIN;
 SELECT * FROM partitioning_locks AS pl1 JOIN partitioning_locks AS pl2 ON pl1.id = pl2.ref_id ORDER BY 1, 2;
 SELECT relation::regclass, locktype, mode FROM pg_locks WHERE relation::regclass::text LIKE 'partitioning_locks%' AND pid = pg_backend_pid() ORDER BY 1, 2, 3;
 COMMIT;
-SET citus.task_executor_type TO 'real-time';
 
 -- test locks on INSERT
 BEGIN;
@@ -924,24 +918,36 @@ TRUNCATE partitioning_locks;
 SELECT relation::regclass, locktype, mode FROM pg_locks WHERE relation::regclass::text LIKE 'partitioning_locks%' AND pid = pg_backend_pid() ORDER BY 1, 2, 3;
 COMMIT;
 
+CREATE VIEW lockinfo AS
+    SELECT
+        logicalrelid,
+        CASE
+            WHEN l.objsubid = 5 THEN 'shard'
+            WHEN l.objsubid = 4 THEN 'shard_metadata'
+            ELSE 'colocated_shards_metadata'
+        END AS locktype,
+        mode
+    FROM
+        pg_locks AS l JOIN (select row_number() over (partition by logicalrelid order by shardminvalue) -1 as shardintervalindex, * from pg_dist_shard) AS s
+    ON
+        (l.objsubid IN (4, 5) AND l.objid = s.shardid )
+        OR (l.objsubid = 8
+            AND l.objid IN (select colocationid from pg_dist_partition AS p where p.logicalrelid = s.logicalrelid)
+            AND l.classid = shardintervalindex
+        )
+    WHERE
+        logicalrelid IN ('partitioning_locks', 'partitioning_locks_2009', 'partitioning_locks_2010')
+        AND pid = pg_backend_pid()
+        AND l.locktype = 'advisory'
+    ORDER BY
+        1, 2, 3;
+
 -- test shard resource locks with multi-shard UPDATE
 BEGIN;
 UPDATE partitioning_locks_2009 SET time = '2009-03-01';
 
 -- see the locks on parent table
-SELECT
-    logicalrelid,
-    locktype,
-    mode
-FROM
-    pg_locks AS l JOIN pg_dist_shard AS s
-ON
-    l.objid = s.shardid
-WHERE
-    logicalrelid IN ('partitioning_locks', 'partitioning_locks_2009', 'partitioning_locks_2010') AND
-    pid = pg_backend_pid()
-ORDER BY
-    1, 2, 3;
+SELECT * FROM lockinfo;
 COMMIT;
 
 -- test shard resource locks with TRUNCATE
@@ -949,19 +955,7 @@ BEGIN;
 TRUNCATE partitioning_locks_2009;
 
 -- see the locks on parent table
-SELECT
-    logicalrelid,
-    locktype,
-    mode
-FROM
-    pg_locks AS l JOIN pg_dist_shard AS s
-ON
-    l.objid = s.shardid
-WHERE
-    logicalrelid IN ('partitioning_locks', 'partitioning_locks_2009', 'partitioning_locks_2010') AND
-    pid = pg_backend_pid()
-ORDER BY
-    1, 2, 3;
+SELECT * FROM lockinfo;
 COMMIT;
 
 -- test shard resource locks with INSERT/SELECT
@@ -969,19 +963,7 @@ BEGIN;
 INSERT INTO partitioning_locks_2009 SELECT * FROM partitioning_locks WHERE time >= '2009-01-01' AND time < '2010-01-01';
 
 -- see the locks on parent table
-SELECT
-    logicalrelid,
-    locktype,
-    mode
-FROM
-    pg_locks AS l JOIN pg_dist_shard AS s
-ON
-    l.objid = s.shardid
-WHERE
-    logicalrelid IN ('partitioning_locks', 'partitioning_locks_2009', 'partitioning_locks_2010') AND
-    pid = pg_backend_pid()
-ORDER BY
-    1, 2, 3;
+SELECT * FROM lockinfo;
 COMMIT;
 
 -- test partition-wise join
@@ -1002,11 +984,12 @@ SELECT success FROM run_command_on_workers('select pg_reload_conf()');
 EXPLAIN (COSTS OFF)
 SELECT * FROM partitioning_hash_test JOIN partitioning_hash_join_test USING (id, subid);
 
--- set partition-wise join on
+-- set partition-wise join on and parallel to off
 SELECT success FROM run_command_on_workers('alter system set enable_partitionwise_join to on');
 SELECT success FROM run_command_on_workers('select pg_reload_conf()');
 
 SET enable_partitionwise_join TO on;
+ANALYZE partitioning_hash_test, partitioning_hash_join_test;
 
 EXPLAIN (COSTS OFF)
 SELECT * FROM partitioning_hash_test JOIN partitioning_hash_join_test USING (id, subid);
@@ -1027,6 +1010,7 @@ SELECT success FROM run_command_on_workers('select pg_reload_conf()');
 
 RESET enable_partitionwise_join;
 
+DROP VIEW lockinfo;
 DROP TABLE
 IF EXISTS
     partitioning_test_2009,
@@ -1052,18 +1036,18 @@ CREATE TABLE partitioning_schema."schema-test_2009"(id int, time date);
 ALTER TABLE partitioning_schema."schema-test" ATTACH PARTITION partitioning_schema."schema-test_2009" FOR VALUES FROM ('2009-01-01') TO ('2010-01-01');
 
 -- attached partition is distributed as well
-SELECT 
-	logicalrelid 
-FROM 
-	pg_dist_partition 
-WHERE 
+SELECT
+	logicalrelid
+FROM
+	pg_dist_partition
+WHERE
 	logicalrelid IN ('partitioning_schema."schema-test"'::regclass, 'partitioning_schema."schema-test_2009"'::regclass)
 ORDER BY 1;
 
-SELECT 
-	logicalrelid, count(*) 
+SELECT
+	logicalrelid, count(*)
 FROM
-    pg_dist_shard 
+    pg_dist_shard
 WHERE
     logicalrelid IN ('partitioning_schema."schema-test"'::regclass, 'partitioning_schema."schema-test_2009"'::regclass)
 GROUP BY
@@ -1079,18 +1063,18 @@ SELECT create_distributed_table('partitioning_schema."schema-test"', 'id');
 CREATE TABLE partitioning_schema."schema-test_2009" PARTITION OF partitioning_schema."schema-test" FOR VALUES FROM ('2009-01-01') TO ('2010-01-01');
 
 -- newly created partition is distributed as well
-SELECT 
-	logicalrelid 
-FROM 
-	pg_dist_partition 
-WHERE 
+SELECT
+	logicalrelid
+FROM
+	pg_dist_partition
+WHERE
 	logicalrelid IN ('partitioning_schema."schema-test"'::regclass, 'partitioning_schema."schema-test_2009"'::regclass)
 ORDER BY 1;
 
-SELECT 
-	logicalrelid, count(*) 
+SELECT
+	logicalrelid, count(*)
 FROM
-    pg_dist_shard 
+    pg_dist_shard
 WHERE
     logicalrelid IN ('partitioning_schema."schema-test"'::regclass, 'partitioning_schema."schema-test_2009"'::regclass)
 GROUP BY
@@ -1107,18 +1091,18 @@ SELECT create_distributed_table('"schema-test"', 'id');
 CREATE TABLE partitioning_schema."schema-test_2009" PARTITION OF "schema-test" FOR VALUES FROM ('2009-01-01') TO ('2010-01-01');
 
 -- newly created partition is distributed as well
-SELECT 
-	logicalrelid 
-FROM 
-	pg_dist_partition 
-WHERE 
+SELECT
+	logicalrelid
+FROM
+	pg_dist_partition
+WHERE
 	logicalrelid IN ('partitioning_schema."schema-test"'::regclass, 'partitioning_schema."schema-test_2009"'::regclass)
 ORDER BY 1;
 
-SELECT 
-	logicalrelid, count(*) 
+SELECT
+	logicalrelid, count(*)
 FROM
-    pg_dist_shard 
+    pg_dist_shard
 WHERE
     logicalrelid IN ('partitioning_schema."schema-test"'::regclass, 'partitioning_schema."schema-test_2009"'::regclass)
 GROUP BY
@@ -1169,17 +1153,73 @@ ALTER TABLE partitioning_test ATTACH PARTITION partitioning_test_2010
 ALTER TABLE partitioning_test ATTACH PARTITION partitioning_test_2011
       FOR VALUES FROM ('2011-01-01') TO ('2012-01-01');
 
+SELECT parent_table, partition_column, partition, from_value, to_value FROM time_partitions;
+
+-- create the same partition to verify it behaves like in plain PG
+CREATE TABLE partitioning_test_2011 PARTITION OF partitioning_test FOR VALUES FROM ('2011-01-01') TO ('2012-01-01');
+CREATE TABLE IF NOT EXISTS partitioning_test_2011 PARTITION OF partitioning_test FOR VALUES FROM ('2011-01-01') TO ('2012-01-01');
+
+-- verify we can create a partition that doesn't already exist with IF NOT EXISTS
+CREATE TABLE IF NOT EXISTS partitioning_test_2013 PARTITION OF partitioning_test FOR VALUES FROM ('2013-01-01') TO ('2014-01-01');
+SELECT logicalrelid FROM pg_dist_partition WHERE logicalrelid IN ('partitioning_test', 'partitioning_test_2013') ORDER BY 1;
+
+-- create the same table but that is not a partition and verify it behaves like in plain PG
+CREATE TABLE not_partition(time date);
+CREATE TABLE not_partition PARTITION OF partitioning_test FOR VALUES FROM ('2011-01-01') TO ('2012-01-01');
+CREATE TABLE IF NOT EXISTS not_partition PARTITION OF partitioning_test FOR VALUES FROM ('2011-01-01') TO ('2012-01-01');
+DROP TABLE not_partition;
+
+-- verify it skips when the partition with the same name belongs to another table
+CREATE TABLE another_table(id int, time date) PARTITION BY RANGE (time);
+CREATE TABLE partition_of_other_table PARTITION OF another_table FOR VALUES FROM ('2014-01-01') TO ('2015-01-01');
+CREATE TABLE partition_of_other_table PARTITION OF partitioning_test FOR VALUES FROM ('2014-01-01') TO ('2015-01-01');
+CREATE TABLE IF NOT EXISTS partition_of_other_table PARTITION OF partitioning_test FOR VALUES FROM ('2014-01-01') TO ('2015-01-01');
+ALTER TABLE another_table DETACH PARTITION partition_of_other_table;
+DROP TABLE another_table, partition_of_other_table;
+
+-- test fix_pre_citus10_partitioned_table_constraint_names udf
+SELECT fix_pre_citus10_partitioned_table_constraint_names('partitioning_test');
+SELECT fix_pre_citus10_partitioned_table_constraint_names();
+
+-- the following should fail
+SELECT fix_pre_citus10_partitioned_table_constraint_names('public.non_distributed_partitioned_table');
+SELECT fix_pre_citus10_partitioned_table_constraint_names('reference_table');
+
 ALTER TABLE partitioning_test DETACH PARTITION partitioning_test_2008;
 ALTER TABLE partitioning_test DETACH PARTITION partitioning_test_2009;
 ALTER TABLE partitioning_test DETACH PARTITION partitioning_test_2010;
 ALTER TABLE partitioning_test DETACH PARTITION partitioning_test_2011;
+ALTER TABLE partitioning_test DETACH PARTITION partitioning_test_2013;
 
 DROP TABLE partitioning_test, partitioning_test_2008, partitioning_test_2009,
-           partitioning_test_2010, partitioning_test_2011,
+           partitioning_test_2010, partitioning_test_2011, partitioning_test_2013,
            reference_table, reference_table_2;
 
-DROP SCHEMA partitioning_schema CASCADE;
 RESET SEARCH_PATH;
+
+-- not timestamp partitioned
+CREATE TABLE not_time_partitioned (x int, y int) PARTITION BY RANGE (x);
+CREATE TABLE not_time_partitioned_p0 PARTITION OF not_time_partitioned DEFAULT;
+CREATE TABLE not_time_partitioned_p1 PARTITION OF not_time_partitioned FOR VALUES FROM (1) TO (2);
+SELECT parent_table, partition_column, partition, from_value, to_value FROM time_partitions;
+SELECT * FROM time_partition_range('not_time_partitioned_p1');
+DROP TABLE not_time_partitioned;
+
+-- multi-column partitioned
+CREATE TABLE multi_column_partitioned (x date, y date) PARTITION BY RANGE (x, y);
+CREATE TABLE multi_column_partitioned_p1 PARTITION OF multi_column_partitioned  FOR VALUES FROM ('2020-01-01', '2020-01-01') TO ('2020-12-31','2020-12-31');
+SELECT parent_table, partition_column, partition, from_value, to_value FROM time_partitions;
+SELECT * FROM time_partition_range('multi_column_partitioned_p1');
+DROP TABLE multi_column_partitioned;
+
+-- not-range-partitioned
+CREATE TABLE list_partitioned (x date, y date) PARTITION BY LIST (x);
+CREATE TABLE list_partitioned_p1 PARTITION OF list_partitioned FOR VALUES IN ('2020-01-01');
+SELECT parent_table, partition_column, partition, from_value, to_value FROM time_partitions;
+SELECT * FROM time_partition_range('list_partitioned_p1');
+DROP TABLE list_partitioned;
+
+DROP SCHEMA partitioning_schema CASCADE;
 DROP TABLE IF EXISTS
 	partitioning_hash_test,
 	partitioning_hash_join_test,

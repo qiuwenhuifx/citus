@@ -5,7 +5,7 @@
  * Routines for handling DDL statements that relate to relay files. These
  * routines extend relation, index and constraint names in utility commands.
  *
- * Copyright (c) 2012-2016, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  * $Id$
  *
@@ -29,8 +29,11 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
+#include "distributed/citus_safe_lib.h"
 #include "distributed/commands.h"
+#include "distributed/listutils.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/multi_partitioning_utils.h"
 #include "distributed/relay_utility.h"
 #include "distributed/version_compat.h"
 #include "lib/stringinfo.h"
@@ -76,11 +79,57 @@ RelayEventExtendNames(Node *parseTree, char *schemaName, uint64 shardId)
 
 	switch (nodeType)
 	{
+		case T_AlterObjectSchemaStmt:
+		{
+			AlterObjectSchemaStmt *alterObjectSchemaStmt =
+				(AlterObjectSchemaStmt *) parseTree;
+			ObjectType objectType = alterObjectSchemaStmt->objectType;
+
+			if (objectType == OBJECT_STATISTIC_EXT)
+			{
+				RangeVar *stat = makeRangeVarFromNameList(
+					(List *) alterObjectSchemaStmt->object);
+
+				/* append shard id */
+				AppendShardIdToName(&stat->relname, shardId);
+
+				alterObjectSchemaStmt->object = (Node *) MakeNameListFromRangeVar(stat);
+			}
+			else
+			{
+				char **relationName = &(alterObjectSchemaStmt->relation->relname);
+				char **relationSchemaName =
+					&(alterObjectSchemaStmt->relation->schemaname);
+
+				/* prefix with schema name if it is not added already */
+				SetSchemaNameIfNotExist(relationSchemaName, schemaName);
+
+				/* append shardId to base relation name */
+				AppendShardIdToName(relationName, shardId);
+			}
+
+			break;
+		}
+
+#if PG_VERSION_NUM >= PG_VERSION_13
+		case T_AlterStatsStmt:
+		{
+			AlterStatsStmt *alterStatsStmt = (AlterStatsStmt *) parseTree;
+			RangeVar *stat = makeRangeVarFromNameList(alterStatsStmt->defnames);
+
+			AppendShardIdToName(&stat->relname, shardId);
+
+			alterStatsStmt->defnames = MakeNameListFromRangeVar(stat);
+
+			break;
+		}
+#endif
+
 		case T_AlterTableStmt:
 		{
 			/*
-			 * We append shardId to the very end of table and index names to
-			 * avoid name collisions. We also append shardId to constraint names.
+			 * We append shardId to the very end of table and index, constraint
+			 * and trigger names to avoid name collisions.
 			 */
 
 			AlterTableStmt *alterTableStmt = (AlterTableStmt *) parseTree;
@@ -89,7 +138,6 @@ RelayEventExtendNames(Node *parseTree, char *schemaName, uint64 shardId)
 			char **relationSchemaName = &(alterTableStmt->relation->schemaname);
 
 			List *commandList = alterTableStmt->cmds;
-			ListCell *commandCell = NULL;
 
 			/* prefix with schema name if it is not added already */
 			SetSchemaNameIfNotExist(relationSchemaName, schemaName);
@@ -97,14 +145,17 @@ RelayEventExtendNames(Node *parseTree, char *schemaName, uint64 shardId)
 			/* append shardId to base relation name */
 			AppendShardIdToName(relationName, shardId);
 
-			foreach(commandCell, commandList)
+			AlterTableCmd *command = NULL;
+			foreach_ptr(command, commandList)
 			{
-				AlterTableCmd *command = (AlterTableCmd *) lfirst(commandCell);
-
 				if (command->subtype == AT_AddConstraint)
 				{
 					Constraint *constraint = (Constraint *) command->def;
 					char **constraintName = &(constraint->conname);
+					const bool missingOk = false;
+					relationId = RangeVarGetRelid(alterTableStmt->relation,
+												  AccessShareLock,
+												  missingOk);
 
 					if (constraint->contype == CONSTR_PRIMARY && constraint->indexname)
 					{
@@ -112,13 +163,29 @@ RelayEventExtendNames(Node *parseTree, char *schemaName, uint64 shardId)
 						AppendShardIdToName(indexName, shardId);
 					}
 
-					AppendShardIdToName(constraintName, shardId);
+					/*
+					 * Append shardId to constraint names if
+					 *  - table is not partitioned or
+					 *  - constraint is not a CHECK constraint
+					 *
+					 * We do not want to append shardId to partitioned table shards because
+					 * the names of constraints will be inherited, and the shardId will no
+					 * longer be valid for the child table.
+					 *
+					 * See MergeConstraintsIntoExisting function in Postgres that requires
+					 * inherited check constraints in child tables to have the same name
+					 * with those in parent tables.
+					 */
+					if (!PartitionedTable(relationId) ||
+						constraint->contype != CONSTR_CHECK)
+					{
+						AppendShardIdToName(constraintName, shardId);
+					}
 				}
 				else if (command->subtype == AT_DropConstraint ||
 						 command->subtype == AT_ValidateConstraint)
 				{
 					char **constraintName = &(command->name);
-					Oid constraintOid = InvalidOid;
 					const bool constraintMissingOk = true;
 
 					if (!OidIsValid(relationId))
@@ -129,9 +196,9 @@ RelayEventExtendNames(Node *parseTree, char *schemaName, uint64 shardId)
 													  rvMissingOk);
 					}
 
-					constraintOid = get_relation_constraint_oid(relationId,
-																command->name,
-																constraintMissingOk);
+					Oid constraintOid = get_relation_constraint_oid(relationId,
+																	command->name,
+																	constraintMissingOk);
 					if (!OidIsValid(constraintOid))
 					{
 						AppendShardIdToName(constraintName, shardId);
@@ -153,7 +220,31 @@ RelayEventExtendNames(Node *parseTree, char *schemaName, uint64 shardId)
 						AppendShardIdToName(indexName, shardId);
 					}
 				}
+				else if (command->subtype == AT_EnableTrig ||
+						 command->subtype == AT_DisableTrig ||
+						 command->subtype == AT_EnableAlwaysTrig ||
+						 command->subtype == AT_EnableReplicaTrig)
+				{
+					char **triggerName = &(command->name);
+					AppendShardIdToName(triggerName, shardId);
+				}
 			}
+
+			break;
+		}
+
+		case T_AlterOwnerStmt:
+		{
+			AlterOwnerStmt *alterOwnerStmt = castNode(AlterOwnerStmt, parseTree);
+
+			/* we currently extend names in alter owner statements only for statistics */
+			Assert(alterOwnerStmt->objectType == OBJECT_STATISTIC_EXT);
+
+			RangeVar *stat = makeRangeVarFromNameList((List *) alterOwnerStmt->object);
+
+			AppendShardIdToName(&stat->relname, shardId);
+
+			alterOwnerStmt->object = (Node *) MakeNameListFromRangeVar(stat);
 
 			break;
 		}
@@ -161,8 +252,6 @@ RelayEventExtendNames(Node *parseTree, char *schemaName, uint64 shardId)
 		case T_ClusterStmt:
 		{
 			ClusterStmt *clusterStmt = (ClusterStmt *) parseTree;
-			char **relationName = NULL;
-			char **relationSchemaName = NULL;
 
 			/* we do not support clustering the entire database */
 			if (clusterStmt->relation == NULL)
@@ -170,8 +259,8 @@ RelayEventExtendNames(Node *parseTree, char *schemaName, uint64 shardId)
 				ereport(ERROR, (errmsg("cannot extend name for multi-relation cluster")));
 			}
 
-			relationName = &(clusterStmt->relation->relname);
-			relationSchemaName = &(clusterStmt->relation->schemaname);
+			char **relationName = &(clusterStmt->relation->relname);
+			char **relationSchemaName = &(clusterStmt->relation->schemaname);
 
 			/* prefix with schema name if it is not added already */
 			SetSchemaNameIfNotExist(relationSchemaName, schemaName);
@@ -224,6 +313,33 @@ RelayEventExtendNames(Node *parseTree, char *schemaName, uint64 shardId)
 			break;
 		}
 
+		case T_CreateTrigStmt:
+		{
+			CreateTrigStmt *createTriggerStmt = (CreateTrigStmt *) parseTree;
+			CreateTriggerEventExtendNames(createTriggerStmt, schemaName, shardId);
+			break;
+		}
+
+		case T_AlterObjectDependsStmt:
+		{
+			AlterObjectDependsStmt *alterTriggerDependsStmt =
+				(AlterObjectDependsStmt *) parseTree;
+			ObjectType objectType = alterTriggerDependsStmt->objectType;
+
+			if (objectType == OBJECT_TRIGGER)
+			{
+				AlterTriggerDependsEventExtendNames(alterTriggerDependsStmt,
+													schemaName, shardId);
+			}
+			else
+			{
+				ereport(WARNING, (errmsg("unsafe object type in alter object "
+										 "depends statement"),
+								  errdetail("Object type: %u", (uint32) objectType)));
+			}
+			break;
+		}
+
 		case T_DropStmt:
 		{
 			DropStmt *dropStmt = (DropStmt *) parseTree;
@@ -232,11 +348,8 @@ RelayEventExtendNames(Node *parseTree, char *schemaName, uint64 shardId)
 			if (objectType == OBJECT_TABLE || objectType == OBJECT_INDEX ||
 				objectType == OBJECT_FOREIGN_TABLE || objectType == OBJECT_FOREIGN_SERVER)
 			{
-				List *relationNameList = NULL;
-				int relationNameListLength = 0;
 				Value *relationSchemaNameValue = NULL;
 				Value *relationNameValue = NULL;
-				char **relationName = NULL;
 
 				uint32 dropCount = list_length(dropStmt->objects);
 				if (dropCount > 1)
@@ -253,8 +366,8 @@ RelayEventExtendNames(Node *parseTree, char *schemaName, uint64 shardId)
 				 * have the correct memory address for the name.
 				 */
 
-				relationNameList = (List *) linitial(dropStmt->objects);
-				relationNameListLength = list_length(relationNameList);
+				List *relationNameList = (List *) linitial(dropStmt->objects);
+				int relationNameListLength = list_length(relationNameList);
 
 				switch (relationNameListLength)
 				{
@@ -294,12 +407,33 @@ RelayEventExtendNames(Node *parseTree, char *schemaName, uint64 shardId)
 					relationNameList = lcons(schemaNameValue, relationNameList);
 				}
 
-				relationName = &(relationNameValue->val.str);
+				char **relationName = &(relationNameValue->val.str);
 				AppendShardIdToName(relationName, shardId);
 			}
 			else if (objectType == OBJECT_POLICY)
 			{
 				DropPolicyEventExtendNames(dropStmt, schemaName, shardId);
+			}
+			else if (objectType == OBJECT_TRIGGER)
+			{
+				DropTriggerEventExtendNames(dropStmt, schemaName, shardId);
+			}
+			else if (objectType == OBJECT_STATISTIC_EXT)
+			{
+				List *shardStatisticsList = NIL;
+				List *objectNameList = NULL;
+				foreach_ptr(objectNameList, dropStmt->objects)
+				{
+					RangeVar *stat = makeRangeVarFromNameList(objectNameList);
+
+					SetSchemaNameIfNotExist(&stat->schemaname, schemaName);
+
+					AppendShardIdToName(&stat->relname, shardId);
+					shardStatisticsList = lappend(shardStatisticsList,
+												  MakeNameListFromRangeVar(stat));
+				}
+
+				dropStmt->objects = shardStatisticsList;
 			}
 			else
 			{
@@ -315,13 +449,11 @@ RelayEventExtendNames(Node *parseTree, char *schemaName, uint64 shardId)
 		{
 			GrantStmt *grantStmt = (GrantStmt *) parseTree;
 			if (grantStmt->targtype == ACL_TARGET_OBJECT &&
-				grantStmt->objtype == RELATION_OBJECT_TYPE)
+				grantStmt->objtype == OBJECT_TABLE)
 			{
-				ListCell *lc;
-
-				foreach(lc, grantStmt->objects)
+				RangeVar *relation = NULL;
+				foreach_ptr(relation, grantStmt->objects)
 				{
-					RangeVar *relation = (RangeVar *) lfirst(lc);
 					char **relationName = &(relation->relname);
 					char **relationSchemaName = &(relation->schemaname);
 
@@ -403,15 +535,6 @@ RelayEventExtendNames(Node *parseTree, char *schemaName, uint64 shardId)
 
 				AppendShardIdToName(objectName, shardId);
 			}
-			else if (objectType == REINDEX_OBJECT_DATABASE)
-			{
-				ereport(ERROR, (errmsg("cannot extend name for multi-relation reindex")));
-			}
-			else
-			{
-				ereport(ERROR, (errmsg("invalid object type in reindex statement"),
-								errdetail("Object type: %u", (uint32) objectType)));
-			}
 
 			break;
 		}
@@ -427,7 +550,6 @@ RelayEventExtendNames(Node *parseTree, char *schemaName, uint64 shardId)
 				char **oldRelationName = &(renameStmt->relation->relname);
 				char **newRelationName = &(renameStmt->newname);
 				char **objectSchemaName = &(renameStmt->relation->schemaname);
-				int newRelationNameLength;
 
 				/* prefix with schema name if it is not added already */
 				SetSchemaNameIfNotExist(objectSchemaName, schemaName);
@@ -449,7 +571,7 @@ RelayEventExtendNames(Node *parseTree, char *schemaName, uint64 shardId)
 				 *
 				 * See also https://github.com/citusdata/citus/issues/1664
 				 */
-				newRelationNameLength = strlen(*newRelationName);
+				int newRelationNameLength = strlen(*newRelationName);
 				if (newRelationNameLength >= (NAMEDATALEN - 1))
 				{
 					ereport(ERROR,
@@ -459,7 +581,7 @@ RelayEventExtendNames(Node *parseTree, char *schemaName, uint64 shardId)
 								 *newRelationName, NAMEDATALEN - 1)));
 				}
 			}
-			else if (objectType == OBJECT_COLUMN || objectType == OBJECT_TRIGGER)
+			else if (objectType == OBJECT_COLUMN)
 			{
 				char **relationName = &(renameStmt->relation->relname);
 				char **objectSchemaName = &(renameStmt->relation->schemaname);
@@ -469,15 +591,51 @@ RelayEventExtendNames(Node *parseTree, char *schemaName, uint64 shardId)
 
 				AppendShardIdToName(relationName, shardId);
 			}
+			else if (objectType == OBJECT_TRIGGER)
+			{
+				AlterTriggerRenameEventExtendNames(renameStmt, schemaName, shardId);
+			}
 			else if (objectType == OBJECT_POLICY)
 			{
 				RenamePolicyEventExtendNames(renameStmt, schemaName, shardId);
+			}
+			else if (objectType == OBJECT_STATISTIC_EXT)
+			{
+				RangeVar *stat = makeRangeVarFromNameList((List *) renameStmt->object);
+
+				AppendShardIdToName(&stat->relname, shardId);
+				AppendShardIdToName(&renameStmt->newname, shardId);
+
+				SetSchemaNameIfNotExist(&stat->schemaname, schemaName);
+
+				renameStmt->object = (Node *) MakeNameListFromRangeVar(stat);
 			}
 			else
 			{
 				ereport(WARNING, (errmsg("unsafe object type in rename statement"),
 								  errdetail("Object type: %u", (uint32) objectType)));
 			}
+
+			break;
+		}
+
+		case T_CreateStatsStmt:
+		{
+			CreateStatsStmt *createStatsStmt = (CreateStatsStmt *) parseTree;
+
+			/* because CREATE STATISTICS statements can only have one relation */
+			RangeVar *relation = linitial(createStatsStmt->relations);
+
+			char **relationName = &(relation->relname);
+			char **objectSchemaName = &(relation->schemaname);
+
+			SetSchemaNameIfNotExist(objectSchemaName, schemaName);
+			AppendShardIdToName(relationName, shardId);
+
+			RangeVar *stat = makeRangeVarFromNameList(createStatsStmt->defnames);
+			AppendShardIdToName(&stat->relname, shardId);
+
+			createStatsStmt->defnames = MakeNameListFromRangeVar(stat);
 
 			break;
 		}
@@ -524,11 +682,10 @@ RelayEventExtendNamesForInterShardCommands(Node *parseTree, uint64 leftShardId,
 		{
 			AlterTableStmt *alterTableStmt = (AlterTableStmt *) parseTree;
 			List *commandList = alterTableStmt->cmds;
-			ListCell *commandCell = NULL;
 
-			foreach(commandCell, commandList)
+			AlterTableCmd *command = NULL;
+			foreach_ptr(command, commandList)
 			{
-				AlterTableCmd *command = (AlterTableCmd *) lfirst(commandCell);
 				char **referencedTableName = NULL;
 				char **relationSchemaName = NULL;
 
@@ -553,10 +710,9 @@ RelayEventExtendNamesForInterShardCommands(Node *parseTree, uint64 leftShardId,
 					ColumnDef *columnDefinition = (ColumnDef *) command->def;
 					List *columnConstraints = columnDefinition->constraints;
 
-					ListCell *columnConstraint = NULL;
-					foreach(columnConstraint, columnConstraints)
+					Constraint *constraint = NULL;
+					foreach_ptr(constraint, columnConstraints)
 					{
-						Constraint *constraint = (Constraint *) lfirst(columnConstraint);
 						if (constraint->contype == CONSTR_FOREIGN)
 						{
 							referencedTableName = &(constraint->pktable->relname);
@@ -685,10 +841,8 @@ AppendShardIdToName(char **name, uint64 shardId)
 	char extendedName[NAMEDATALEN];
 	int nameLength = strlen(*name);
 	char shardIdAndSeparator[NAMEDATALEN];
-	int shardIdAndSeparatorLength;
 	uint32 longNameHash = 0;
 	int multiByteClipLength = 0;
-	int neededBytes = 0;
 
 	if (nameLength >= NAMEDATALEN)
 	{
@@ -697,9 +851,9 @@ AppendShardIdToName(char **name, uint64 shardId)
 							   NAMEDATALEN)));
 	}
 
-	snprintf(shardIdAndSeparator, NAMEDATALEN, "%c" UINT64_FORMAT,
-			 SHARD_NAME_SEPARATOR, shardId);
-	shardIdAndSeparatorLength = strlen(shardIdAndSeparator);
+	SafeSnprintf(shardIdAndSeparator, NAMEDATALEN, "%c" UINT64_FORMAT,
+				 SHARD_NAME_SEPARATOR, shardId);
+	int shardIdAndSeparatorLength = strlen(shardIdAndSeparator);
 
 	/*
 	 * If *name strlen is < (NAMEDATALEN - shardIdAndSeparatorLength),
@@ -708,7 +862,7 @@ AppendShardIdToName(char **name, uint64 shardId)
 
 	if (nameLength < (NAMEDATALEN - shardIdAndSeparatorLength))
 	{
-		snprintf(extendedName, NAMEDATALEN, "%s%s", (*name), shardIdAndSeparator);
+		SafeSnprintf(extendedName, NAMEDATALEN, "%s%s", (*name), shardIdAndSeparator);
 	}
 
 	/*
@@ -742,18 +896,18 @@ AppendShardIdToName(char **name, uint64 shardId)
 		multiByteClipLength = pg_mbcliplen(*name, nameLength, (NAMEDATALEN -
 															   shardIdAndSeparatorLength -
 															   10));
-		snprintf(extendedName, NAMEDATALEN, "%.*s%c%.8x%s",
-				 multiByteClipLength, (*name),
-				 SHARD_NAME_SEPARATOR, longNameHash,
-				 shardIdAndSeparator);
+		SafeSnprintf(extendedName, NAMEDATALEN, "%.*s%c%.8x%s",
+					 multiByteClipLength, (*name),
+					 SHARD_NAME_SEPARATOR, longNameHash,
+					 shardIdAndSeparator);
 	}
 
 	(*name) = (char *) repalloc((*name), NAMEDATALEN);
-	neededBytes = snprintf((*name), NAMEDATALEN, "%s", extendedName);
+	int neededBytes = SafeSnprintf((*name), NAMEDATALEN, "%s", extendedName);
 	if (neededBytes < 0)
 	{
 		ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY),
-						errmsg("out of memory: %s", strerror(errno))));
+						errmsg("out of memory: %m")));
 	}
 	else if (neededBytes >= NAMEDATALEN)
 	{
@@ -773,10 +927,7 @@ shard_name(PG_FUNCTION_ARGS)
 {
 	Oid relationId = PG_GETARG_OID(0);
 	int64 shardId = PG_GETARG_INT64(1);
-	char *relationName = NULL;
 
-	Oid schemaId = InvalidOid;
-	char *schemaName = NULL;
 	char *qualifiedName = NULL;
 
 	CheckCitusVersion(ERROR);
@@ -794,7 +945,7 @@ shard_name(PG_FUNCTION_ARGS)
 						errmsg("object_name does not reference a valid relation")));
 	}
 
-	relationName = get_rel_name(relationId);
+	char *relationName = get_rel_name(relationId);
 
 	if (relationName == NULL)
 	{
@@ -804,8 +955,8 @@ shard_name(PG_FUNCTION_ARGS)
 
 	AppendShardIdToName(&relationName, shardId);
 
-	schemaId = get_rel_namespace(relationId);
-	schemaName = get_namespace_name(schemaId);
+	Oid schemaId = get_rel_namespace(relationId);
+	char *schemaName = get_namespace_name(schemaId);
 
 	if (strncmp(schemaName, "public", NAMEDATALEN) == 0)
 	{

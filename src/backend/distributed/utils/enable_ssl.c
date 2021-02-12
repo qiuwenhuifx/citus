@@ -3,7 +3,7 @@
  * enable_ssl.c
  *    UDF and Utilities for enabling ssl during citus setup
  *
- * Copyright (c) 2018, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -37,7 +37,21 @@
 #define X509_SUBJECT_COMMON_NAME "CN"
 
 #define POSTGRES_DEFAULT_SSL_CIPHERS "HIGH:MEDIUM:+3DES:!aNULL"
-#define CITUS_DEFAULT_SSL_CIPHERS "TLSv1.2+HIGH:!aNULL:!eNULL"
+
+/*
+ * Microsoft approved cipher string.
+ * This cipher string implicitely enables only TLSv1.2+, because these ciphers
+ * were all added in TLSv1.2. This can be confirmed by running:
+ * openssl -v <below strings concatenated>
+ */
+#define CITUS_DEFAULT_SSL_CIPHERS "ECDHE-ECDSA-AES128-GCM-SHA256:" \
+								  "ECDHE-ECDSA-AES256-GCM-SHA384:" \
+								  "ECDHE-RSA-AES128-GCM-SHA256:" \
+								  "ECDHE-RSA-AES256-GCM-SHA384:" \
+								  "ECDHE-ECDSA-AES128-SHA256:" \
+								  "ECDHE-ECDSA-AES256-SHA384:" \
+								  "ECDHE-RSA-AES128-SHA256:" \
+								  "ECDHE-RSA-AES256-SHA384"
 #define SET_CITUS_SSL_CIPHERS_QUERY \
 	"ALTER SYSTEM SET ssl_ciphers TO '" CITUS_DEFAULT_SSL_CIPHERS "';"
 
@@ -75,13 +89,11 @@ citus_setup_ssl(PG_FUNCTION_ARGS)
 #else /* USE_SSL */
 	if (!EnableSSL && ShouldUseAutoSSL())
 	{
-		Node *enableSSLParseTree = NULL;
-
 		ereport(LOG, (errmsg("citus extension created on postgres without ssl enabled, "
 							 "turning it on during creation of the extension")));
 
 		/* execute the alter system statement to enable ssl on within postgres */
-		enableSSLParseTree = ParseTreeNode(ENABLE_SSL_QUERY);
+		Node *enableSSLParseTree = ParseTreeNode(ENABLE_SSL_QUERY);
 		AlterSystemSetConfigFile((AlterSystemStmt *) enableSSLParseTree);
 
 		if (strcmp(SSLCipherSuites, POSTGRES_DEFAULT_SSL_CIPHERS) == 0)
@@ -141,14 +153,12 @@ citus_check_defaults_for_sslmode(PG_FUNCTION_ARGS)
 	 */
 	if (strcmp(NodeConninfo, "sslmode=require") == 0)
 	{
-		Node *resetCitusNodeConnInfoParseTree = NULL;
-
 		/* execute the alter system statement to reset node_conninfo to the old default */
 
 		ereport(LOG, (errmsg("reset citus.node_conninfo to old default value as the new "
 							 "value is incompatible with the current ssl setting")));
 
-		resetCitusNodeConnInfoParseTree = ParseTreeNode(RESET_CITUS_NODE_CONNINFO);
+		Node *resetCitusNodeConnInfoParseTree = ParseTreeNode(RESET_CITUS_NODE_CONNINFO);
 		AlterSystemSetConfigFile((AlterSystemStmt *) resetCitusNodeConnInfoParseTree);
 		configChanged = true;
 	}
@@ -195,7 +205,7 @@ ShouldUseAutoSSL(void)
 	const char *sslmode = NULL;
 	sslmode = GetConnParam("sslmode");
 
-	if (strcmp(sslmode, "require") == 0)
+	if (sslmode != NULL && strcmp(sslmode, "require") == 0)
 	{
 		return true;
 	}
@@ -289,13 +299,8 @@ CreateCertificatesWhenNeeded()
 static EVP_PKEY *
 GeneratePrivateKey()
 {
-	int success = 0;
-	EVP_PKEY *privateKey = NULL;
-	BIGNUM *exponent = NULL;
-	RSA *rsa = NULL;
-
 	/* Allocate memory for the EVP_PKEY structure. */
-	privateKey = EVP_PKEY_new();
+	EVP_PKEY *privateKey = EVP_PKEY_new();
 	if (!privateKey)
 	{
 		ereport(ERROR, (errmsg("unable to allocate space for private key")));
@@ -303,17 +308,17 @@ GeneratePrivateKey()
 	EnsureReleaseResource((MemoryContextCallbackFunction) (&EVP_PKEY_free),
 						  privateKey);
 
-	exponent = BN_new();
+	BIGNUM *exponent = BN_new();
 	EnsureReleaseResource((MemoryContextCallbackFunction) (&BN_free), exponent);
 
 	/* load the exponent to use for the generation of the key */
-	success = BN_set_word(exponent, RSA_F4);
+	int success = BN_set_word(exponent, RSA_F4);
 	if (success != 1)
 	{
 		ereport(ERROR, (errmsg("unable to prepare exponent for RSA algorithm")));
 	}
 
-	rsa = RSA_new();
+	RSA *rsa = RSA_new();
 	success = RSA_generate_key_ex(rsa, 2048, exponent, NULL);
 	if (success != 1)
 	{
@@ -338,10 +343,7 @@ GeneratePrivateKey()
 static X509 *
 CreateCertificate(EVP_PKEY *privateKey)
 {
-	X509 *certificate = NULL;
-	X509_NAME *subjectName = NULL;
-
-	certificate = X509_new();
+	X509 *certificate = X509_new();
 	if (!certificate)
 	{
 		ereport(ERROR, (errmsg("unable to allocate space for the x509 certificate")));
@@ -364,8 +366,8 @@ CreateCertificate(EVP_PKEY *privateKey)
 	 * Postgres does not check the validity on the certificates, but we can't omit the
 	 * dates either to create a certificate that can be parsed. We settled on a validity
 	 * of 0 seconds. When postgres would fix the validity check in a future version it
-	 * would fail right after an upgrade instead of setting a time bomb till certificate
-	 * expiration date.
+	 * would fail right after an upgrade. Instead of working until the certificate
+	 * expiration date and then suddenly erroring out.
 	 */
 	X509_gmtime_adj(X509_get_notBefore(certificate), 0);
 	X509_gmtime_adj(X509_get_notAfter(certificate), 0);
@@ -374,7 +376,7 @@ CreateCertificate(EVP_PKEY *privateKey)
 	X509_set_pubkey(certificate, privateKey);
 
 	/* Set the common name for the certificate */
-	subjectName = X509_get_subject_name(certificate);
+	X509_NAME *subjectName = X509_get_subject_name(certificate);
 	X509_NAME_add_entry_by_txt(subjectName, X509_SUBJECT_COMMON_NAME, MBSTRING_ASC,
 							   (unsigned char *) CITUS_AUTO_SSL_COMMON_NAME, -1, -1,
 							   0);
@@ -402,27 +404,39 @@ StoreCertificate(EVP_PKEY *privateKey, X509 *certificate)
 	const char *privateKeyFilename = ssl_key_file;
 	const char *certificateFilename = ssl_cert_file;
 
-	FILE *privateKeyFile = NULL;
-	FILE *certificateFile = NULL;
-	int success = 0;
 
 	/* Open the private key file and write the private key in PEM format to it */
-	privateKeyFile = fopen(privateKeyFilename, "wb");
+	int privateKeyFileDescriptor = open(privateKeyFilename, O_WRONLY | O_CREAT, 0600);
+	if (privateKeyFileDescriptor == -1)
+	{
+		ereport(ERROR, (errmsg("unable to open private key file '%s' for writing",
+							   privateKeyFilename)));
+	}
+
+	FILE *privateKeyFile = fdopen(privateKeyFileDescriptor, "wb");
 	if (!privateKeyFile)
 	{
 		ereport(ERROR, (errmsg("unable to open private key file '%s' for writing",
 							   privateKeyFilename)));
 	}
 
-	success = PEM_write_PrivateKey(privateKeyFile, privateKey, NULL, NULL, 0, NULL, NULL);
+	int success = PEM_write_PrivateKey(privateKeyFile, privateKey, NULL, NULL, 0, NULL,
+									   NULL);
 	fclose(privateKeyFile);
 	if (!success)
 	{
 		ereport(ERROR, (errmsg("unable to store private key")));
 	}
 
+	int certificateFileDescriptor = open(certificateFilename, O_WRONLY | O_CREAT, 0600);
+	if (certificateFileDescriptor == -1)
+	{
+		ereport(ERROR, (errmsg("unable to open private key file '%s' for writing",
+							   privateKeyFilename)));
+	}
+
 	/* Open the certificate file and write the certificate in the PEM format to it */
-	certificateFile = fopen(certificateFilename, "wb");
+	FILE *certificateFile = fdopen(certificateFileDescriptor, "wb");
 	if (!certificateFile)
 	{
 		ereport(ERROR, (errmsg("unable to open certificate file '%s' for writing",

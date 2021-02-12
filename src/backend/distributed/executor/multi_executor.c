@@ -4,35 +4,44 @@
  *
  * Entrypoint into distributed query execution.
  *
- * Copyright (c) 2012-2016, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
 
+#include "distributed/pg_version_constants.h"
+
 #include "miscadmin.h"
 
 #include "access/xact.h"
 #include "catalog/dependency.h"
+#include "catalog/pg_class.h"
 #include "catalog/namespace.h"
 #include "distributed/citus_custom_scan.h"
 #include "distributed/commands/multi_copy.h"
 #include "distributed/commands/utility_hook.h"
 #include "distributed/insert_select_executor.h"
 #include "distributed/insert_select_planner.h"
+#include "distributed/listutils.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/multi_executor.h"
-#include "distributed/multi_master_planner.h"
+#include "distributed/combine_query_planner.h"
 #include "distributed/distributed_planner.h"
-#include "distributed/multi_router_executor.h"
 #include "distributed/multi_router_planner.h"
-#include "distributed/multi_resowner.h"
 #include "distributed/multi_server_executor.h"
 #include "distributed/resource_lock.h"
+#include "distributed/transaction_management.h"
+#include "distributed/version_compat.h"
+#include "distributed/worker_shard_visibility.h"
 #include "distributed/worker_protocol.h"
 #include "executor/execdebug.h"
 #include "commands/copy.h"
+#include "nodes/execnodes.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "parser/parsetree.h"
+#include "parser/parse_oper.h"
 #include "storage/lmgr.h"
 #include "tcop/dest.h"
 #include "tcop/pquery.h"
@@ -43,17 +52,35 @@
 
 /*
  * Controls the connection type for multi shard modifications, DDLs
- * TRUNCATE and real-time SELECT queries.
+ * TRUNCATE and multi-shard SELECT queries.
  */
 int MultiShardConnectionType = PARALLEL_CONNECTION;
 bool WritableStandbyCoordinator = false;
 
+/*
+ * Pointer to bound parameters of the current ongoing call to ExecutorRun.
+ * If executor is not running, then this value is meaningless.
+ */
+ParamListInfo executorBoundParams = NULL;
+
+
+/* sort the returning to get consistent outputs, used only for testing */
+bool SortReturning = false;
+
+/*
+ * How many nested executors have we started? This can happen for SQL
+ * UDF calls. The outer query starts an executor, then postgres opens
+ * another executor to run the SQL UDF.
+ */
+int ExecutorLevel = 0;
+
 
 /* local function forward declarations */
-static bool IsCitusPlan(Plan *plan);
-static bool IsCitusCustomScan(Plan *plan);
 static Relation StubRelation(TupleDesc tupleDescriptor);
 static bool AlterTableConstraintCheck(QueryDesc *queryDesc);
+static List * FindCitusCustomScanStates(PlanState *planState);
+static bool CitusCustomScanStateWalker(PlanState *planState,
+									   List **citusCustomScanStates);
 
 /*
  * CitusExecutorStart is the ExecutorStart_hook that gets called when
@@ -107,123 +134,153 @@ CitusExecutorRun(QueryDesc *queryDesc,
 				 ScanDirection direction, uint64 count, bool execute_once)
 {
 	DestReceiver *dest = queryDesc->dest;
-	int originalLevel = FunctionCallLevel;
 
-	if (dest->mydest == DestSPI)
-	{
-		/*
-		 * If the query runs via SPI, we assume we're in a function call
-		 * and we should treat statements as part of a bigger transaction.
-		 * We reset this counter to 0 in the abort handler.
-		 */
-		FunctionCallLevel++;
-	}
+	ParamListInfo savedBoundParams = executorBoundParams;
 
 	/*
-	 * Disable execution of ALTER TABLE constraint validation queries. These
-	 * constraints will be validated in worker nodes, so running these queries
-	 * from the coordinator would be redundant.
-	 *
-	 * For example, ALTER TABLE ... ATTACH PARTITION checks that the new
-	 * partition doesn't violate constraints of the parent table, which
-	 * might involve running some SELECT queries.
-	 *
-	 * Ideally we'd completely skip these checks in the coordinator, but we don't
-	 * have any means to tell postgres to skip the checks. So the best we can do is
-	 * to not execute the queries and return an empty result set, as if this table has
-	 * no rows, so no constraints will be violated.
+	 * Save a pointer to query params so UDFs can access them by calling
+	 * ExecutorBoundParams().
 	 */
-	if (AlterTableConstraintCheck(queryDesc))
-	{
-		EState *estate = queryDesc->estate;
+	executorBoundParams = queryDesc->params;
 
-		estate->es_processed = 0;
-		estate->es_lastoid = InvalidOid;
+	/*
+	 * We do some potentially time consuming operations our self now before we hand of
+	 * control to postgres' executor. To make sure that time spent is accurately measured
+	 * we remove the totaltime instrumentation from the queryDesc. Instead we will start
+	 * and stop the instrumentation of the total time and put it back on the queryDesc
+	 * before returning (or rethrowing) from this function.
+	 */
+	Instrumentation *volatile totalTime = queryDesc->totaltime;
+	queryDesc->totaltime = NULL;
 
-		/* start and shutdown tuple receiver to simulate empty result */
-		dest->rStartup(queryDesc->dest, CMD_SELECT, queryDesc->tupDesc);
-		dest->rShutdown(dest);
-	}
-	else
+	PG_TRY();
 	{
-		standard_ExecutorRun(queryDesc, direction, count, execute_once);
-	}
+		ExecutorLevel++;
 
-	if (dest->mydest == DestSPI)
-	{
+		if (totalTime)
+		{
+			InstrStartNode(totalTime);
+		}
+
 		/*
-		 * Restore the original value. It is not sufficient to decrease
-		 * the value because exceptions might cause us to go back a few
-		 * levels at once.
+		 * Disable execution of ALTER TABLE constraint validation queries. These
+		 * constraints will be validated in worker nodes, so running these queries
+		 * from the coordinator would be redundant.
+		 *
+		 * For example, ALTER TABLE ... ATTACH PARTITION checks that the new
+		 * partition doesn't violate constraints of the parent table, which
+		 * might involve running some SELECT queries.
+		 *
+		 * Ideally we'd completely skip these checks in the coordinator, but we don't
+		 * have any means to tell postgres to skip the checks. So the best we can do is
+		 * to not execute the queries and return an empty result set, as if this table has
+		 * no rows, so no constraints will be violated.
 		 */
-		FunctionCallLevel = originalLevel;
+		if (AlterTableConstraintCheck(queryDesc))
+		{
+			EState *estate = queryDesc->estate;
+
+			estate->es_processed = 0;
+#if PG_VERSION_NUM < PG_VERSION_12
+			estate->es_lastoid = InvalidOid;
+#endif
+
+			/* start and shutdown tuple receiver to simulate empty result */
+			dest->rStartup(queryDesc->dest, CMD_SELECT, queryDesc->tupDesc);
+			dest->rShutdown(dest);
+		}
+		else
+		{
+			/* switch into per-query memory context before calling PreExecScan */
+			MemoryContext oldcontext = MemoryContextSwitchTo(
+				queryDesc->estate->es_query_cxt);
+
+			/*
+			 * Call PreExecScan for all citus custom scan nodes prior to starting the
+			 * postgres exec scan to give some citus scan nodes some time to initialize
+			 * state that would be too late if it were to initialize when the first tuple
+			 * would need to return.
+			 */
+			List *citusCustomScanStates = FindCitusCustomScanStates(queryDesc->planstate);
+			CitusScanState *citusScanState = NULL;
+			foreach_ptr(citusScanState, citusCustomScanStates)
+			{
+				if (citusScanState->PreExecScan)
+				{
+					citusScanState->PreExecScan(citusScanState);
+				}
+			}
+
+			/* postgres will switch here again and will restore back on its own */
+			MemoryContextSwitchTo(oldcontext);
+
+			standard_ExecutorRun(queryDesc, direction, count, execute_once);
+		}
+
+		if (totalTime)
+		{
+			InstrStopNode(totalTime, queryDesc->estate->es_processed);
+			queryDesc->totaltime = totalTime;
+		}
+
+		executorBoundParams = savedBoundParams;
+		ExecutorLevel--;
+
+		if (ExecutorLevel == 0 && PlannerLevel == 0)
+		{
+			/*
+			 * We are leaving Citus code so no one should have any references to
+			 * cache entries. Release them now to not hold onto memory in long
+			 * transactions.
+			 */
+			CitusTableCacheFlushInvalidatedEntries();
+		}
 	}
+	PG_CATCH();
+	{
+		if (totalTime)
+		{
+			queryDesc->totaltime = totalTime;
+		}
+
+		executorBoundParams = savedBoundParams;
+		ExecutorLevel--;
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 
 /*
- * IsCitusPlan returns whether a Plan contains a CustomScan generated by Citus
- * by recursively walking through the plan tree.
+ * FindCitusCustomScanStates returns a list of all citus custom scan states in it.
  */
-static bool
-IsCitusPlan(Plan *plan)
+static List *
+FindCitusCustomScanStates(PlanState *planState)
 {
-	if (plan == NULL)
-	{
-		return false;
-	}
-
-	if (IsCitusCustomScan(plan))
-	{
-		return true;
-	}
-
-	if (plan->lefttree != NULL && IsCitusPlan(plan->lefttree))
-	{
-		return true;
-	}
-
-	if (plan->righttree != NULL && IsCitusPlan(plan->righttree))
-	{
-		return true;
-	}
-
-	return false;
+	List *citusCustomScanStates = NIL;
+	CitusCustomScanStateWalker(planState, &citusCustomScanStates);
+	return citusCustomScanStates;
 }
 
 
 /*
- * IsCitusCustomScan returns whether Plan node is a CustomScan generated by Citus.
+ * CitusCustomScanStateWalker walks a planState tree structure and adds all
+ * CitusCustomState nodes to the list passed by reference as the second argument.
  */
 static bool
-IsCitusCustomScan(Plan *plan)
+CitusCustomScanStateWalker(PlanState *planState, List **citusCustomScanStates)
 {
-	CustomScan *customScan = NULL;
-	Node *privateNode = NULL;
-
-	if (plan == NULL)
+	if (IsCitusCustomState(planState))
 	{
-		return false;
-	}
+		CitusScanState *css = (CitusScanState *) planState;
+		*citusCustomScanStates = lappend(*citusCustomScanStates, css);
 
-	if (!IsA(plan, CustomScan))
-	{
-		return false;
+		/* breaks the walking of this tree */
+		return true;
 	}
-
-	customScan = (CustomScan *) plan;
-	if (list_length(customScan->custom_private) == 0)
-	{
-		return false;
-	}
-
-	privateNode = (Node *) linitial(customScan->custom_private);
-	if (!CitusIsA(privateNode, DistributedPlan))
-	{
-		return false;
-	}
-
-	return true;
+	return planstate_tree_walker(planState, CitusCustomScanStateWalker,
+								 citusCustomScanStates);
 }
 
 
@@ -236,8 +293,6 @@ TupleTableSlot *
 ReturnTupleFromTuplestore(CitusScanState *scanState)
 {
 	Tuplestorestate *tupleStore = scanState->tuplestorestate;
-	TupleTableSlot *resultSlot = NULL;
-	ScanDirection scanDirection = NoMovementScanDirection;
 	bool forwardScanDirection = true;
 
 	if (tupleStore == NULL)
@@ -245,7 +300,8 @@ ReturnTupleFromTuplestore(CitusScanState *scanState)
 		return NULL;
 	}
 
-	scanDirection = scanState->customScanState.ss.ps.state->es_direction;
+	EState *executorState = ScanStateGetExecutorState(scanState);
+	ScanDirection scanDirection = executorState->es_direction;
 	Assert(ScanDirectionIsValid(scanDirection));
 
 	if (ScanDirectionIsBackward(scanDirection))
@@ -253,57 +309,77 @@ ReturnTupleFromTuplestore(CitusScanState *scanState)
 		forwardScanDirection = false;
 	}
 
-	resultSlot = scanState->customScanState.ss.ps.ps_ResultTupleSlot;
-	tuplestore_gettupleslot(tupleStore, forwardScanDirection, false, resultSlot);
+	ExprState *qual = scanState->customScanState.ss.ps.qual;
+	ProjectionInfo *projInfo = scanState->customScanState.ss.ps.ps_ProjInfo;
+	ExprContext *econtext = scanState->customScanState.ss.ps.ps_ExprContext;
 
-	return resultSlot;
-}
-
-
-/*
- * Load data collected by real-time or task-tracker executors into the tuplestore
- * of CitusScanState. For that, we first create a tuple store, and then copy the
- * files one-by-one into the tuple store.
- *
- * Note that in the long term it'd be a lot better if Multi*Execute() directly
- * filled the tuplestores, but that's a fair bit of work.
- */
-void
-LoadTuplesIntoTupleStore(CitusScanState *citusScanState, Job *workerJob)
-{
-	CustomScanState customScanState = citusScanState->customScanState;
-	List *workerTaskList = workerJob->taskList;
-	TupleDesc tupleDescriptor = NULL;
-	ListCell *workerTaskCell = NULL;
-	bool randomAccess = true;
-	bool interTransactions = false;
-	char *copyFormat = "text";
-
-	tupleDescriptor = customScanState.ss.ps.ps_ResultTupleSlot->tts_tupleDescriptor;
-
-	Assert(citusScanState->tuplestorestate == NULL);
-	citusScanState->tuplestorestate =
-		tuplestore_begin_heap(randomAccess, interTransactions, work_mem);
-
-	if (BinaryMasterCopyFormat)
+	if (!qual && !projInfo)
 	{
-		copyFormat = "binary";
+		/* no quals, nor projections return directly from the tuple store. */
+		TupleTableSlot *slot = scanState->customScanState.ss.ss_ScanTupleSlot;
+		tuplestore_gettupleslot(tupleStore, forwardScanDirection, false, slot);
+		return slot;
 	}
 
-	foreach(workerTaskCell, workerTaskList)
+	for (;;)
 	{
-		Task *workerTask = (Task *) lfirst(workerTaskCell);
-		StringInfo jobDirectoryName = NULL;
-		StringInfo taskFilename = NULL;
+		/*
+		 * If there is a very selective qual on the Citus Scan node we might block
+		 * interupts for a longer time if we would not check for interrupts in this loop
+		 */
+		CHECK_FOR_INTERRUPTS();
 
-		jobDirectoryName = MasterJobDirectoryName(workerTask->jobId);
-		taskFilename = TaskFilename(jobDirectoryName, workerTask->taskId);
+		/*
+		 * Reset per-tuple memory context to free any expression evaluation
+		 * storage allocated in the previous tuple cycle.
+		 */
+		ResetExprContext(econtext);
 
-		ReadFileIntoTupleStore(taskFilename->data, copyFormat, tupleDescriptor,
-							   citusScanState->tuplestorestate);
+		TupleTableSlot *slot = scanState->customScanState.ss.ss_ScanTupleSlot;
+		tuplestore_gettupleslot(tupleStore, forwardScanDirection, false, slot);
+
+		if (TupIsNull(slot))
+		{
+			/*
+			 * When the tuple is null we have reached the end of the tuplestore. We will
+			 * return a null tuple, however, depending on the existence of a projection we
+			 * need to either return the scan tuple or the projected tuple.
+			 */
+			if (projInfo)
+			{
+				return ExecClearTuple(projInfo->pi_state.resultslot);
+			}
+			else
+			{
+				return slot;
+			}
+		}
+
+		/* place the current tuple into the expr context */
+		econtext->ecxt_scantuple = slot;
+
+		if (!ExecQual(qual, econtext))
+		{
+			/* skip nodes that do not satisfy the qual (filter) */
+			InstrCountFiltered1(scanState, 1);
+			continue;
+		}
+
+		/* found a satisfactory scan tuple */
+		if (projInfo)
+		{
+			/*
+			 * Form a projection tuple, store it in the result tuple slot and return it.
+			 * ExecProj works on the ecxt_scantuple on the context stored earlier.
+			 */
+			return ExecProject(projInfo);
+		}
+		else
+		{
+			/* Here, we aren't projecting, so just return scan tuple */
+			return slot;
+		}
 	}
-
-	tuplestore_donestoring(citusScanState->tuplestorestate);
 }
 
 
@@ -316,8 +392,6 @@ void
 ReadFileIntoTupleStore(char *fileName, char *copyFormat, TupleDesc tupleDescriptor,
 					   Tuplestorestate *tupstore)
 {
-	CopyState copyState = NULL;
-
 	/*
 	 * Trick BeginCopyFrom into using our tuple descriptor by pretending it belongs
 	 * to a relation.
@@ -332,26 +406,23 @@ ReadFileIntoTupleStore(char *fileName, char *copyFormat, TupleDesc tupleDescript
 	Datum *columnValues = palloc0(columnCount * sizeof(Datum));
 	bool *columnNulls = palloc0(columnCount * sizeof(bool));
 
-	DefElem *copyOption = NULL;
 	List *copyOptions = NIL;
 
 	int location = -1; /* "unknown" token location */
-	copyOption = makeDefElem("format", (Node *) makeString(copyFormat), location);
+	DefElem *copyOption = makeDefElem("format", (Node *) makeString(copyFormat),
+									  location);
 	copyOptions = lappend(copyOptions, copyOption);
 
-	copyState = BeginCopyFrom(NULL, stubRelation, fileName, false, NULL,
-							  NULL, copyOptions);
+	CopyState copyState = BeginCopyFrom(NULL, stubRelation, fileName, false, NULL,
+										NULL, copyOptions);
 
 	while (true)
 	{
-		MemoryContext oldContext = NULL;
-		bool nextRowFound = false;
-
 		ResetPerTupleExprContext(executorState);
-		oldContext = MemoryContextSwitchTo(executorTupleContext);
+		MemoryContext oldContext = MemoryContextSwitchTo(executorTupleContext);
 
-		nextRowFound = NextCopyFrom(copyState, executorExpressionContext,
-									columnValues, columnNulls, NULL);
+		bool nextRowFound = NextCopyFromCompat(copyState, executorExpressionContext,
+											   columnValues, columnNulls);
 		if (!nextRowFound)
 		{
 			MemoryContextSwitchTo(oldContext);
@@ -365,6 +436,103 @@ ReadFileIntoTupleStore(char *fileName, char *copyFormat, TupleDesc tupleDescript
 	EndCopyFrom(copyState);
 	pfree(columnValues);
 	pfree(columnNulls);
+}
+
+
+/*
+ * SortTupleStore gets a CitusScanState and sorts the tuplestore by all the
+ * entries in the target entry list, starting from the first one and
+ * ending with the last entry.
+ *
+ * The sorting is done in ASC order.
+ */
+void
+SortTupleStore(CitusScanState *scanState)
+{
+	TupleDesc tupleDescriptor = ScanStateGetTupleDescriptor(scanState);
+	Tuplestorestate *tupleStore = scanState->tuplestorestate;
+
+	List *targetList = scanState->customScanState.ss.ps.plan->targetlist;
+	uint32 expectedColumnCount = list_length(targetList);
+
+	/* Convert list-ish representation to arrays wanted by executor */
+	int numberOfSortKeys = expectedColumnCount;
+	AttrNumber *sortColIdx = (AttrNumber *) palloc(numberOfSortKeys * sizeof(AttrNumber));
+	Oid *sortOperators = (Oid *) palloc(numberOfSortKeys * sizeof(Oid));
+	Oid *collations = (Oid *) palloc(numberOfSortKeys * sizeof(Oid));
+	bool *nullsFirst = (bool *) palloc(numberOfSortKeys * sizeof(bool));
+
+	int sortKeyIndex = 0;
+
+	/*
+	 * Iterate on the returning target list and generate the necessary information
+	 * for sorting the tuples.
+	 */
+	TargetEntry *returningEntry = NULL;
+	foreach_ptr(returningEntry, targetList)
+	{
+		Oid sortop = InvalidOid;
+
+		/* determine the sortop, we don't need anything else */
+		get_sort_group_operators(exprType((Node *) returningEntry->expr),
+								 true, false, false,
+								 &sortop, NULL, NULL,
+								 NULL);
+
+		sortColIdx[sortKeyIndex] = sortKeyIndex + 1;
+		sortOperators[sortKeyIndex] = sortop;
+		collations[sortKeyIndex] = exprCollation((Node *) returningEntry->expr);
+		nullsFirst[sortKeyIndex] = false;
+
+		sortKeyIndex++;
+	}
+
+	Tuplesortstate *tuplesortstate =
+		tuplesort_begin_heap(tupleDescriptor, numberOfSortKeys, sortColIdx, sortOperators,
+							 collations, nullsFirst, work_mem, NULL, false);
+
+	while (true)
+	{
+		TupleTableSlot *slot = ReturnTupleFromTuplestore(scanState);
+
+		if (TupIsNull(slot))
+		{
+			break;
+		}
+
+		/* tuplesort_puttupleslot copies the slot into sort context */
+		tuplesort_puttupleslot(tuplesortstate, slot);
+	}
+
+	/* perform the actual sort operation */
+	tuplesort_performsort(tuplesortstate);
+
+	/*
+	 * Truncate the existing tupleStore, because we'll fill it back
+	 * from the sorted tuplestore.
+	 */
+	tuplestore_clear(tupleStore);
+
+	/* iterate over all the sorted tuples, add them to original tuplestore */
+	while (true)
+	{
+		TupleTableSlot *newSlot = MakeSingleTupleTableSlotCompat(tupleDescriptor,
+																 &TTSOpsMinimalTuple);
+		bool found = tuplesort_gettupleslot(tuplesortstate, true, false, newSlot, NULL);
+
+		if (!found)
+		{
+			break;
+		}
+
+		/* tuplesort_puttupleslot copies the slot into the tupleStore context */
+		tuplestore_puttupleslot(tupleStore, newSlot);
+	}
+
+	tuplestore_rescan(scanState->tuplestorestate);
+
+	/* terminate the sort, clear unnecessary resources */
+	tuplesort_end(tuplesortstate);
 }
 
 
@@ -394,7 +562,7 @@ void
 ExecuteQueryStringIntoDestReceiver(const char *queryString, ParamListInfo params,
 								   DestReceiver *dest)
 {
-	Query *query = ParseQueryString(queryString);
+	Query *query = ParseQueryString(queryString, NULL, 0);
 
 	ExecuteQueryIntoDestReceiver(query, params, dest);
 }
@@ -404,18 +572,34 @@ ExecuteQueryStringIntoDestReceiver(const char *queryString, ParamListInfo params
  * ParseQuery parses query string and returns a Query struct.
  */
 Query *
-ParseQueryString(const char *queryString)
+ParseQueryString(const char *queryString, Oid *paramOids, int numParams)
 {
-	Query *query = NULL;
 	RawStmt *rawStmt = (RawStmt *) ParseTreeRawStmt(queryString);
-	List *queryTreeList = pg_analyze_and_rewrite(rawStmt, queryString, NULL, 0, NULL);
+
+	/* rewrite the parsed RawStmt to produce a Query */
+	Query *query = RewriteRawQueryStmt(rawStmt, queryString, paramOids, numParams);
+
+	return query;
+}
+
+
+/*
+ * RewriteRawQueryStmt rewrites the given parsed RawStmt according to the other
+ * parameters and returns a Query struct.
+ */
+Query *
+RewriteRawQueryStmt(RawStmt *rawStmt, const char *queryString, Oid *paramOids, int
+					numParams)
+{
+	List *queryTreeList =
+		pg_analyze_and_rewrite(rawStmt, queryString, paramOids, numParams, NULL);
 
 	if (list_length(queryTreeList) != 1)
 	{
 		ereport(ERROR, (errmsg("can only execute a single query")));
 	}
 
-	query = (Query *) linitial(queryTreeList);
+	Query *query = (Query *) linitial(queryTreeList);
 
 	return query;
 }
@@ -428,32 +612,34 @@ ParseQueryString(const char *queryString)
 void
 ExecuteQueryIntoDestReceiver(Query *query, ParamListInfo params, DestReceiver *dest)
 {
-	PlannedStmt *queryPlan = NULL;
-	int cursorOptions = 0;
+	int cursorOptions = CURSOR_OPT_PARALLEL_OK;
 
-	cursorOptions = CURSOR_OPT_PARALLEL_OK;
+	if (query->commandType == CMD_UTILITY)
+	{
+		/* can only execute DML/SELECT via this path */
+		ereport(ERROR, (errmsg("cannot execute utility commands")));
+	}
 
 	/* plan the subquery, this may be another distributed query */
-	queryPlan = pg_plan_query(query, cursorOptions, params);
+	PlannedStmt *queryPlan = pg_plan_query_compat(query, NULL, cursorOptions, params);
 
 	ExecutePlanIntoDestReceiver(queryPlan, params, dest);
 }
 
 
 /*
- * ExecuteIntoDestReceiver plans and executes a query and sends results to the given
+ * ExecutePlanIntoDestReceiver executes a query plan and sends results to the given
  * DestReceiver.
  */
 void
 ExecutePlanIntoDestReceiver(PlannedStmt *queryPlan, ParamListInfo params,
 							DestReceiver *dest)
 {
-	Portal portal = NULL;
 	int eflags = 0;
 	long count = FETCH_ALL;
 
 	/* create a new portal for executing the query */
-	portal = CreateNewPortal();
+	Portal portal = CreateNewPortal();
 
 	/* don't display the portal in pg_cursors, it is for internal use only */
 	portal->visible = false;
@@ -461,7 +647,7 @@ ExecutePlanIntoDestReceiver(PlannedStmt *queryPlan, ParamListInfo params,
 	PortalDefineQuery(portal,
 					  NULL,
 					  "",
-					  "SELECT",
+					  CMDTAG_SELECT_COMPAT,
 					  list_make1(queryPlan),
 					  NULL);
 
@@ -472,8 +658,8 @@ ExecutePlanIntoDestReceiver(PlannedStmt *queryPlan, ParamListInfo params,
 
 
 /*
- * SetLocalMultiShardModifyModeToSequential simply a C interface for
- * setting the following:
+ * SetLocalMultiShardModifyModeToSequential is simply a C interface for setting
+ * the following:
  *      SET LOCAL citus.multi_shard_modify_mode = 'sequential';
  */
 void
@@ -520,4 +706,17 @@ AlterTableConstraintCheck(QueryDesc *queryDesc)
 	}
 
 	return true;
+}
+
+
+/*
+ * ExecutorBoundParams returns the bound parameters of the current ongoing call
+ * to ExecutorRun. This is meant to be used by UDFs which need to access bound
+ * parameters.
+ */
+ParamListInfo
+ExecutorBoundParams(void)
+{
+	Assert(ExecutorLevel > 0);
+	return executorBoundParams;
 }

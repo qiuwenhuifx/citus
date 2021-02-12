@@ -10,7 +10,22 @@ INSERT INTO reference_table_test VALUES (3, 3.0, '3', '2016-12-03');
 INSERT INTO reference_table_test VALUES (4, 4.0, '4', '2016-12-04');
 INSERT INTO reference_table_test VALUES (5, 5.0, '5', '2016-12-05');
 
+-- SELECT .. FOR UPDATE should work on coordinator (takes lock on first worker)
+SELECT value_1, value_2 FROM reference_table_test ORDER BY value_1, value_2 LIMIT 1 FOR UPDATE;
+
+BEGIN;
+SELECT value_1, value_2 FROM reference_table_test ORDER BY value_1, value_2 LIMIT 1 FOR UPDATE;
+END;
+
 \c - - - :worker_1_port
+
+-- SELECT .. FOR UPDATE should work on first worker (takes lock on self)
+SELECT value_1, value_2 FROM reference_table_test ORDER BY value_1, value_2 LIMIT 1 FOR UPDATE;
+
+BEGIN;
+SELECT value_1, value_2 FROM reference_table_test ORDER BY value_1, value_2 LIMIT 1 FOR UPDATE;
+END;
+
 -- run some queries on top of the data
 SELECT
 	*
@@ -340,6 +355,13 @@ INSERT INTO reference_table_test_third VALUES (5, 5.0, '5', '2016-12-05');
 
 \c - - - :worker_2_port
 
+-- SELECT .. FOR UPDATE should work on second worker (takes lock on first worker)
+SELECT value_1, value_2 FROM reference_table_test ORDER BY value_1, value_2 LIMIT 1 FOR UPDATE;
+
+BEGIN;
+SELECT value_1, value_2 FROM reference_table_test ORDER BY value_1, value_2 LIMIT 1 FOR UPDATE;
+END;
+
 -- some very basic tests
 SELECT
 	DISTINCT t1.value_1
@@ -471,60 +493,79 @@ INSERT INTO colocated_table_test_2 VALUES (2, 2.0, '2', '2016-12-02');
 SET client_min_messages TO DEBUG1;
 SET citus.log_multi_join_order TO TRUE;
 
-SELECT 
+SELECT
 	reference_table_test.value_1
-FROM 
+FROM
 	reference_table_test, colocated_table_test
-WHERE 
-	colocated_table_test.value_1 = reference_table_test.value_1;
+WHERE
+	colocated_table_test.value_1 = reference_table_test.value_1
+ORDER BY 1;
 
-SELECT 
+SELECT
 	colocated_table_test.value_2
-FROM 
-	reference_table_test, colocated_table_test 
-WHERE 
-	colocated_table_test.value_2 = reference_table_test.value_2;
+FROM
+	reference_table_test, colocated_table_test
+WHERE
+	colocated_table_test.value_2 = reference_table_test.value_2
+ORDER BY 1;
 
-SELECT 
+SELECT
 	colocated_table_test.value_2
-FROM 
+FROM
 	colocated_table_test, reference_table_test
-WHERE 
-	reference_table_test.value_1 = colocated_table_test.value_1;
+WHERE
+	reference_table_test.value_1 = colocated_table_test.value_1
+ORDER BY 1;
 
-SELECT 
-	colocated_table_test.value_2 
-FROM 
-	reference_table_test, colocated_table_test, colocated_table_test_2
-WHERE 
-	colocated_table_test.value_2 = reference_table_test.value_2;
 
-SELECT 
-	colocated_table_test.value_2 
-FROM 
+SET citus.enable_repartition_joins = on;
+SELECT
+	colocated_table_test.value_2
+FROM
 	reference_table_test, colocated_table_test, colocated_table_test_2
-WHERE 
-	colocated_table_test.value_1 = colocated_table_test_2.value_1 AND colocated_table_test.value_2 = reference_table_test.value_2;
+WHERE
+	colocated_table_test.value_2 = reference_table_test.value_2
+ORDER BY colocated_table_test.value_2;
+RESET citus.enable_repartition_joins;
 
-SET citus.task_executor_type to "task-tracker";
-SELECT 
-	colocated_table_test.value_2 
-FROM 
+SELECT
+	colocated_table_test.value_2
+FROM
 	reference_table_test, colocated_table_test, colocated_table_test_2
-WHERE 
-	colocated_table_test.value_2 = colocated_table_test_2.value_2 AND colocated_table_test.value_2 = reference_table_test.value_2;
+WHERE
+	colocated_table_test.value_1 = colocated_table_test_2.value_1 AND colocated_table_test.value_2 = reference_table_test.value_2
+ORDER BY 1;
 
-SELECT 
-	reference_table_test.value_2 
-FROM 
+SET citus.enable_repartition_joins to ON;
+SELECT
+	colocated_table_test.value_2
+FROM
 	reference_table_test, colocated_table_test, colocated_table_test_2
-WHERE 
-	colocated_table_test.value_1 = reference_table_test.value_1 AND colocated_table_test_2.value_1 = reference_table_test.value_1;
+WHERE
+	colocated_table_test.value_2 = colocated_table_test_2.value_2 AND colocated_table_test.value_2 = reference_table_test.value_2
+ORDER BY 1;
+
+SELECT
+	reference_table_test.value_2
+FROM
+	reference_table_test, colocated_table_test, colocated_table_test_2
+WHERE
+	colocated_table_test.value_1 = reference_table_test.value_1 AND colocated_table_test_2.value_1 = reference_table_test.value_1
+ORDER BY 1;
 
 
 SET client_min_messages TO NOTICE;
 SET citus.log_multi_join_order TO FALSE;
 
--- clean up tables
 \c - - - :master_port
-DROP TABLE reference_table_test, reference_table_test_second, reference_table_test_third;;
+
+-- issue 3766
+CREATE TABLE numbers(a int);
+SELECT create_reference_table('numbers');
+SET client_min_messages TO debug4;
+INSERT INTO numbers VALUES (1), (2), (3), (4);
+SELECT count(*) FROM numbers;
+RESET client_min_messages;
+
+-- clean up tables
+DROP TABLE reference_table_test, reference_table_test_second, reference_table_test_third, numbers;

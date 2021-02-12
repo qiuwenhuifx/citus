@@ -16,10 +16,11 @@ SELECT create_distributed_table('source_table', 'a');
 INSERT INTO dest_table (a, b) VALUES (1, 1);
 INSERT INTO dest_table (a, b) VALUES (2, 1);
 
+INSERT INTO source_table (a, b) VALUES (1, 5);
 INSERT INTO source_table (a, b) VALUES (10, 10);
 
--- simluate actually having secondary nodes
-SELECT * FROM pg_dist_node;
+-- simulate actually having secondary nodes
+SELECT nodeid, groupid, nodename, nodeport, noderack, isactive, noderole, nodecluster FROM pg_dist_node;
 UPDATE pg_dist_node SET noderole = 'secondary';
 
 \c "dbname=regression options='-c\ citus.use_secondary_nodes=always'"
@@ -40,16 +41,68 @@ SELECT
 FROM
     (
 	     WITH cte AS (
-	    SELECT 
-	    	DISTINCT dest_table.a 
-	     FROM 
-	     	dest_table, source_table 
-	     WHERE 
-	     	source_table.a = dest_table.a AND 
+	    SELECT
+	    	DISTINCT dest_table.a
+	     FROM
+	     	dest_table, source_table
+	     WHERE
+	     	source_table.a = dest_table.a AND
 	     dest_table.b IN (1,2,3,4)
 	     ) SELECT * FROM cte ORDER BY 1 DESC LIMIT 5
      ) as foo ORDER BY 1;
+
+-- intermediate result pruning should still work
+SET citus.log_intermediate_results TO TRUE;
+
+SELECT *
+FROM
+(
+    WITH dest_table_cte AS (
+        SELECT a
+        FROM dest_table
+    ),
+    joined_source_table_cte_1 AS (
+        SELECT b, a
+        FROM source_table
+        INNER JOIN dest_table_cte USING (a)
+    ),
+    joined_source_table_cte_2 AS (
+        SELECT b, a
+        FROM joined_source_table_cte_1
+        INNER JOIN dest_table_cte USING (a)
+    )
+    SELECT SUM(b) OVER (PARTITION BY coalesce(a, NULL))
+    FROM dest_table_cte
+    INNER JOIN joined_source_table_cte_2 USING (a)
+) inner_query;
+
+-- confirm that the pruning works well when using round-robin as well
+SET citus.task_assignment_policy to 'round-robin';
+SELECT *
+FROM
+(
+    WITH dest_table_cte AS (
+        SELECT a
+        FROM dest_table
+    ),
+    joined_source_table_cte_1 AS (
+        SELECT b, a
+        FROM source_table
+        INNER JOIN dest_table_cte USING (a)
+    ),
+    joined_source_table_cte_2 AS (
+        SELECT b, a
+        FROM joined_source_table_cte_1
+        INNER JOIN dest_table_cte USING (a)
+    )
+    SELECT SUM(b) OVER (PARTITION BY coalesce(a, NULL))
+    FROM dest_table_cte
+    INNER JOIN joined_source_table_cte_2 USING (a)
+) inner_query;
+
+SET citus.task_assignment_policy to DEFAULT;
 SET client_min_messages TO DEFAULT;
+SET citus.log_intermediate_results TO DEFAULT;
 
 -- insert into is definitely not allowed
 INSERT INTO dest_table (a, b)
@@ -57,4 +110,4 @@ INSERT INTO dest_table (a, b)
 
 \c "dbname=regression options='-c\ citus.use_secondary_nodes=never'"
 UPDATE pg_dist_node SET noderole = 'primary';
-DROP TABLE dest_table;
+DROP TABLE source_table, dest_table;

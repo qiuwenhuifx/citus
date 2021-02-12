@@ -6,7 +6,7 @@
  *   subsystems, this files, and especially CoordinatedTransactionCallback,
  *   coordinates the work between them.
  *
- * Copyright (c) 2016, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -20,14 +20,24 @@
 #include "access/twophase.h"
 #include "access/xact.h"
 #include "distributed/backend_data.h"
+#include "distributed/citus_safe_lib.h"
 #include "distributed/connection_management.h"
+#include "distributed/distributed_planner.h"
 #include "distributed/hash_helpers.h"
 #include "distributed/intermediate_results.h"
-#include "distributed/multi_shard_transaction.h"
+#include "distributed/listutils.h"
+#include "distributed/local_executor.h"
+#include "distributed/locally_reserved_shared_connections.h"
+#include "distributed/maintenanced.h"
+#include "distributed/multi_executor.h"
+#include "distributed/multi_explain.h"
+#include "distributed/repartition_join_execution.h"
 #include "distributed/transaction_management.h"
 #include "distributed/placement_connection.h"
+#include "distributed/shared_connection_stats.h"
 #include "distributed/subplan_execution.h"
 #include "distributed/version_compat.h"
+#include "distributed/worker_log_messages.h"
 #include "utils/hsearch.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
@@ -38,7 +48,26 @@ CoordinatedTransactionState CurrentCoordinatedTransactionState = COORD_TRANS_NON
 
 /* GUC, the commit protocol to use for commands affecting more than one connection */
 int MultiShardCommitProtocol = COMMIT_PROTOCOL_2PC;
+int SingleShardCommitProtocol = COMMIT_PROTOCOL_2PC;
 int SavedMultiShardCommitProtocol = COMMIT_PROTOCOL_BARE;
+
+/*
+ * GUC that determines whether a SELECT in a transaction block should also run in
+ * a transaction block on the worker even if no writes have occurred yet.
+ */
+bool SelectOpensTransactionBlock = true;
+
+/* controls use of locks to enforce safe commutativity */
+bool AllModificationsCommutative = false;
+
+/* we've deprecated this flag, keeping here for some time not to break existing users */
+bool EnableDeadlockPrevention = true;
+
+/* number of nested stored procedure call levels we are currently in */
+int StoredProcedureLevel = 0;
+
+/* number of nested DO block levels we are currently in */
+int DoBlockLevel = 0;
 
 /* state needed to keep track of operations used during a transaction */
 XactModificationType XactModificationLevel = XACT_MODIFICATION_NONE;
@@ -46,8 +75,20 @@ XactModificationType XactModificationLevel = XACT_MODIFICATION_NONE;
 /* list of connections that are part of the current coordinated transaction */
 dlist_head InProgressTransactions = DLIST_STATIC_INIT(InProgressTransactions);
 
-/* stack of active sub-transactions */
-static List *activeSubXacts = NIL;
+/*
+ * activeSetStmts keeps track of SET LOCAL statements executed within the current
+ * subxact and will be set to NULL when pushing into new subxact or ending top xact.
+ */
+StringInfo activeSetStmts;
+
+/*
+ * Though a list, we treat this as a stack, pushing on subxact contexts whenever
+ * e.g. a SAVEPOINT is executed (though this is actually performed by providing
+ * PostgreSQL with a sub-xact callback). At present, the context of a subxact
+ * includes a subxact identifier as well as any SET LOCAL statements propagated
+ * to workers during the sub-transaction.
+ */
+static List *activeSubXactContexts = NIL;
 
 /* some pre-allocated memory so we don't need to call malloc() during callbacks */
 MemoryContext CommitContext = NULL;
@@ -62,8 +103,8 @@ bool CoordinatedTransactionUses2PC = false;
 /* if disabled, distributed statements in a function may run as separate transactions */
 bool FunctionOpensTransactionBlock = true;
 
-/* stack depth of UDF calls */
-int FunctionCallLevel = 0;
+/* if true, we should trigger metadata sync on commit */
+bool MetadataSyncOnCommit = false;
 
 
 /* transaction management functions */
@@ -72,19 +113,26 @@ static void CoordinatedSubTransactionCallback(SubXactEvent event, SubTransaction
 											  SubTransactionId parentSubid, void *arg);
 
 /* remaining functions */
+static void ResetShardPlacementTransactionState(void);
 static void AdjustMaxPreparedTransactions(void);
 static void PushSubXact(SubTransactionId subId);
 static void PopSubXact(SubTransactionId subId);
-static void SwallowErrors(void (*func)());
+static bool MaybeExecutingUDF(void);
+static void ResetGlobalVariables(void);
 
 
 /*
- * BeginCoordinatedTransaction begins a coordinated transaction. No
- * pre-existing coordinated transaction may be in progress.
+ * UseCoordinatedTransaction sets up the necessary variables to use
+ * a coordinated transaction, unless one is already in progress.
  */
 void
-BeginCoordinatedTransaction(void)
+UseCoordinatedTransaction(void)
 {
+	if (CurrentCoordinatedTransactionState == COORD_TRANS_STARTED)
+	{
+		return;
+	}
+
 	if (CurrentCoordinatedTransactionState != COORD_TRANS_NONE &&
 		CurrentCoordinatedTransactionState != COORD_TRANS_IDLE)
 	{
@@ -93,23 +141,32 @@ BeginCoordinatedTransaction(void)
 
 	CurrentCoordinatedTransactionState = COORD_TRANS_STARTED;
 
-	AssignDistributedTransactionId();
+	/*
+	 * If assign_distributed_transaction_id() has been called, we should reuse
+	 * that identifier so distributed deadlock detection works properly.
+	 */
+	DistributedTransactionId *transactionId = GetCurrentDistributedTransactionId();
+	if (transactionId->transactionNumber == 0)
+	{
+		AssignDistributedTransactionId();
+	}
 }
 
 
 /*
- * BeginOrContinueCoordinatedTransaction starts a coordinated transaction,
- * unless one already is in progress.
+ * EnsureDistributedTransactionId makes sure that the current transaction
+ * has a distributed transaction id. It is either assigned by a previous
+ * call of assign_distributed_transaction_id(), or by starting a coordinated
+ * transaction.
  */
 void
-BeginOrContinueCoordinatedTransaction(void)
+EnsureDistributedTransactionId(void)
 {
-	if (CurrentCoordinatedTransactionState == COORD_TRANS_STARTED)
+	DistributedTransactionId *transactionId = GetCurrentDistributedTransactionId();
+	if (transactionId->transactionNumber == 0)
 	{
-		return;
+		UseCoordinatedTransaction();
 	}
-
-	BeginCoordinatedTransaction();
 }
 
 
@@ -209,10 +266,23 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 				AfterXactConnectionHandling(true);
 			}
 
-			CurrentCoordinatedTransactionState = COORD_TRANS_NONE;
-			XactModificationLevel = XACT_MODIFICATION_NONE;
-			dlist_init(&InProgressTransactions);
-			CoordinatedTransactionUses2PC = false;
+			/*
+			 * Changes to catalog tables are now visible to the metadata sync
+			 * daemon, so we can trigger metadata sync if necessary.
+			 */
+			if (MetadataSyncOnCommit)
+			{
+				TriggerMetadataSync(MyDatabaseId);
+			}
+
+			ResetGlobalVariables();
+
+			/*
+			 * Make sure that we give the shared connections back to the shared
+			 * pool if any. This operation is a no-op if the reserved connections
+			 * are already given away.
+			 */
+			DeallocateReservedConnections();
 
 			UnSetDistributedTransactionId();
 
@@ -224,6 +294,9 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 
 		case XACT_EVENT_ABORT:
 		{
+			/* stop propagating notices from workers, we know the query is failed */
+			DisableWorkerMessagePropagation();
+
 			/*
 			 * FIXME: Add warning for the COORD_TRANS_COMMITTED case. That
 			 * can be reached if this backend fails after the
@@ -244,7 +317,7 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 				 * RemoveIntermediateResultsDirectory.
 				 */
 				AtEOXact_Files(false);
-				SwallowErrors(RemoveIntermediateResultsDirectory);
+				RemoveIntermediateResultsDirectory();
 			}
 			ResetShardPlacementTransactionState();
 
@@ -261,11 +334,22 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 				AfterXactConnectionHandling(false);
 			}
 
-			CurrentCoordinatedTransactionState = COORD_TRANS_NONE;
-			XactModificationLevel = XACT_MODIFICATION_NONE;
-			dlist_init(&InProgressTransactions);
-			CoordinatedTransactionUses2PC = false;
-			FunctionCallLevel = 0;
+			ResetGlobalVariables();
+
+			/*
+			 * Make sure that we give the shared connections back to the shared
+			 * pool if any. This operation is a no-op if the reserved connections
+			 * are already given away.
+			 */
+			DeallocateReservedConnections();
+
+			/*
+			 * We reset these mainly for posterity. The only way we would normally
+			 * get here with ExecutorLevel or PlannerLevel > 0 is during a fatal
+			 * error when the process is about to end.
+			 */
+			ExecutorLevel = 0;
+			PlannerLevel = 0;
 
 			/*
 			 * We should reset SubPlanLevel in case a transaction is aborted,
@@ -277,7 +361,6 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 			 */
 			SubPlanLevel = 0;
 			UnSetDistributedTransactionId();
-			UnsetCitusNoticeLevel();
 			break;
 		}
 
@@ -289,6 +372,9 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 
 		case XACT_EVENT_PREPARE:
 		{
+			/* we need to reset SavedExplainPlan before TopTransactionContext is deleted */
+			FreeSavedExplainPlan();
+
 			/*
 			 * This callback is only relevant for worker queries since
 			 * distributed queries cannot be executed with 2PC, see
@@ -374,7 +460,7 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 		case XACT_EVENT_PARALLEL_PRE_COMMIT:
 		case XACT_EVENT_PRE_PREPARE:
 		{
-			if (CurrentCoordinatedTransactionState > COORD_TRANS_NONE)
+			if (InCoordinatedTransaction())
 			{
 				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 								errmsg("cannot use 2PC in transactions involving "
@@ -387,8 +473,43 @@ CoordinatedTransactionCallback(XactEvent event, void *arg)
 
 
 /*
- * Subtransaction callback - currently only used to remember whether a
- * savepoint has been rolled back, as we don't support that.
+ * ResetGlobalVariables resets global variables that
+ * might be changed during the execution of queries.
+ */
+static void
+ResetGlobalVariables()
+{
+	CurrentCoordinatedTransactionState = COORD_TRANS_NONE;
+	XactModificationLevel = XACT_MODIFICATION_NONE;
+	SetLocalExecutionStatus(LOCAL_EXECUTION_OPTIONAL);
+	FreeSavedExplainPlan();
+	dlist_init(&InProgressTransactions);
+	activeSetStmts = NULL;
+	CoordinatedTransactionUses2PC = false;
+	TransactionModifiedNodeMetadata = false;
+	MetadataSyncOnCommit = false;
+	ResetWorkerErrorIndication();
+}
+
+
+/*
+ * ResetShardPlacementTransactionState performs cleanup after the end of a
+ * transaction.
+ */
+static void
+ResetShardPlacementTransactionState(void)
+{
+	if (MultiShardCommitProtocol == COMMIT_PROTOCOL_BARE)
+	{
+		MultiShardCommitProtocol = SavedMultiShardCommitProtocol;
+		SavedMultiShardCommitProtocol = COMMIT_PROTOCOL_BARE;
+	}
+}
+
+
+/*
+ * CoordinatedSubTransactionCallback is the callback used to implement
+ * distributed ROLLBACK TO SAVEPOINT.
  */
 static void
 CoordinatedSubTransactionCallback(SubXactEvent event, SubTransactionId subId,
@@ -396,6 +517,16 @@ CoordinatedSubTransactionCallback(SubXactEvent event, SubTransactionId subId,
 {
 	switch (event)
 	{
+		/*
+		 * Our subtransaction stack should be consistent with postgres' internal
+		 * transaction stack. In case of subxact begin, postgres calls our
+		 * callback after it has pushed the transaction into stack, so we have to
+		 * do the same even if worker commands fail, so we PushSubXact() first.
+		 * In case of subxact commit, callback is called before pushing subxact to
+		 * the postgres transaction stack, so we call PopSubXact() after making sure
+		 * worker commands didn't fail. Otherwise, Postgres would roll back that
+		 * would cause us to call PopSubXact again.
+		 */
 		case SUBXACT_EVENT_START_SUB:
 		{
 			PushSubXact(subId);
@@ -408,23 +539,33 @@ CoordinatedSubTransactionCallback(SubXactEvent event, SubTransactionId subId,
 
 		case SUBXACT_EVENT_COMMIT_SUB:
 		{
-			PopSubXact(subId);
 			if (InCoordinatedTransaction())
 			{
 				CoordinatedRemoteTransactionsSavepointRelease(subId);
 			}
+			PopSubXact(subId);
 			break;
 		}
 
 		case SUBXACT_EVENT_ABORT_SUB:
 		{
-			PopSubXact(subId);
+			/*
+			 * Stop showing message for now, will re-enable when executing
+			 * the next statement.
+			 */
+			DisableWorkerMessagePropagation();
+
+			/*
+			 * Given that we aborted, worker error indications can be ignored.
+			 */
+			ResetWorkerErrorIndication();
+
 			if (InCoordinatedTransaction())
 			{
 				CoordinatedRemoteTransactionsSavepointRollback(subId);
 			}
+			PopSubXact(subId);
 
-			UnsetCitusNoticeLevel();
 			break;
 		}
 
@@ -455,7 +596,7 @@ AdjustMaxPreparedTransactions(void)
 	{
 		char newvalue[12];
 
-		snprintf(newvalue, sizeof(newvalue), "%d", MaxConnections * 2);
+		SafeSnprintf(newvalue, sizeof(newvalue), "%d", MaxConnections * 2);
 
 		SetConfigOption("max_prepared_transactions", newvalue, PGC_POSTMASTER,
 						PGC_S_OVERRIDE);
@@ -472,8 +613,27 @@ AdjustMaxPreparedTransactions(void)
 static void
 PushSubXact(SubTransactionId subId)
 {
-	MemoryContext old_context = MemoryContextSwitchTo(CurTransactionContext);
-	activeSubXacts = lcons_int(subId, activeSubXacts);
+	/*
+	 * We need to allocate these in TopTransactionContext instead of current
+	 * subxact's memory context. This is because AtSubCommit_Memory won't
+	 * delete the subxact's memory context unless it is empty, and this
+	 * can cause in memory leaks. For emptiness it just checks if the memory
+	 * has been reset, and we cannot reset the subxact context since other
+	 * data can be in the context that are needed by upper commits.
+	 *
+	 * See https://github.com/citusdata/citus/issues/3999
+	 */
+	MemoryContext old_context = MemoryContextSwitchTo(TopTransactionContext);
+
+	/* save provided subId as well as propagated SET LOCAL stmts */
+	SubXactContext *state = palloc(sizeof(SubXactContext));
+	state->subId = subId;
+	state->setLocalCmds = activeSetStmts;
+
+	/* append to list and reset active set stmts for upcoming sub-xact */
+	activeSubXactContexts = lcons(state, activeSubXactContexts);
+	activeSetStmts = makeStringInfo();
+
 	MemoryContextSwitchTo(old_context);
 }
 
@@ -482,76 +642,54 @@ PushSubXact(SubTransactionId subId)
 static void
 PopSubXact(SubTransactionId subId)
 {
-	MemoryContext old_context = MemoryContextSwitchTo(CurTransactionContext);
-	Assert(linitial_int(activeSubXacts) == subId);
-	activeSubXacts = list_delete_first(activeSubXacts);
-	MemoryContextSwitchTo(old_context);
-}
+	SubXactContext *state = linitial(activeSubXactContexts);
 
-
-/* ActiveSubXacts returns list of active sub-transactions in temporal order. */
-List *
-ActiveSubXacts(void)
-{
-	ListCell *subIdCell = NULL;
-	List *activeSubXactsReversed = NIL;
+	Assert(state->subId == subId);
 
 	/*
-	 * activeSubXacts is in reversed temporal order, so we reverse it to get it
-	 * in temporal order.
+	 * Free activeSetStmts to avoid memory leaks when we create subxacts
+	 * for each row, e.g. in exception handling of UDFs.
 	 */
-	foreach(subIdCell, activeSubXacts)
+	if (activeSetStmts != NULL)
 	{
-		SubTransactionId subId = lfirst_int(subIdCell);
-		activeSubXactsReversed = lcons_int(subId, activeSubXactsReversed);
+		pfree(activeSetStmts->data);
+		pfree(activeSetStmts);
 	}
 
-	return activeSubXactsReversed;
+	/*
+	 * SET LOCAL commands are local to subxact blocks. When a subxact commits
+	 * or rolls back, we should roll back our set of SET LOCAL commands to the
+	 * ones we had in the upper commit.
+	 */
+	activeSetStmts = state->setLocalCmds;
+
+	/*
+	 * Free state to avoid memory leaks when we create subxacts for each row,
+	 * e.g. in exception handling of UDFs.
+	 */
+	pfree(state);
+
+	activeSubXactContexts = list_delete_first(activeSubXactContexts);
 }
 
 
-/*
- * If an ERROR is thrown while processing a transaction the ABORT handler is called.
- * ERRORS thrown during ABORT are not treated any differently, the ABORT handler is also
- * called during processing of those. If an ERROR was raised the first time through it's
- * unlikely that the second try will succeed; more likely that an ERROR will be thrown
- * again. This loop continues until Postgres notices and PANICs, complaining about a stack
- * overflow.
- *
- * Instead of looping and crashing, SwallowErrors lets us attempt to continue running the
- * ABORT logic. This wouldn't be safe in most other parts of the codebase, in
- * approximately none of the places where we emit ERROR do we first clean up after
- * ourselves! It's fine inside the ABORT handler though; Postgres is going to clean
- * everything up before control passes back to us.
- */
-static void
-SwallowErrors(void (*func)())
+/* ActiveSubXactContexts returns the list of active sub-xact context in temporal order. */
+List *
+ActiveSubXactContexts(void)
 {
-	MemoryContext savedContext = CurrentMemoryContext;
+	List *reversedSubXactStates = NIL;
 
-	PG_TRY();
+	/*
+	 * activeSubXactContexts is in reversed temporal order, so we reverse it to get it
+	 * in temporal order.
+	 */
+	SubXactContext *state = NULL;
+	foreach_ptr(state, activeSubXactContexts)
 	{
-		func();
+		reversedSubXactStates = lcons(state, reversedSubXactStates);
 	}
-	PG_CATCH();
-	{
-		ErrorData *edata = CopyErrorData();
 
-		/* don't try to intercept PANIC or FATAL, let those breeze past us */
-		if (edata->elevel != ERROR)
-		{
-			PG_RE_THROW();
-		}
-
-		/* turn the ERROR into a WARNING and emit it */
-		edata->elevel = WARNING;
-		ThrowErrorData(edata);
-
-		/* leave the error handling system */
-		FlushErrorState();
-		MemoryContextSwitchTo(savedContext);
-	}
-	PG_END_TRY();
+	return reversedSubXactStates;
 }
 
 
@@ -569,12 +707,17 @@ IsMultiStatementTransaction(void)
 		/* in a BEGIN...END block */
 		return true;
 	}
+	else if (DoBlockLevel > 0)
+	{
+		/* in (a transaction within) a do block */
+		return true;
+	}
 	else if (StoredProcedureLevel > 0)
 	{
 		/* in (a transaction within) a stored procedure */
 		return true;
 	}
-	else if (FunctionCallLevel > 0 && FunctionOpensTransactionBlock)
+	else if (MaybeExecutingUDF() && FunctionOpensTransactionBlock)
 	{
 		/* in a language-handler function call, open a transaction if configured to do so */
 		return true;
@@ -583,4 +726,31 @@ IsMultiStatementTransaction(void)
 	{
 		return false;
 	}
+}
+
+
+/*
+ * MaybeExecutingUDF returns true if we are possibly executing a function call.
+ * We use nested level of executor to check this, so this can return true for
+ * CTEs, etc. which also start nested executors.
+ *
+ * If the planner is being called from the executor, then we may also be in
+ * a UDF.
+ */
+static bool
+MaybeExecutingUDF(void)
+{
+	return ExecutorLevel > 1 || (ExecutorLevel == 1 && PlannerLevel > 0);
+}
+
+
+/*
+ * TriggerMetadataSyncOnCommit sets a flag to do metadata sync on commit.
+ * This is because new metadata only becomes visible to the metadata sync
+ * daemon after commit happens.
+ */
+void
+TriggerMetadataSyncOnCommit(void)
+{
+	MetadataSyncOnCommit = true;
 }

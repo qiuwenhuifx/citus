@@ -1,9 +1,13 @@
 SELECT citus.mitmproxy('conn.allow()');
 
+-- do not cache any connections
+SET citus.max_cached_conns_per_worker TO 0;
+
 SET citus.shard_count = 1;
 SET citus.shard_replication_factor = 2; -- one shard per worker
 SET citus.multi_shard_commit_protocol TO '1pc';
 SET citus.next_shard_id TO 100400;
+SET citus.max_cached_conns_per_worker TO 0;
 ALTER SEQUENCE pg_catalog.pg_dist_placement_placementid_seq RESTART 100;
 
 CREATE TABLE copy_test (key int, value int);

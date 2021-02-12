@@ -2,7 +2,6 @@
 -- MULTI_TASK_STRING_SIZE
 --
 SET citus.next_shard_id TO 1602000;
-ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 1602000;
 
 CREATE TABLE wide_table
 (
@@ -210,13 +209,6 @@ CREATE TABLE wide_table
 
 SELECT create_distributed_table('wide_table', 'long_column_001');
 
-SET citus.task_executor_type TO 'task-tracker';
-
-SHOW citus.max_task_string_size;
-
--- setting can not be changed on runtime
-SET citus.max_task_string_size TO 20000;
-
 -- error message may vary between executions
 -- hiding warning and error message
 -- no output means the query has failed
@@ -226,6 +218,7 @@ SELECT raise_failed_execution('
 SELECT u.* FROM wide_table u JOIN wide_table v ON (u.long_column_002 = v.long_column_003);
 ');
 
+SET citus.enable_repartition_joins to ON;
 -- following will succeed since it fetches few columns
 SELECT u.long_column_001, u.long_column_002, u.long_column_003 FROM wide_table u JOIN wide_table v ON (u.long_column_002 = v.long_column_003);
 
@@ -234,5 +227,4 @@ RESET client_min_messages;
 DROP TABLE wide_table;
 
 RESET citus.shard_count;
-RESET citus.task_executor_type;
 

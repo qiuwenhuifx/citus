@@ -29,28 +29,41 @@
  * could use to decide the shard that a distributed query touches reside on
  * a worker node.
  *
- * Copyright (c) 2019, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
+#include "distributed/pg_version_constants.h"
+
 #include "distributed/distributed_planner.h"
+#include "distributed/insert_select_planner.h"
 #include "distributed/multi_physical_planner.h" /* only to use some utility functions */
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_router_planner.h"
 #include "distributed/pg_dist_partition.h"
 #include "distributed/shardinterval_utils.h"
 #include "distributed/shard_pruning.h"
+#if PG_VERSION_NUM >= PG_VERSION_12
+#include "nodes/makefuncs.h"
+#endif
 #include "nodes/nodeFuncs.h"
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
+#if PG_VERSION_NUM >= PG_VERSION_12
+#include "optimizer/optimizer.h"
+#else
 #include "optimizer/clauses.h"
+#endif
+#include "tcop/pquery.h"
 
 bool EnableFastPathRouterPlanner = true;
 
 static bool ColumnAppearsMultipleTimes(Node *quals, Var *distributionKey);
-static bool ConjunctionContainsColumnFilter(Node *node, Var *column);
-static bool DistKeyInSimpleOpExpression(Expr *clause, Var *distColumn);
+static bool ConjunctionContainsColumnFilter(Node *node, Var *column,
+											Node **distributionKeyValue);
+static bool DistKeyInSimpleOpExpression(Expr *clause, Var *distColumn,
+										Node **distributionKeyValue);
 
 
 /*
@@ -64,23 +77,6 @@ static bool DistKeyInSimpleOpExpression(Expr *clause, Var *distColumn);
 PlannedStmt *
 FastPathPlanner(Query *originalQuery, Query *parse, ParamListInfo boundParams)
 {
-	PlannedStmt *result = NULL;
-
-	/*
-	 * To support prepared statements for fast-path queries, we resolve the
-	 * external parameters at this point. Note that this is normally done by
-	 * eval_const_expr() in standard planner when the boundParams are avaliable.
-	 * If not avaliable, as does for all other types of queries, Citus goes
-	 * through the logic of increasing the cost of the plan and forcing
-	 * PostgreSQL to pick custom plans.
-	 *
-	 * We're also only interested in resolving the quals since we'd want to
-	 * do shard pruning based on the filter on the distribution column.
-	 */
-	originalQuery->jointree->quals =
-		ResolveExternalParams((Node *) originalQuery->jointree->quals,
-							  copyParamList(boundParams));
-
 	/*
 	 * Citus planner relies on some of the transformations on constant
 	 * evaluation on the parse tree.
@@ -90,8 +86,7 @@ FastPathPlanner(Query *originalQuery, Query *parse, ParamListInfo boundParams)
 	parse->jointree->quals =
 		(Node *) eval_const_expressions(NULL, (Node *) parse->jointree->quals);
 
-
-	result = GeneratePlaceHolderPlannedStmt(originalQuery);
+	PlannedStmt *result = GeneratePlaceHolderPlannedStmt(originalQuery);
 
 	return result;
 }
@@ -115,14 +110,17 @@ GeneratePlaceHolderPlannedStmt(Query *parse)
 	PlannedStmt *result = makeNode(PlannedStmt);
 	SeqScan *seqScanNode = makeNode(SeqScan);
 	Plan *plan = &seqScanNode->plan;
-	Oid relationId = InvalidOid;
 
-	AssertArg(FastPathRouterQuery(parse));
+	Node *distKey PG_USED_FOR_ASSERTS_ONLY = NULL;
+
+	AssertArg(FastPathRouterQuery(parse, &distKey));
 
 	/* there is only a single relation rte */
 	seqScanNode->scanrelid = 1;
 
-	plan->targetlist = copyObject(parse->targetList);
+	plan->targetlist =
+		copyObject(FetchStatementTargetList((Node *) parse));
+
 	plan->qual = NULL;
 	plan->lefttree = NULL;
 	plan->righttree = NULL;
@@ -135,8 +133,9 @@ GeneratePlaceHolderPlannedStmt(Query *parse)
 
 	result->rtable = copyObject(parse->rtable);
 	result->planTree = (Plan *) plan;
+	result->hasReturning = (parse->returningList != NIL);
 
-	relationId = ExtractFirstDistributedTableId(parse);
+	Oid relationId = ExtractFirstCitusTableId(parse);
 	result->relationOids = list_make1_oid(relationId);
 
 	return result;
@@ -154,38 +153,41 @@ GeneratePlaceHolderPlannedStmt(Query *parse)
  *      and it should be ANDed with any other filters. Also, the distribution
  *      key should only exists once in the WHERE clause. So basically,
  *          SELECT ... FROM dist_table WHERE dist_key = X
- *   - No returning for UPDATE/DELETE queries
+ *      If the filter is a const, distributionKeyValue is set
+ *   - All INSERT statements (including multi-row INSERTs) as long as the commands
+ *     don't have any sublinks/CTEs etc
  */
 bool
-FastPathRouterQuery(Query *query)
+FastPathRouterQuery(Query *query, Node **distributionKeyValue)
 {
-	RangeTblEntry *rangeTableEntry = NULL;
 	FromExpr *joinTree = query->jointree;
 	Node *quals = NULL;
-	Oid distributedTableId = InvalidOid;
-	Var *distributionKey = NULL;
-	DistTableCacheEntry *cacheEntry = NULL;
 
 	if (!EnableFastPathRouterPlanner)
 	{
 		return false;
 	}
 
-	if (!(query->commandType == CMD_SELECT || query->commandType == CMD_UPDATE ||
-		  query->commandType == CMD_DELETE))
+	/*
+	 * We want to deal with only very simple queries. Some of the
+	 * checks might be too restrictive, still we prefer this way.
+	 */
+	if (query->cteList != NIL || query->hasSubLinks ||
+		query->setOperations != NULL || query->hasTargetSRFs ||
+		query->hasModifyingCTE)
 	{
 		return false;
 	}
 
-	/*
-	 * We want to deal with only very simple select queries. Some of the
-	 * checks might be too restrictive, still we prefer this way.
-	 */
-	if (query->cteList != NIL || query->returningList != NIL ||
-		query->hasSubLinks || query->setOperations != NULL ||
-		query->hasTargetSRFs || query->hasModifyingCTE)
+	if (CheckInsertSelectQuery(query))
 	{
+		/* we don't support INSERT..SELECT in the fast-path */
 		return false;
+	}
+	else if (query->commandType == CMD_INSERT)
+	{
+		/* we don't need to do any further checks, all INSERTs are fast-path */
+		return true;
 	}
 
 	/* make sure that the only range table in FROM clause */
@@ -194,30 +196,31 @@ FastPathRouterQuery(Query *query)
 		return false;
 	}
 
-	rangeTableEntry = (RangeTblEntry *) linitial(query->rtable);
+	RangeTblEntry *rangeTableEntry = (RangeTblEntry *) linitial(query->rtable);
 	if (rangeTableEntry->rtekind != RTE_RELATION)
 	{
 		return false;
 	}
 
 	/* we don't want to deal with append/range distributed tables */
-	distributedTableId = rangeTableEntry->relid;
-	cacheEntry = DistributedTableCacheEntry(distributedTableId);
-	if (!(cacheEntry->partitionMethod == DISTRIBUTE_BY_HASH ||
-		  cacheEntry->partitionMethod == DISTRIBUTE_BY_NONE))
+	Oid distributedTableId = rangeTableEntry->relid;
+	CitusTableCacheEntry *cacheEntry = GetCitusTableCacheEntry(distributedTableId);
+	if (IsCitusTableTypeCacheEntry(cacheEntry, RANGE_DISTRIBUTED) ||
+		IsCitusTableTypeCacheEntry(cacheEntry, APPEND_DISTRIBUTED))
 	{
 		return false;
 	}
 
 	/* WHERE clause should not be empty for distributed tables */
 	if (joinTree == NULL ||
-		(cacheEntry->partitionMethod != DISTRIBUTE_BY_NONE && joinTree->quals == NULL))
+		(IsCitusTableTypeCacheEntry(cacheEntry, DISTRIBUTED_TABLE) && joinTree->quals ==
+		 NULL))
 	{
 		return false;
 	}
 
 	/* if that's a reference table, we don't need to check anything further */
-	distributionKey = PartitionColumn(distributedTableId, 1);
+	Var *distributionKey = PartitionColumn(distributedTableId, 1);
 	if (!distributionKey)
 	{
 		return true;
@@ -244,7 +247,7 @@ FastPathRouterQuery(Query *query)
 	 *	This is to simplify both of the individual checks and omit various edge cases
 	 *	that might arise with multiple distribution keys in the quals.
 	 */
-	if (ConjunctionContainsColumnFilter(quals, distributionKey) &&
+	if (ConjunctionContainsColumnFilter(quals, distributionKey, distributionKeyValue) &&
 		!ColumnAppearsMultipleTimes(quals, distributionKey))
 	{
 		return true;
@@ -262,11 +265,10 @@ static bool
 ColumnAppearsMultipleTimes(Node *quals, Var *distributionKey)
 {
 	ListCell *varClauseCell = NULL;
-	List *varClauseList = NIL;
 	int partitionColumnReferenceCount = 0;
 
 	/* make sure partition column is used only once in the quals */
-	varClauseList = pull_var_clause_default(quals);
+	List *varClauseList = pull_var_clause_default(quals);
 	foreach(varClauseCell, varClauseList)
 	{
 		Var *column = (Var *) lfirst(varClauseCell);
@@ -289,9 +291,11 @@ ColumnAppearsMultipleTimes(Node *quals, Var *distributionKey)
  * ConjunctionContainsColumnFilter returns true if the query contains an exact
  * match (equal) expression on the provided column. The function returns true only
  * if the match expression has an AND relation with the rest of the expression tree.
+ *
+ * If the conjuction contains column filter which is const, distributionKeyValue is set.
  */
 static bool
-ConjunctionContainsColumnFilter(Node *node, Var *column)
+ConjunctionContainsColumnFilter(Node *node, Var *column, Node **distributionKeyValue)
 {
 	if (node == NULL)
 	{
@@ -302,7 +306,7 @@ ConjunctionContainsColumnFilter(Node *node, Var *column)
 	{
 		OpExpr *opExpr = (OpExpr *) node;
 		bool distKeyInSimpleOpExpression =
-			DistKeyInSimpleOpExpression((Expr *) opExpr, column);
+			DistKeyInSimpleOpExpression((Expr *) opExpr, column, distributionKeyValue);
 
 		if (!distKeyInSimpleOpExpression)
 		{
@@ -333,7 +337,8 @@ ConjunctionContainsColumnFilter(Node *node, Var *column)
 		{
 			Node *argumentNode = (Node *) lfirst(argumentCell);
 
-			if (ConjunctionContainsColumnFilter(argumentNode, column))
+			if (ConjunctionContainsColumnFilter(argumentNode, column,
+												distributionKeyValue))
 			{
 				return true;
 			}
@@ -348,30 +353,23 @@ ConjunctionContainsColumnFilter(Node *node, Var *column)
  * DistKeyInSimpleOpExpression checks whether given expression is a simple operator
  * expression with either (dist_key = param) or (dist_key = const). Note that the
  * operands could be in the reverse order as well.
+ *
+ * When a const is found, distributionKeyValue is set.
  */
 static bool
-DistKeyInSimpleOpExpression(Expr *clause, Var *distColumn)
+DistKeyInSimpleOpExpression(Expr *clause, Var *distColumn, Node **distributionKeyValue)
 {
-	Node *leftOperand = NULL;
-	Node *rightOperand = NULL;
 	Param *paramClause = NULL;
 	Const *constantClause = NULL;
 
 	Var *columnInExpr = NULL;
 
-	if (is_opclause(clause) && list_length(((OpExpr *) clause)->args) == 2)
+	Node *leftOperand;
+	Node *rightOperand;
+	if (!BinaryOpExpression(clause, &leftOperand, &rightOperand))
 	{
-		leftOperand = get_leftop(clause);
-		rightOperand = get_rightop(clause);
+		return false;
 	}
-	else
-	{
-		return false; /* not a binary opclause */
-	}
-
-	/* strip coercions before doing check */
-	leftOperand = strip_implicit_coercions(leftOperand);
-	rightOperand = strip_implicit_coercions(rightOperand);
 
 	if (IsA(rightOperand, Param) && IsA(leftOperand, Var))
 	{
@@ -411,6 +409,18 @@ DistKeyInSimpleOpExpression(Expr *clause, Var *distColumn)
 
 	/* at this point we should have the columnInExpr */
 	Assert(columnInExpr);
+	bool distColumnExists = equal(distColumn, columnInExpr);
+	if (distColumnExists && constantClause != NULL &&
+		distColumn->vartype == constantClause->consttype &&
+		*distributionKeyValue == NULL)
+	{
+		/* if the vartypes do not match, let shard pruning handle it later */
+		*distributionKeyValue = (Node *) copyObject(constantClause);
+	}
+	else if (paramClause != NULL)
+	{
+		*distributionKeyValue = (Node *) copyObject(paramClause);
+	}
 
-	return equal(distColumn, columnInExpr);
+	return distColumnExists;
 }

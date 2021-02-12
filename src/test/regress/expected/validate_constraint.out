@@ -28,14 +28,6 @@ SET citus.shard_count TO 8;
 SET citus.next_shard_id TO 8000000;
 SET citus.next_placement_id TO 8000000;
 CREATE TYPE constraint_validity AS (name text, validated bool);
-SELECT run_command_on_workers(
-         $$CREATE TYPE constraint_validity AS (name text, validated bool)$$);
-      run_command_on_workers       
------------------------------------
- (localhost,57637,t,"CREATE TYPE")
- (localhost,57638,t,"CREATE TYPE")
-(2 rows)
-
 CREATE VIEW constraint_validations_in_workers AS
   SELECT (json_populate_record(NULL :: constraint_validity,
                                json_array_elements_text((run_command_on_workers($$
@@ -63,23 +55,23 @@ CREATE VIEW constraint_validations AS
     AND contype = 'c';
 CREATE TABLE referenced_table (id int UNIQUE, test_column int);
 SELECT create_reference_table('referenced_table');
- create_reference_table 
-------------------------
- 
+ create_reference_table
+---------------------------------------------------------------------
+
 (1 row)
 
 CREATE TABLE referencing_table (id int, ref_id int);
 SELECT create_distributed_table('referencing_table', 'ref_id');
- create_distributed_table 
---------------------------
- 
+ create_distributed_table
+---------------------------------------------------------------------
+
 (1 row)
 
 CREATE TABLE constrained_table (id int, constrained_column int);
 SELECT create_distributed_table('constrained_table', 'constrained_column');
- create_distributed_table 
---------------------------
- 
+ create_distributed_table
+---------------------------------------------------------------------
+
 (1 row)
 
 -- The two constraint types that are allowed to be NOT VALID
@@ -119,16 +111,16 @@ ALTER TABLE constrained_table
 SELECT *
 FROM constraint_validations
 ORDER BY 1, 2;
-       Constraint       | Validated? 
-------------------------+------------
+       Constraint       | Validated?
+---------------------------------------------------------------------
  validatable_constraint | t
 (1 row)
 
 SELECT *
 FROM constraint_validations_in_workers
 ORDER BY 1, 2;
-              name              | validated 
---------------------------------+-----------
+              name              | validated
+---------------------------------------------------------------------
  validatable_constraint_8000009 | t
  validatable_constraint_8000010 | t
  validatable_constraint_8000011 | t

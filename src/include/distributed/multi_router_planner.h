@@ -4,7 +4,7 @@
  *
  * Declarations for public functions and types related to router planning.
  *
- * Copyright (c) 2014-2016, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -15,6 +15,7 @@
 #include "c.h"
 
 #include "distributed/errormessage.h"
+#include "distributed/log_utils.h"
 #include "distributed/multi_logical_planner.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/distributed_planner.h"
@@ -37,17 +38,26 @@ extern DeferredErrorMessage * PlanRouterQuery(Query *originalQuery,
 											  PlannerRestrictionContext *
 											  plannerRestrictionContext,
 											  List **placementList, uint64 *anchorShardId,
-											  List **relationShardList, bool
-											  replacePrunedQueryWithDummy,
+											  List **relationShardList,
+											  List **prunedShardIntervalListList,
+											  bool replacePrunedQueryWithDummy,
 											  bool *multiShardModifyQuery,
-											  Const **partitionValueConst);
-extern List * RouterInsertTaskList(Query *query, DeferredErrorMessage **planningError);
+											  Const **partitionValueConst,
+											  bool *containOnlyLocalTable);
+extern List * RelationShardListForShardIntervalList(List *shardIntervalList,
+													bool *shardsPresent);
+extern List * CreateTaskPlacementListForShardIntervals(List *shardIntervalList,
+													   bool shardsPresent,
+													   bool generateDummyPlacement,
+													   bool hasLocalRelation);
+extern List * RouterInsertTaskList(Query *query, bool parametersInQueryResolved,
+								   DeferredErrorMessage **planningError);
 extern Const * ExtractInsertPartitionKeyValue(Query *query);
 extern List * TargetShardIntervalsForRestrictInfo(RelationRestrictionContext *
 												  restrictionContext,
 												  bool *multiShardQuery,
 												  Const **partitionValueConst);
-extern List * WorkersContainingAllShards(List *prunedShardIntervalsList);
+extern List * PlacementsForWorkersContainingAllShards(List *shardIntervalListList);
 extern List * IntersectPlacementList(List *lhsPlacementList, List *rhsPlacementList);
 extern DeferredErrorMessage * ModifyQuerySupported(Query *queryTree, Query *originalQuery,
 												   bool multiShardQuery,
@@ -58,16 +68,26 @@ extern List * ShardIntervalOpExpressions(ShardInterval *shardInterval, Index rte
 extern RelationRestrictionContext * CopyRelationRestrictionContext(
 	RelationRestrictionContext *oldContext);
 
-extern Oid ExtractFirstDistributedTableId(Query *query);
+extern Oid ExtractFirstCitusTableId(Query *query);
 extern RangeTblEntry * ExtractSelectRangeTableEntry(Query *query);
 extern Oid ModifyQueryResultRelationId(Query *query);
-extern RangeTblEntry * ExtractInsertRangeTableEntry(Query *query);
+extern RangeTblEntry * ExtractResultRelationRTE(Query *query);
+extern RangeTblEntry * ExtractResultRelationRTEOrError(Query *query);
 extern RangeTblEntry * ExtractDistributedInsertValuesRTE(Query *query);
 extern bool IsMultiRowInsert(Query *query);
-extern void AddShardIntervalRestrictionToSelect(Query *subqery,
-												ShardInterval *shardInterval);
+extern void AddPartitionKeyNotNullFilterToSelect(Query *subqery);
 extern bool UpdateOrDeleteQuery(Query *query);
-extern List * WorkersContainingAllShards(List *prunedShardIntervalsList);
+
+extern uint64 GetAnchorShardId(List *relationShardList);
+extern List * TargetShardIntervalForFastPathQuery(Query *query,
+												  bool *isMultiShardQuery,
+												  Const *inputDistributionKeyValue,
+												  Const **outGoingPartitionValueConst);
+extern void GenerateSingleShardRouterTaskList(Job *job,
+											  List *relationShardList,
+											  List *placementList,
+											  uint64 shardId,
+											  bool isLocalTableModification);
 
 /*
  * FastPathPlanner is a subset of router planner, that's why we prefer to
@@ -76,6 +96,7 @@ extern List * WorkersContainingAllShards(List *prunedShardIntervalsList);
 
 extern PlannedStmt * FastPathPlanner(Query *originalQuery, Query *parse, ParamListInfo
 									 boundParams);
-extern bool FastPathRouterQuery(Query *query);
+extern bool FastPathRouterQuery(Query *query, Node **distributionKeyValue);
+
 
 #endif /* MULTI_ROUTER_PLANNER_H */

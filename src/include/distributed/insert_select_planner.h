@@ -5,7 +5,7 @@
  * Declarations for public functions and types related to planning
  * INSERT..SELECT commands.
  *
- * Copyright (c) 2017, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -23,17 +23,27 @@
 #include "nodes/plannodes.h"
 
 
-extern bool InsertSelectIntoDistributedTable(Query *query);
+extern bool InsertSelectIntoCitusTable(Query *query);
+extern bool CheckInsertSelectQuery(Query *query);
 extern bool InsertSelectIntoLocalTable(Query *query);
 extern Query * ReorderInsertSelectTargetLists(Query *originalQuery,
 											  RangeTblEntry *insertRte,
 											  RangeTblEntry *subqueryRte);
-extern void CoordinatorInsertSelectExplainScan(CustomScanState *node, List *ancestors,
+extern void NonPushableInsertSelectExplainScan(CustomScanState *node, List *ancestors,
 											   struct ExplainState *es);
 extern DistributedPlan * CreateInsertSelectPlan(uint64 planId, Query *originalQuery,
 												PlannerRestrictionContext *
-												plannerRestrictionContext);
+												plannerRestrictionContext,
+												ParamListInfo boundParams);
+extern DistributedPlan * CreateInsertSelectIntoLocalTablePlan(uint64 planId,
+															  Query *originalQuery,
+															  ParamListInfo
+															  boundParams, bool
+															  hasUnresolvedParams,
+															  PlannerRestrictionContext *
+															  plannerRestrictionContext);
 extern char * InsertSelectResultIdPrefix(uint64 planId);
+extern bool PlanningInsertSelect(void);
 
 
 #endif /* INSERT_SELECT_PLANNER_H */

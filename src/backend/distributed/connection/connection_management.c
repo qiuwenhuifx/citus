@@ -3,7 +3,7 @@
  * connection_management.c
  *   Central management of connections and their life-cycle
  *
- * Copyright (c) 2016, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -15,36 +15,53 @@
 
 #include "miscadmin.h"
 
+#include "safe_lib.h"
+
 #include "access/hash.h"
 #include "commands/dbcommands.h"
 #include "distributed/connection_management.h"
 #include "distributed/errormessage.h"
+#include "distributed/error_codes.h"
+#include "distributed/listutils.h"
+#include "distributed/log_utils.h"
 #include "distributed/memutils.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/hash_helpers.h"
 #include "distributed/placement_connection.h"
 #include "distributed/run_from_same_connection.h"
+#include "distributed/shared_connection_stats.h"
+#include "distributed/cancel_utils.h"
 #include "distributed/remote_commands.h"
 #include "distributed/version_compat.h"
+#include "distributed/worker_log_messages.h"
 #include "mb/pg_wchar.h"
+#include "portability/instr_time.h"
+#include "storage/ipc.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 
 
-int NodeConnectionTimeout = 5000;
+int NodeConnectionTimeout = 30000;
+int MaxCachedConnectionsPerWorker = 1;
+
 HTAB *ConnectionHash = NULL;
 HTAB *ConnParamsHash = NULL;
+
 MemoryContext ConnectionContext = NULL;
 
 static uint32 ConnectionHashHash(const void *key, Size keysize);
 static int ConnectionHashCompare(const void *a, const void *b, Size keysize);
-static MultiConnection * StartConnectionEstablishment(ConnectionHashKey *key);
+static void StartConnectionEstablishment(MultiConnection *connectionn,
+										 ConnectionHashKey *key);
+static MultiConnection * FindAvailableConnection(dlist_head *connections, uint32 flags);
 static void FreeConnParamsHashEntryFields(ConnParamsHashEntry *entry);
 static void AfterXactHostConnectionHandling(ConnectionHashEntry *entry, bool isCommit);
-static void DefaultCitusNoticeProcessor(void *arg, const char *message);
-static MultiConnection * FindAvailableConnection(dlist_head *connections, uint32 flags);
+static bool ShouldShutdownConnection(MultiConnection *connection, const int
+									 cachedConnectionCount);
+static void ResetConnection(MultiConnection *connection);
 static bool RemoteTransactionIdle(MultiConnection *connection);
 static int EventSetSizeForConnectionList(List *connections);
+
 
 /* types for async connection management */
 enum MultiConnectionPhase
@@ -65,13 +82,9 @@ typedef struct MultiConnectionPollState
 static bool MultiConnectionStatePoll(MultiConnectionPollState *connectionState);
 static WaitEventSet * WaitEventSetFromMultiConnectionStates(List *connections,
 															int *waitCount);
-static long DeadlineTimestampTzToTimeout(TimestampTz deadline);
 static void CloseNotReadyMultiConnectionStates(List *connectionStates);
 static uint32 MultiConnectionStateEventMask(MultiConnectionPollState *connectionState);
-
-
-static int CitusNoticeLogLevel = DEFAULT_CITUS_NOTICE_LEVEL;
-
+static void CitusPQFinish(MultiConnection *connection);
 
 /*
  * Initialize per-backend connection management infrastructure.
@@ -80,7 +93,6 @@ void
 InitializeConnectionManagement(void)
 {
 	HASHCTL info, connParamsInfo;
-	uint32 hashFlags = 0;
 
 	/*
 	 * Create a single context for connection and transaction related memory
@@ -100,9 +112,10 @@ InitializeConnectionManagement(void)
 	info.hash = ConnectionHashHash;
 	info.match = ConnectionHashCompare;
 	info.hcxt = ConnectionContext;
-	hashFlags = (HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT | HASH_COMPARE);
+	uint32 hashFlags = (HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT | HASH_COMPARE);
 
-	memcpy(&connParamsInfo, &info, sizeof(HASHCTL));
+	/* connParamsInfo is same as info, except for entrysize */
+	connParamsInfo = info;
 	connParamsInfo.entrysize = sizeof(ConnParamsHashEntry);
 
 	ConnectionHash = hash_create("citus connection cache (host,port,user,database)",
@@ -134,7 +147,7 @@ InvalidateConnParamsHashEntries(void)
 
 
 /*
- * Perform connection management activity after the end of a transaction. Both
+ * AfterXactConnectionHandling performs connection management activity after the end of a transaction. Both
  * COMMIT and ABORT paths are handled here.
  *
  * This is called by Citus' global transaction callback.
@@ -148,6 +161,12 @@ AfterXactConnectionHandling(bool isCommit)
 	hash_seq_init(&status, ConnectionHash);
 	while ((entry = (ConnectionHashEntry *) hash_seq_search(&status)) != 0)
 	{
+		if (!entry->isValid)
+		{
+			/* skip invalid connection hash entries */
+			continue;
+		}
+
 		AfterXactHostConnectionHandling(entry, isCommit);
 
 		/*
@@ -173,50 +192,6 @@ GetNodeConnection(uint32 flags, const char *hostname, int32 port)
 
 
 /*
- * GetNonDataAccessConnection() establishes a connection to remote node, using
- * default user and database. The returned connection is guaranteed to not have
- * been used for any data access over any placements.
- *
- * See StartNonDataAccessConnection for details.
- */
-MultiConnection *
-GetNonDataAccessConnection(const char *hostname, int32 port)
-{
-	MultiConnection *connection;
-
-	connection = StartNonDataAccessConnection(hostname, port);
-
-	FinishConnectionEstablishment(connection);
-
-	return connection;
-}
-
-
-/*
- * StartNonDataAccessConnection() initiates a connection that is
- * guaranteed to not have been used for any data access over any
- * placements.
- *
- * The returned connection is started with the default user and database.
- */
-MultiConnection *
-StartNonDataAccessConnection(const char *hostname, int32 port)
-{
-	uint32 flags = 0;
-	MultiConnection *connection = StartNodeConnection(flags, hostname, port);
-
-	if (ConnectionUsedForAnyPlacements(connection))
-	{
-		flags = FORCE_NEW_CONNECTION;
-
-		connection = StartNodeConnection(flags, hostname, port);
-	}
-
-	return connection;
-}
-
-
-/*
  * StartNodeConnection initiates a connection to remote node, using default
  * user and database.
  *
@@ -225,7 +200,16 @@ StartNonDataAccessConnection(const char *hostname, int32 port)
 MultiConnection *
 StartNodeConnection(uint32 flags, const char *hostname, int32 port)
 {
-	return StartNodeUserDatabaseConnection(flags, hostname, port, NULL, NULL);
+	MultiConnection *connection = StartNodeUserDatabaseConnection(flags, hostname, port,
+																  NULL, NULL);
+
+	/*
+	 * connection can only be NULL for optional connections, which we don't
+	 * support in this codepath.
+	 */
+	Assert((flags & OPTIONAL_CONNECTION) == 0);
+	Assert(connection != NULL);
+	return connection;
 }
 
 
@@ -235,12 +219,18 @@ StartNodeConnection(uint32 flags, const char *hostname, int32 port)
  * See StartNodeUserDatabaseConnection for details.
  */
 MultiConnection *
-GetNodeUserDatabaseConnection(uint32 flags, const char *hostname, int32 port, const
-							  char *user, const char *database)
+GetNodeUserDatabaseConnection(uint32 flags, const char *hostname, int32 port,
+							  const char *user, const char *database)
 {
-	MultiConnection *connection;
+	MultiConnection *connection = StartNodeUserDatabaseConnection(flags, hostname, port,
+																  user, database);
 
-	connection = StartNodeUserDatabaseConnection(flags, hostname, port, user, database);
+	/*
+	 * connection can only be NULL for optional connections, which we don't
+	 * support in this codepath.
+	 */
+	Assert((flags & OPTIONAL_CONNECTION) == 0);
+	Assert(connection != NULL);
 
 	FinishConnectionEstablishment(connection);
 
@@ -253,7 +243,6 @@ GetNodeUserDatabaseConnection(uint32 flags, const char *hostname, int32 port, co
  *
  * If user or database are NULL, the current session's defaults are used. The
  * following flags influence connection establishment behaviour:
- * - SESSION_LIFESPAN - the connection should persist after transaction end
  * - FORCE_NEW_CONNECTION - a new connection is required
  *
  * The returned connection has only been initiated, not fully
@@ -261,22 +250,21 @@ GetNodeUserDatabaseConnection(uint32 flags, const char *hostname, int32 port, co
  * that's not desired use the Get* variant.
  */
 MultiConnection *
-StartNodeUserDatabaseConnection(uint32 flags, const char *hostname, int32 port, const
-								char *user, const char *database)
+StartNodeUserDatabaseConnection(uint32 flags, const char *hostname, int32 port,
+								const char *user, const char *database)
 {
 	ConnectionHashKey key;
-	ConnectionHashEntry *entry = NULL;
-	MultiConnection *connection;
 	bool found;
 
 	/* do some minimal input checks */
-	strlcpy(key.hostname, hostname, MAX_NODE_LENGTH);
 	if (strlen(hostname) > MAX_NODE_LENGTH)
 	{
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("hostname exceeds the maximum length of %d",
 							   MAX_NODE_LENGTH)));
 	}
+
+	strlcpy(key.hostname, hostname, MAX_NODE_LENGTH);
 
 	key.port = port;
 	if (user)
@@ -307,49 +295,110 @@ StartNodeUserDatabaseConnection(uint32 flags, const char *hostname, int32 port, 
 	 * connection list empty.
 	 */
 
-	entry = hash_search(ConnectionHash, &key, HASH_ENTER, &found);
-	if (!found)
+	ConnectionHashEntry *entry = hash_search(ConnectionHash, &key, HASH_ENTER, &found);
+	if (!found || !entry->isValid)
 	{
+		/*
+		 * We are just building hash entry or previously it was left in an
+		 * invalid state as we couldn't allocate memory for it.
+		 * So initialize entry->connections list here.
+		 */
+		entry->isValid = false;
 		entry->connections = MemoryContextAlloc(ConnectionContext,
 												sizeof(dlist_head));
 		dlist_init(entry->connections);
+
+		/*
+		 * If MemoryContextAlloc errors out -e.g. during an OOM-, entry->connections
+		 * stays as NULL. So entry->isValid should be set to true right after we
+		 * initialize entry->connections properly.
+		 */
+		entry->isValid = true;
 	}
 
 	/* if desired, check whether there's a usable connection */
 	if (!(flags & FORCE_NEW_CONNECTION))
 	{
 		/* check connection cache for a connection that's not already in use */
-		connection = FindAvailableConnection(entry->connections, flags);
+		MultiConnection *connection = FindAvailableConnection(entry->connections, flags);
 		if (connection)
 		{
-			if (flags & SESSION_LIFESPAN)
-			{
-				connection->sessionLifespan = true;
-			}
-
 			return connection;
 		}
 	}
+
 
 	/*
 	 * Either no caching desired, or no pre-established, non-claimed,
 	 * connection present. Initiate connection establishment.
 	 */
-	connection = StartConnectionEstablishment(&key);
-
+	MultiConnection *connection = MemoryContextAllocZero(ConnectionContext,
+														 sizeof(MultiConnection));
+	connection->initilizationState = POOL_STATE_NOT_INITIALIZED;
 	dlist_push_tail(entry->connections, &connection->connectionNode);
+
+	/* these two flags are by nature cannot happen at the same time */
+	Assert(!((flags & WAIT_FOR_CONNECTION) && (flags & OPTIONAL_CONNECTION)));
+
+	if (flags & WAIT_FOR_CONNECTION)
+	{
+		WaitLoopForSharedConnection(hostname, port);
+	}
+	else if (flags & OPTIONAL_CONNECTION)
+	{
+		/*
+		 * We can afford to skip establishing an optional connection. For
+		 * non-optional connections, we first retry for some time. If we still
+		 * cannot reserve the right to establish a connection, we prefer to
+		 * error out.
+		 */
+		if (!TryToIncrementSharedConnectionCounter(hostname, port))
+		{
+			/* do not track the connection anymore */
+			dlist_delete(&connection->connectionNode);
+			pfree(connection);
+
+			return NULL;
+		}
+	}
+	else
+	{
+		/*
+		 * The caller doesn't want the connection manager to wait
+		 * until a connection slot is available on the remote node.
+		 * In the end, we might fail to establish connection to the
+		 * remote node as it might not have any space in
+		 * max_connections for this connection establishment.
+		 *
+		 * Still, we keep track of the connnection counter.
+		 */
+		IncrementSharedConnectionCounter(hostname, port);
+	}
+
+
+	/*
+	 * We've already incremented the counter above, so we should decrement
+	 * when we're done with the connection.
+	 */
+	connection->initilizationState = POOL_STATE_COUNTER_INCREMENTED;
+
+	StartConnectionEstablishment(connection, &key);
+
 	ResetShardPlacementAssociation(connection);
 
-	if (flags & SESSION_LIFESPAN)
-	{
-		connection->sessionLifespan = true;
-	}
+	/* fully initialized the connection, record it */
+	connection->initilizationState = POOL_STATE_INITIALIZED;
 
 	return connection;
 }
 
 
-/* StartNodeUserDatabaseConnection() helper */
+/*
+ * FindAvailableConnection searches the given list of connections for one that
+ * is not claimed exclusively.
+ *
+ * If no connection is available, FindAvailableConnection returns NULL.
+ */
 static MultiConnection *
 FindAvailableConnection(dlist_head *connections, uint32 flags)
 {
@@ -360,9 +409,39 @@ FindAvailableConnection(dlist_head *connections, uint32 flags)
 		MultiConnection *connection =
 			dlist_container(MultiConnection, connectionNode, iter.cur);
 
+		if (flags & OUTSIDE_TRANSACTION)
+		{
+			/* don't return connections that are used in transactions */
+			if (connection->remoteTransaction.transactionState !=
+				REMOTE_TRANS_NOT_STARTED)
+			{
+				continue;
+			}
+		}
+
 		/* don't return claimed connections */
 		if (connection->claimedExclusively)
 		{
+			/* connection is in use for an ongoing operation */
+			continue;
+		}
+
+		if (connection->forceCloseAtTransactionEnd)
+		{
+			/*
+			 * This is a connection that should be closed, probabably because
+			 * of old connection options. So we ignore it. It will
+			 * automatically be closed at the end of the transaction.
+			 */
+			continue;
+		}
+
+		if (connection->initilizationState != POOL_STATE_INITIALIZED)
+		{
+			/*
+			 * If the connection has not been initialized, it should not be
+			 * considered as available.
+			 */
 			continue;
 		}
 
@@ -374,8 +453,78 @@ FindAvailableConnection(dlist_head *connections, uint32 flags)
 
 
 /*
- * CloseNodeConnectionsAfterTransaction sets the sessionLifespan flag of the connections
- * to a particular node as false. This is mainly used when a worker leaves the cluster.
+ * CloseAllConnectionsAfterTransaction sets the forceClose flag of all the
+ * connections. This is mainly done when citus.node_conninfo changes.
+ */
+void
+CloseAllConnectionsAfterTransaction(void)
+{
+	if (ConnectionHash == NULL)
+	{
+		return;
+	}
+	HASH_SEQ_STATUS status;
+	ConnectionHashEntry *entry;
+
+	hash_seq_init(&status, ConnectionHash);
+	while ((entry = (ConnectionHashEntry *) hash_seq_search(&status)) != 0)
+	{
+		if (!entry->isValid)
+		{
+			/* skip invalid connection hash entries */
+			continue;
+		}
+
+		dlist_iter iter;
+
+		dlist_head *connections = entry->connections;
+		dlist_foreach(iter, connections)
+		{
+			MultiConnection *connection =
+				dlist_container(MultiConnection, connectionNode, iter.cur);
+
+			connection->forceCloseAtTransactionEnd = true;
+		}
+	}
+}
+
+
+/*
+ * ConnectionAvailableToNode returns a MultiConnection if the session has at least
+ * one connection established and avaliable to use to the give node. Else, returns
+ * false.
+ */
+MultiConnection *
+ConnectionAvailableToNode(char *hostName, int nodePort, const char *userName,
+						  const char *database)
+{
+	ConnectionHashKey key;
+	bool found = false;
+
+	strlcpy(key.hostname, hostName, MAX_NODE_LENGTH);
+	key.port = nodePort;
+	strlcpy(key.user, userName, NAMEDATALEN);
+	strlcpy(key.database, database, NAMEDATALEN);
+
+	ConnectionHashEntry *entry =
+		(ConnectionHashEntry *) hash_search(ConnectionHash, &key, HASH_FIND, &found);
+
+	if (!found || !entry->isValid)
+	{
+		return false;
+	}
+
+	int flags = 0;
+	MultiConnection *connection = FindAvailableConnection(entry->connections, flags);
+
+	return connection;
+}
+
+
+/*
+ * CloseNodeConnectionsAfterTransaction sets the forceClose flag of the connections
+ * to a particular node as true such that the connections are no longer cached. This
+ * is mainly used when a worker leaves the cluster.
  */
 void
 CloseNodeConnectionsAfterTransaction(char *nodeName, int nodePort)
@@ -386,21 +535,26 @@ CloseNodeConnectionsAfterTransaction(char *nodeName, int nodePort)
 	hash_seq_init(&status, ConnectionHash);
 	while ((entry = (ConnectionHashEntry *) hash_seq_search(&status)) != 0)
 	{
+		if (!entry->isValid)
+		{
+			/* skip invalid connection hash entries */
+			continue;
+		}
+
 		dlist_iter iter;
-		dlist_head *connections = NULL;
 
 		if (strcmp(entry->key.hostname, nodeName) != 0 || entry->key.port != nodePort)
 		{
 			continue;
 		}
 
-		connections = entry->connections;
+		dlist_head *connections = entry->connections;
 		dlist_foreach(iter, connections)
 		{
 			MultiConnection *connection =
 				dlist_container(MultiConnection, connectionNode, iter.cur);
 
-			connection->sessionLifespan = false;
+			connection->forceCloseAtTransactionEnd = true;
 		}
 	}
 }
@@ -416,8 +570,7 @@ CloseConnection(MultiConnection *connection)
 	bool found;
 
 	/* close connection */
-	PQfinish(connection->pgConn);
-	connection->pgConn = NULL;
+	CitusPQFinish(connection);
 
 	strlcpy(key.hostname, connection->hostname, MAX_NODE_LENGTH);
 	key.port = connection->port;
@@ -446,6 +599,43 @@ CloseConnection(MultiConnection *connection)
 
 
 /*
+ * ShutdownAllConnections shutdowns all the MultiConnections in the
+ * ConnectionHash.
+ *
+ * This function is intended to be called atexit() of the backend, so
+ * that the cached connections are closed properly. Calling this function
+ * at another point in the code could be dangerous, so think twice if you
+ * need to call this function.
+ */
+void
+ShutdownAllConnections(void)
+{
+	ConnectionHashEntry *entry = NULL;
+	HASH_SEQ_STATUS status;
+
+	hash_seq_init(&status, ConnectionHash);
+	while ((entry = (ConnectionHashEntry *) hash_seq_search(&status)) != NULL)
+	{
+		if (!entry->isValid)
+		{
+			/* skip invalid connection hash entries */
+			continue;
+		}
+
+		dlist_iter iter;
+
+		dlist_foreach(iter, entry->connections)
+		{
+			MultiConnection *connection =
+				dlist_container(MultiConnection, connectionNode, iter.cur);
+
+			ShutdownConnection(connection);
+		}
+	}
+}
+
+
+/*
  * ShutdownConnection, if necessary cancels the currently running statement,
  * and then closes the underlying libpq connection.  The MultiConnection
  * itself is left intact.
@@ -464,18 +654,9 @@ ShutdownConnection(MultiConnection *connection)
 	if (PQstatus(connection->pgConn) == CONNECTION_OK &&
 		PQtransactionStatus(connection->pgConn) == PQTRANS_ACTIVE)
 	{
-		char errorMessage[ERROR_BUFFER_SIZE] = { 0 };
-		PGcancel *cancel = PQgetCancel(connection->pgConn);
-
-		if (!PQcancel(cancel, errorMessage, sizeof(errorMessage)))
-		{
-			ereport(WARNING, (errmsg("could not cancel connection: %s",
-									 errorMessage)));
-		}
-		PQfreeCancel(cancel);
+		SendCancelationRequest(connection);
 	}
-	PQfinish(connection->pgConn);
-	connection->pgConn = NULL;
+	CitusPQFinish(connection);
 }
 
 
@@ -558,9 +739,6 @@ EventSetSizeForConnectionList(List *connections)
 static WaitEventSet *
 WaitEventSetFromMultiConnectionStates(List *connections, int *waitCount)
 {
-	WaitEventSet *waitEventSet = NULL;
-	ListCell *connectionCell = NULL;
-
 	const int eventSetSize = EventSetSizeForConnectionList(connections);
 	int numEventsAdded = 0;
 
@@ -569,7 +747,7 @@ WaitEventSetFromMultiConnectionStates(List *connections, int *waitCount)
 		*waitCount = 0;
 	}
 
-	waitEventSet = CreateWaitEventSet(CurrentMemoryContext, eventSetSize);
+	WaitEventSet *waitEventSet = CreateWaitEventSet(CurrentMemoryContext, eventSetSize);
 	EnsureReleaseResource((MemoryContextCallbackFunction) (&FreeWaitEventSet),
 						  waitEventSet);
 
@@ -581,13 +759,9 @@ WaitEventSetFromMultiConnectionStates(List *connections, int *waitCount)
 	AddWaitEventToSet(waitEventSet, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
 	numEventsAdded += 2;
 
-	foreach(connectionCell, connections)
+	MultiConnectionPollState *connectionState = NULL;
+	foreach_ptr(connectionState, connections)
 	{
-		MultiConnectionPollState *connectionState = (MultiConnectionPollState *) lfirst(
-			connectionCell);
-		int socket = 0;
-		int eventMask = 0;
-
 		if (numEventsAdded >= eventSetSize)
 		{
 			/* room for events to schedule is exhausted */
@@ -600,11 +774,11 @@ WaitEventSetFromMultiConnectionStates(List *connections, int *waitCount)
 			continue;
 		}
 
-		socket = PQsocket(connectionState->connection->pgConn);
+		int sock = PQsocket(connectionState->connection->pgConn);
 
-		eventMask = MultiConnectionStateEventMask(connectionState);
+		int eventMask = MultiConnectionStateEventMask(connectionState);
 
-		AddWaitEventToSet(waitEventSet, eventMask, socket, NULL, connectionState);
+		AddWaitEventToSet(waitEventSet, eventMask, sock, NULL, connectionState);
 		numEventsAdded++;
 
 		if (waitCount)
@@ -646,21 +820,18 @@ MultiConnectionStateEventMask(MultiConnectionPollState *connectionState)
 void
 FinishConnectionListEstablishment(List *multiConnectionList)
 {
-	const TimestampTz connectionStart = GetCurrentTimestamp();
-	const TimestampTz deadline = TimestampTzPlusMilliseconds(connectionStart,
-															 NodeConnectionTimeout);
+	instr_time connectionStart;
+	INSTR_TIME_SET_CURRENT(connectionStart);
+
 	List *connectionStates = NULL;
-	ListCell *multiConnectionCell = NULL;
 
 	WaitEventSet *waitEventSet = NULL;
 	bool waitEventSetRebuild = true;
 	int waitCount = 0;
-	WaitEvent *events = NULL;
-	MemoryContext oldContext = NULL;
 
-	foreach(multiConnectionCell, multiConnectionList)
+	MultiConnection *connection = NULL;
+	foreach_ptr(connection, multiConnectionList)
 	{
-		MultiConnection *connection = (MultiConnection *) lfirst(multiConnectionCell);
 		MultiConnectionPollState *connectionState =
 			palloc0(sizeof(MultiConnectionPollState));
 
@@ -682,23 +853,22 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 	}
 
 	/* prepare space for socket events */
-	events = (WaitEvent *) palloc0(EventSetSizeForConnectionList(connectionStates) *
-								   sizeof(WaitEvent));
+	WaitEvent *events = (WaitEvent *) palloc0(EventSetSizeForConnectionList(
+												  connectionStates) *
+											  sizeof(WaitEvent));
 
 	/*
 	 * for high connection counts with lots of round trips we could potentially have a lot
 	 * of (big) waitsets that we'd like to clean right after we have used them. To do this
 	 * we switch to a temporary memory context for this loop which gets reset at the end
 	 */
-	oldContext = MemoryContextSwitchTo(
+	MemoryContext oldContext = MemoryContextSwitchTo(
 		AllocSetContextCreate(CurrentMemoryContext,
 							  "connection establishment temporary context",
 							  ALLOCSET_DEFAULT_SIZES));
 	while (waitCount > 0)
 	{
-		long timeout = DeadlineTimestampTzToTimeout(deadline);
-		int eventCount = 0;
-		int eventIndex = 0;
+		long timeout = MillisecondsToTimeout(connectionStart, NodeConnectionTimeout);
 
 		if (waitEventSetRebuild)
 		{
@@ -713,13 +883,12 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 			}
 		}
 
-		eventCount = WaitEventSetWait(waitEventSet, timeout, events, waitCount,
-									  WAIT_EVENT_CLIENT_READ);
+		int eventCount = WaitEventSetWait(waitEventSet, timeout, events, waitCount,
+										  WAIT_EVENT_CLIENT_READ);
 
-		for (eventIndex = 0; eventIndex < eventCount; eventIndex++)
+		for (int eventIndex = 0; eventIndex < eventCount; eventIndex++)
 		{
 			WaitEvent *event = &events[eventIndex];
-			bool connectionStateChanged = false;
 			MultiConnectionPollState *connectionState =
 				(MultiConnectionPollState *) event->user_data;
 
@@ -734,7 +903,7 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 
 				CHECK_FOR_INTERRUPTS();
 
-				if (InterruptHoldoffCount > 0 && (QueryCancelPending || ProcDiePending))
+				if (IsHoldOffCancellationReceived())
 				{
 					/*
 					 * because we can't break from 2 loops easily we need to not forget to
@@ -747,7 +916,7 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 				continue;
 			}
 
-			connectionStateChanged = MultiConnectionStatePoll(connectionState);
+			bool connectionStateChanged = MultiConnectionStatePoll(connectionState);
 			if (connectionStateChanged)
 			{
 				if (connectionState->phase != MULTI_CONNECTION_PHASE_CONNECTING)
@@ -761,6 +930,16 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 					uint32 eventMask = MultiConnectionStateEventMask(connectionState);
 					ModifyWaitEvent(waitEventSet, event->pos, eventMask, NULL);
 				}
+
+				/*
+				 * The state has changed to connected, update the connection's
+				 * state as well.
+				 */
+				if (connectionState->phase == MULTI_CONNECTION_PHASE_CONNECTED)
+				{
+					connectionState->connection->connectionState =
+						MULTI_CONNECTION_CONNECTED;
+				}
 			}
 		}
 
@@ -771,8 +950,7 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 			 * connectionStart and if passed close all non-finished connections
 			 */
 
-			TimestampTz now = GetCurrentTimestamp();
-			if (TimestampDifferenceExceeds(connectionStart, now, NodeConnectionTimeout))
+			if (MillisecondsPassedSince(connectionStart) >= NodeConnectionTimeout)
 			{
 				/*
 				 * showing as a warning, can't be an error. In some cases queries can
@@ -796,17 +974,28 @@ FinishConnectionListEstablishment(List *multiConnectionList)
 
 
 /*
- * DeadlineTimestampTzToTimeout returns the numer of miliseconds that still need to elapse
- * before the deadline provided as an argument will be reached. The outcome can be used to
+ * MillisecondsPassedSince returns the number of milliseconds elapsed between an
+ * instr_time & the current time.
+ */
+double
+MillisecondsPassedSince(instr_time moment)
+{
+	instr_time timeSinceMoment;
+	INSTR_TIME_SET_CURRENT(timeSinceMoment);
+	INSTR_TIME_SUBTRACT(timeSinceMoment, moment);
+	return INSTR_TIME_GET_MILLISEC(timeSinceMoment);
+}
+
+
+/*
+ * MillisecondsToTimeout returns the numer of milliseconds that still need to elapse
+ * before msAfterStart milliseconds have passed since start. The outcome can be used to
  * pass to the Wait of an EventSet to make sure it returns after the timeout has passed.
  */
-static long
-DeadlineTimestampTzToTimeout(TimestampTz deadline)
+long
+MillisecondsToTimeout(instr_time start, long msAfterStart)
 {
-	long secs = 0;
-	int msecs = 0;
-	TimestampDifference(GetCurrentTimestamp(), deadline, &secs, &msecs);
-	return secs * 1000 + msecs / 1000;
+	return msAfterStart - MillisecondsPassedSince(start);
 }
 
 
@@ -821,10 +1010,9 @@ DeadlineTimestampTzToTimeout(TimestampTz deadline)
 static void
 CloseNotReadyMultiConnectionStates(List *connectionStates)
 {
-	ListCell *connectionStateCell = NULL;
-	foreach(connectionStateCell, connectionStates)
+	MultiConnectionPollState *connectionState = NULL;
+	foreach_ptr(connectionState, connectionStates)
 	{
-		MultiConnectionPollState *connectionState = lfirst(connectionStateCell);
 		MultiConnection *connection = connectionState->connection;
 
 		if (connectionState->phase != MULTI_CONNECTION_PHASE_CONNECTING)
@@ -833,8 +1021,29 @@ CloseNotReadyMultiConnectionStates(List *connectionStates)
 		}
 
 		/* close connection, otherwise we take up resource on the other side */
+		CitusPQFinish(connection);
+	}
+}
+
+
+/*
+ * CitusPQFinish is a wrapper around PQfinish and does book keeping on shared connection
+ * counters.
+ */
+static void
+CitusPQFinish(MultiConnection *connection)
+{
+	if (connection->pgConn != NULL)
+	{
 		PQfinish(connection->pgConn);
 		connection->pgConn = NULL;
+	}
+
+	/* behave idempotently, there is no gurantee that CitusPQFinish() is called once */
+	if (connection->initilizationState >= POOL_STATE_COUNTER_INCREMENTED)
+	{
+		DecrementSharedConnectionCounter(connection->hostname, connection->port);
+		connection->initilizationState = POOL_STATE_NOT_INITIALIZED;
 	}
 }
 
@@ -881,9 +1090,8 @@ static uint32
 ConnectionHashHash(const void *key, Size keysize)
 {
 	ConnectionHashKey *entry = (ConnectionHashKey *) key;
-	uint32 hash = 0;
 
-	hash = string_hash(entry->hostname, NAMEDATALEN);
+	uint32 hash = string_hash(entry->hostname, NAMEDATALEN);
 	hash = hash_combine(hash, hash_uint32(entry->port));
 	hash = hash_combine(hash, string_hash(entry->user, NAMEDATALEN));
 	hash = hash_combine(hash, string_hash(entry->database, NAMEDATALEN));
@@ -916,17 +1124,26 @@ ConnectionHashCompare(const void *a, const void *b, Size keysize)
  * Asynchronously establish connection to a remote node, but don't wait for
  * that to finish. DNS lookups etc. are performed synchronously though.
  */
-static MultiConnection *
-StartConnectionEstablishment(ConnectionHashKey *key)
+static void
+StartConnectionEstablishment(MultiConnection *connection, ConnectionHashKey *key)
 {
 	bool found = false;
-	MultiConnection *connection = NULL;
-	ConnParamsHashEntry *entry = NULL;
+	static uint64 connectionId = 1;
 
 	/* search our cache for precomputed connection settings */
-	entry = hash_search(ConnParamsHash, key, HASH_ENTER, &found);
+	ConnParamsHashEntry *entry = hash_search(ConnParamsHash, key, HASH_ENTER, &found);
 	if (!found || !entry->isValid)
 	{
+		if (!found)
+		{
+			/*
+			 * Zero out entry, but not the key part.
+			 * Avoids leaving invalid pointers in hash table if GetConnParam throws with MemoryContextAllocZero.
+			 */
+			memset(((char *) entry) + sizeof(ConnectionHashKey), 0,
+				   sizeof(ConnParamsHashEntry) - sizeof(ConnectionHashKey));
+		}
+
 		/* avoid leaking memory in the keys and values arrays */
 		if (found && !entry->isValid)
 		{
@@ -940,18 +1157,16 @@ StartConnectionEstablishment(ConnectionHashKey *key)
 		entry->isValid = true;
 	}
 
-	connection = MemoryContextAllocZero(ConnectionContext, sizeof(MultiConnection));
-
 	strlcpy(connection->hostname, key->hostname, MAX_NODE_LENGTH);
 	connection->port = key->port;
 	strlcpy(connection->database, key->database, NAMEDATALEN);
 	strlcpy(connection->user, key->user, NAMEDATALEN);
 
-
 	connection->pgConn = PQconnectStartParams((const char **) entry->keywords,
 											  (const char **) entry->values,
 											  false);
 	connection->connectionStart = GetCurrentTimestamp();
+	connection->connectionId = connectionId++;
 
 	/*
 	 * To avoid issues with interrupts not getting caught all our connections
@@ -960,9 +1175,7 @@ StartConnectionEstablishment(ConnectionHashKey *key)
 	 */
 	PQsetnonblocking(connection->pgConn, true);
 
-	SetCitusNoticeProcessor(connection);
-
-	return connection;
+	SetCitusNoticeReceiver(connection);
 }
 
 
@@ -974,34 +1187,59 @@ StartConnectionEstablishment(ConnectionHashKey *key)
 static void
 FreeConnParamsHashEntryFields(ConnParamsHashEntry *entry)
 {
-	char **keyword = &entry->keywords[entry->runtimeParamStart];
-	char **value = &entry->values[entry->runtimeParamStart];
+	/*
+	 * if there was a memory error during the initialization of ConnParamHashEntry in
+	 * GetConnParams the keywords or values might not have been initialized completely.
+	 * We check if they have been initialized before freeing them.
+	 *
+	 * We only iteratively free the lists starting at the index pointed to by
+	 * entry->runtimeParamStart as all entries before are settings that are managed
+	 * separately.
+	 */
 
-	while (*keyword != NULL)
+	if (entry->keywords != NULL)
 	{
-		pfree(*keyword);
-		keyword++;
+		char **keyword = &entry->keywords[entry->runtimeParamStart];
+		while (*keyword != NULL)
+		{
+			pfree(*keyword);
+			keyword++;
+		}
+		pfree(entry->keywords);
+		entry->keywords = NULL;
 	}
 
-	while (*value != NULL)
+	if (entry->values != NULL)
 	{
-		pfree(*value);
-		value++;
+		char **value = &entry->values[entry->runtimeParamStart];
+		while (*value != NULL)
+		{
+			pfree(*value);
+			value++;
+		}
+		pfree(entry->values);
+		entry->values = NULL;
 	}
 
-	pfree(entry->keywords);
-	pfree(entry->values);
+	entry->runtimeParamStart = 0;
 }
 
 
 /*
- * Close all remote connections if necessary anymore (i.e. not session
+ * AfterXactHostConnectionHandling closes all remote connections if not necessary anymore (i.e. not session
  * lifetime), or if in a failed state.
  */
 static void
 AfterXactHostConnectionHandling(ConnectionHashEntry *entry, bool isCommit)
 {
+	if (!entry || !entry->isValid)
+	{
+		/* callers only pass valid hash entries but let's be on the safe side */
+		ereport(ERROR, (errmsg("connection hash entry is NULL or invalid")));
+	}
+
 	dlist_mutable_iter iter;
+	int cachedConnectionCount = 0;
 
 	dlist_foreach_modify(iter, entry->connections)
 	{
@@ -1009,8 +1247,8 @@ AfterXactHostConnectionHandling(ConnectionHashEntry *entry, bool isCommit)
 			dlist_container(MultiConnection, connectionNode, iter.cur);
 
 		/*
-		 * To avoid code leaking connections we warn if connections are
-		 * still claimed exclusively. We can only do so if the transaction
+		 * To avoid leaking connections we warn if connections are
+		 * still claimed exclusively. We can only do so if the transaction is
 		 * committed, as it's normal that code didn't have chance to clean
 		 * up after errors.
 		 */
@@ -1020,12 +1258,8 @@ AfterXactHostConnectionHandling(ConnectionHashEntry *entry, bool isCommit)
 					(errmsg("connection claimed exclusively at transaction commit")));
 		}
 
-		/*
-		 * Preserve session lifespan connections if they are still healthy.
-		 */
-		if (!connection->sessionLifespan ||
-			PQstatus(connection->pgConn) != CONNECTION_OK ||
-			!RemoteTransactionIdle(connection))
+
+		if (ShouldShutdownConnection(connection, cachedConnectionCount))
 		{
 			ShutdownConnection(connection);
 
@@ -1036,16 +1270,69 @@ AfterXactHostConnectionHandling(ConnectionHashEntry *entry, bool isCommit)
 		}
 		else
 		{
-			/* reset per-transaction state */
-			ResetRemoteTransaction(connection);
-			ResetShardPlacementAssociation(connection);
+			/*
+			 * reset healthy session lifespan connections.
+			 */
+			ResetConnection(connection);
 
-			/* reset copy state */
-			connection->copyBytesWrittenSinceLastFlush = 0;
-
-			UnclaimConnection(connection);
+			cachedConnectionCount++;
 		}
 	}
+}
+
+
+/*
+ * ShouldShutdownConnection returns true if either one of the followings is true:
+ * - The connection is citus initiated.
+ * - Current cached connections is already at MaxCachedConnectionsPerWorker
+ * - Connection is forced to close at the end of transaction
+ * - Connection is not in OK state
+ * - A transaction is still in progress (usually because we are cancelling a distributed transaction)
+ */
+static bool
+ShouldShutdownConnection(MultiConnection *connection, const int cachedConnectionCount)
+{
+	/*
+	 * When we are in a backend that was created to serve an internal connection
+	 * from the coordinator or another worker, we disable connection caching to avoid
+	 * escalating the number of cached connections. We can recognize such backends
+	 * from their application name.
+	 */
+	return IsCitusInitiatedRemoteBackend() ||
+		   connection->initilizationState != POOL_STATE_INITIALIZED ||
+		   cachedConnectionCount >= MaxCachedConnectionsPerWorker ||
+		   connection->forceCloseAtTransactionEnd ||
+		   PQstatus(connection->pgConn) != CONNECTION_OK ||
+		   !RemoteTransactionIdle(connection);
+}
+
+
+/*
+ * IsCitusInitiatedRemoteBackend returns true if we are in a backend that citus
+ * initiated via remote connection.
+ */
+bool
+IsCitusInitiatedRemoteBackend(void)
+{
+	return application_name && strcmp(application_name, CITUS_APPLICATION_NAME) == 0;
+}
+
+
+/*
+ * ResetConnection preserves the given connection for later usage by
+ * resetting its states.
+ */
+static void
+ResetConnection(MultiConnection *connection)
+{
+	/* reset per-transaction state */
+	ResetRemoteTransaction(connection);
+	ResetShardPlacementAssociation(connection);
+
+	/* reset copy state */
+	connection->copyBytesWrittenSinceLastFlush = 0;
+
+	UnclaimConnection(connection);
 }
 
 
@@ -1070,84 +1357,4 @@ RemoteTransactionIdle(MultiConnection *connection)
 	}
 
 	return PQtransactionStatus(connection->pgConn) == PQTRANS_IDLE;
-}
-
-
-/*
- * SetCitusNoticeProcessor sets the NoticeProcessor to DefaultCitusNoticeProcessor
- */
-void
-SetCitusNoticeProcessor(MultiConnection *connection)
-{
-	PQsetNoticeProcessor(connection->pgConn, DefaultCitusNoticeProcessor,
-						 connection);
-}
-
-
-/*
- * SetCitusNoticeLevel is used to set the notice level for distributed
- * queries.
- */
-void
-SetCitusNoticeLevel(int level)
-{
-	CitusNoticeLogLevel = level;
-}
-
-
-/*
- * UnsetCitusNoticeLevel sets the CitusNoticeLogLevel back to
- * its default value.
- */
-void
-UnsetCitusNoticeLevel()
-{
-	CitusNoticeLogLevel = DEFAULT_CITUS_NOTICE_LEVEL;
-}
-
-
-/*
- * DefaultCitusNoticeProcessor is used to redirect worker notices
- * from logfile to console.
- */
-static void
-DefaultCitusNoticeProcessor(void *arg, const char *message)
-{
-	MultiConnection *connection = (MultiConnection *) arg;
-	char *nodeName = connection->hostname;
-	uint32 nodePort = connection->port;
-	char *trimmedMessage = TrimLogLevel(message);
-	char *level = strtok((char *) message, ":");
-
-	ereport(CitusNoticeLogLevel,
-			(errmsg("%s", ApplyLogRedaction(trimmedMessage)),
-			 errdetail("%s from %s:%d", level, nodeName, nodePort)));
-}
-
-
-/*
- * TrimLogLevel returns a copy of the string with the leading log level
- * and spaces removed such as
- *      From:
- *          INFO:  "normal2_102070": scanned 0 of 0 pages...
- *      To:
- *          "normal2_102070": scanned 0 of 0 pages...
- */
-char *
-TrimLogLevel(const char *message)
-{
-	char *chompedMessage = pchomp(message);
-	size_t n;
-
-	n = 0;
-	while (n < strlen(chompedMessage) && chompedMessage[n] != ':')
-	{
-		n++;
-	}
-
-	do {
-		n++;
-	} while (n < strlen(chompedMessage) && chompedMessage[n] == ' ');
-
-	return chompedMessage + n;
 }

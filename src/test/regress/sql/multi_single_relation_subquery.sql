@@ -7,7 +7,6 @@
 SET citus.next_shard_id TO 860000;
 
 
-SET citus.task_executor_type TO 'task-tracker';
 
 select
     number_sum,
@@ -139,7 +138,7 @@ from
     limit 100) as distributed_table
 group by
     l_suppkey
-    ORDER BY 2 DESC, 1 DESC 
+    ORDER BY 2 DESC, 1 DESC
 LIMIT 5;
 
 -- Check that we don't support subqueries without aggregates.
@@ -177,7 +176,7 @@ from
         lineitem
     group by
         l_partkey
-    having 
+    having
         count(distinct l_shipdate) >= 2) as distributed_table;
 
 -- Check that if subquery is pulled, we don't error and run query properly.

@@ -2,9 +2,11 @@
  * multi_partitioning_utils.c
  *	  Utility functions for declarative partitioning
  *
- * Copyright (c) 2017, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  */
 #include "postgres.h"
+
+#include "distributed/pg_version_constants.h"
 
 #include "access/genam.h"
 #include "access/heapam.h"
@@ -12,26 +14,303 @@
 #include "catalog/indexing.h"
 #include "catalog/partition.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_constraint.h"
 #include "catalog/pg_inherits.h"
-#if (PG_VERSION_NUM < 110000)
-#include "catalog/pg_constraint_fn.h"
-#endif
+#include "common/string.h"
+#include "distributed/citus_nodes.h"
+#include "distributed/adaptive_executor.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/colocation_utils.h"
-#include "distributed/master_metadata_utility.h"
-#include "distributed/master_protocol.h"
+#include "distributed/commands.h"
+#include "distributed/coordinator_protocol.h"
+#include "distributed/deparse_shard_query.h"
+#include "distributed/listutils.h"
+#include "distributed/metadata_utility.h"
 #include "distributed/multi_partitioning_utils.h"
+#include "distributed/multi_physical_planner.h"
+#include "distributed/relay_utility.h"
+#include "distributed/resource_lock.h"
 #include "distributed/shardinterval_utils.h"
+#include "distributed/version_compat.h"
 #include "lib/stringinfo.h"
 #include "nodes/pg_list.h"
+#include "pgstat.h"
+#if PG_VERSION_NUM >= PG_VERSION_12
+#include "partitioning/partdesc.h"
+#endif
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
-
 static char * PartitionBound(Oid partitionId);
+static Relation try_relation_open_nolock(Oid relationId);
+static List * CreateFixPartitionConstraintsTaskList(Oid relationId);
+static List * WorkerFixPartitionConstraintCommandList(Oid relationId, uint64 shardId,
+													  List *checkConstraintList);
+static List * CheckConstraintNameListForRelation(Oid relationId);
+static bool RelationHasConstraint(Oid relationId, char *constraintName);
+static char * RenameConstraintCommand(Oid relationId, char *constraintName,
+									  char *newConstraintName);
+
+
+PG_FUNCTION_INFO_V1(fix_pre_citus10_partitioned_table_constraint_names);
+PG_FUNCTION_INFO_V1(worker_fix_pre_citus10_partitioned_table_constraint_names);
+
+
+/*
+ * fix_pre_citus10_partitioned_table_constraint_names fixes the constraint names of
+ * partitioned table shards on workers.
+ *
+ * Constraint names for partitioned table shards should have shardId suffixes if and only
+ * if they are unique or foreign key constraints. We mistakenly appended shardIds to
+ * constraint names on ALTER TABLE dist_part_table ADD CONSTRAINT .. queries prior to
+ * Citus 10. fix_pre_citus10_partitioned_table_constraint_names determines if this is the
+ * case, and renames constraints back to their original names on shards.
+ */
+Datum
+fix_pre_citus10_partitioned_table_constraint_names(PG_FUNCTION_ARGS)
+{
+	Oid relationId = PG_GETARG_OID(0);
+	EnsureCoordinator();
+
+	if (!PartitionedTable(relationId))
+	{
+		ereport(ERROR, (errmsg("could not fix partition constraints: "
+							   "relation does not exist or is not partitioned")));
+	}
+	if (!IsCitusTable(relationId))
+	{
+		ereport(ERROR, (errmsg("fix_pre_citus10_partitioned_table_constraint_names can "
+							   "only be called for distributed partitioned tables")));
+	}
+
+	List *taskList = CreateFixPartitionConstraintsTaskList(relationId);
+
+	/* do not do anything if there are no constraints that should be fixed */
+	if (taskList != NIL)
+	{
+		bool localExecutionSupported = true;
+		ExecuteUtilityTaskList(taskList, localExecutionSupported);
+	}
+
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * worker_fix_pre_citus10_partitioned_table_constraint_names fixes the constraint names on a worker given a shell
+ * table name and shard id.
+ */
+Datum
+worker_fix_pre_citus10_partitioned_table_constraint_names(PG_FUNCTION_ARGS)
+{
+	Oid relationId = PG_GETARG_OID(0);
+	int64 shardId = PG_GETARG_INT32(1);
+	text *constraintNameText = PG_GETARG_TEXT_P(2);
+
+	if (!PartitionedTable(relationId))
+	{
+		ereport(ERROR, (errmsg("could not fix partition constraints: "
+							   "relation does not exist or is not partitioned")));
+	}
+
+	char *constraintName = text_to_cstring(constraintNameText);
+	char *shardIdAppendedConstraintName = pstrdup(constraintName);
+	AppendShardIdToName(&shardIdAppendedConstraintName, shardId);
+
+	/* if shardId was appended to the constraint name, rename back to original */
+	if (RelationHasConstraint(relationId, shardIdAppendedConstraintName))
+	{
+		char *renameConstraintDDLCommand =
+			RenameConstraintCommand(relationId, shardIdAppendedConstraintName,
+									constraintName);
+		ExecuteAndLogUtilityCommand(renameConstraintDDLCommand);
+	}
+	PG_RETURN_VOID();
+}
+
+
+/*
+ * CreateFixPartitionConstraintsTaskList goes over all the partitions of a distributed
+ * partitioned table, and creates the list of tasks to execute
+ * worker_fix_pre_citus10_partitioned_table_constraint_names UDF on worker nodes.
+ */
+static List *
+CreateFixPartitionConstraintsTaskList(Oid relationId)
+{
+	List *taskList = NIL;
+
+	/* enumerate the tasks when putting them to the taskList */
+	int taskId = 1;
+	List *checkConstraintList = CheckConstraintNameListForRelation(relationId);
+
+	/* early exit if the relation does not have any check constraints */
+	if (checkConstraintList == NIL)
+	{
+		return NIL;
+	}
+
+	List *shardIntervalList = LoadShardIntervalList(relationId);
+
+	/* lock metadata before getting placement lists */
+	LockShardListMetadata(shardIntervalList, ShareLock);
+
+	ShardInterval *shardInterval = NULL;
+	foreach_ptr(shardInterval, shardIntervalList)
+	{
+		uint64 shardId = shardInterval->shardId;
+
+		List *queryStringList = WorkerFixPartitionConstraintCommandList(relationId,
+																		shardId,
+																		checkConstraintList);
+
+		Task *task = CitusMakeNode(Task);
+		task->jobId = INVALID_JOB_ID;
+		task->taskId = taskId++;
+
+		task->taskType = DDL_TASK;
+		SetTaskQueryStringList(task, queryStringList);
+		task->dependentTaskList = NULL;
+		task->replicationModel = REPLICATION_MODEL_INVALID;
+		task->anchorShardId = shardId;
+		task->taskPlacementList = ActiveShardPlacementList(shardId);
+
+		taskList = lappend(taskList, task);
+	}
+
+	return taskList;
+}
+
+
+/*
+ * CheckConstraintNameListForRelation returns a list of names of CHECK constraints
+ * for a relation.
+ */
+static List *
+CheckConstraintNameListForRelation(Oid relationId)
+{
+	List *constraintNameList = NIL;
+
+	int scanKeyCount = 2;
+	ScanKeyData scanKey[2];
+
+	Relation pgConstraint = table_open(ConstraintRelationId, AccessShareLock);
+
+	ScanKeyInit(&scanKey[0], Anum_pg_constraint_conrelid,
+				BTEqualStrategyNumber, F_OIDEQ, relationId);
+	ScanKeyInit(&scanKey[1], Anum_pg_constraint_contype,
+				BTEqualStrategyNumber, F_CHAREQ, CONSTRAINT_CHECK);
+
+	bool useIndex = false;
+	SysScanDesc scanDescriptor = systable_beginscan(pgConstraint, InvalidOid, useIndex,
+													NULL, scanKeyCount, scanKey);
+
+	HeapTuple heapTuple = systable_getnext(scanDescriptor);
+	while (HeapTupleIsValid(heapTuple))
+	{
+		Form_pg_constraint constraintForm = (Form_pg_constraint) GETSTRUCT(heapTuple);
+		char *constraintName = NameStr(constraintForm->conname);
+		constraintNameList = lappend(constraintNameList, pstrdup(constraintName));
+
+		heapTuple = systable_getnext(scanDescriptor);
+	}
+
+	systable_endscan(scanDescriptor);
+	table_close(pgConstraint, NoLock);
+
+	return constraintNameList;
+}
+
+
+/*
+ * WorkerFixPartitionConstraintCommandList creates a list of queries that will fix
+ * all check constraint names of a shard.
+ */
+static List *
+WorkerFixPartitionConstraintCommandList(Oid relationId, uint64 shardId,
+										List *checkConstraintList)
+{
+	List *commandList = NIL;
+	Oid schemaId = get_rel_namespace(relationId);
+	char *schemaName = get_namespace_name(schemaId);
+	char *relationName = get_rel_name(relationId);
+	char *shardRelationName = pstrdup(relationName);
+
+	/* build shard relation name */
+	AppendShardIdToName(&shardRelationName, shardId);
+
+	char *quotedShardName = quote_qualified_identifier(schemaName, shardRelationName);
+
+	char *constraintName = NULL;
+	foreach_ptr(constraintName, checkConstraintList)
+	{
+		StringInfo shardQueryString = makeStringInfo();
+		appendStringInfo(shardQueryString,
+						 "SELECT worker_fix_pre_citus10_partitioned_table_constraint_names(%s::regclass, "
+						 UINT64_FORMAT ", %s::text)",
+						 quote_literal_cstr(quotedShardName), shardId,
+						 quote_literal_cstr(constraintName));
+		commandList = lappend(commandList, shardQueryString->data);
+	}
+
+	return commandList;
+}
+
+
+/*
+ * RelationHasConstraint checks if a relation has a constraint with a given name.
+ */
+static bool
+RelationHasConstraint(Oid relationId, char *constraintName)
+{
+	bool found = false;
+
+	int scanKeyCount = 2;
+	ScanKeyData scanKey[2];
+
+	Relation pgConstraint = table_open(ConstraintRelationId, AccessShareLock);
+
+	ScanKeyInit(&scanKey[0], Anum_pg_constraint_conrelid,
+				BTEqualStrategyNumber, F_OIDEQ, ObjectIdGetDatum(relationId));
+	ScanKeyInit(&scanKey[1], Anum_pg_constraint_conname,
+				BTEqualStrategyNumber, F_NAMEEQ, CStringGetDatum(constraintName));
+
+	bool useIndex = false;
+	SysScanDesc scanDescriptor = systable_beginscan(pgConstraint, InvalidOid, useIndex,
+													NULL, scanKeyCount, scanKey);
+
+	HeapTuple heapTuple = systable_getnext(scanDescriptor);
+	if (HeapTupleIsValid(heapTuple))
+	{
+		found = true;
+	}
+
+	systable_endscan(scanDescriptor);
+	table_close(pgConstraint, NoLock);
+
+	return found;
+}
+
+
+/*
+ * RenameConstraintCommand creates the query string that will rename a constraint
+ */
+static char *
+RenameConstraintCommand(Oid relationId, char *constraintName, char *newConstraintName)
+{
+	char *qualifiedRelationName = generate_qualified_relation_name(relationId);
+	const char *quotedConstraintName = quote_identifier(constraintName);
+	const char *quotedNewConstraintName = quote_identifier(newConstraintName);
+
+	StringInfo renameCommand = makeStringInfo();
+	appendStringInfo(renameCommand, "ALTER TABLE %s RENAME CONSTRAINT %s TO %s",
+					 qualifiedRelationName, quotedConstraintName,
+					 quotedNewConstraintName);
+
+	return renameCommand->data;
+}
 
 
 /*
@@ -40,7 +319,14 @@ static char * PartitionBound(Oid partitionId);
 bool
 PartitionedTable(Oid relationId)
 {
-	Relation rel = heap_open(relationId, AccessShareLock);
+	Relation rel = try_relation_open(relationId, AccessShareLock);
+
+	/* don't error out for tables that are dropped */
+	if (rel == NULL)
+	{
+		return false;
+	}
+
 	bool partitionedTable = false;
 
 	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
@@ -49,7 +335,7 @@ PartitionedTable(Oid relationId)
 	}
 
 	/* keep the lock */
-	heap_close(rel, NoLock);
+	table_close(rel, NoLock);
 
 	return partitionedTable;
 }
@@ -63,7 +349,7 @@ PartitionedTable(Oid relationId)
 bool
 PartitionedTableNoLock(Oid relationId)
 {
-	Relation rel = try_relation_open(relationId, NoLock);
+	Relation rel = try_relation_open_nolock(relationId);
 	bool partitionedTable = false;
 
 	/* don't error out for tables that are dropped */
@@ -78,7 +364,7 @@ PartitionedTableNoLock(Oid relationId)
 	}
 
 	/* keep the lock */
-	heap_close(rel, NoLock);
+	table_close(rel, NoLock);
 
 	return partitionedTable;
 }
@@ -90,13 +376,18 @@ PartitionedTableNoLock(Oid relationId)
 bool
 PartitionTable(Oid relationId)
 {
-	Relation rel = heap_open(relationId, AccessShareLock);
-	bool partitionTable = false;
+	Relation rel = try_relation_open(relationId, AccessShareLock);
 
-	partitionTable = rel->rd_rel->relispartition;
+	/* don't error out for tables that are dropped */
+	if (rel == NULL)
+	{
+		return false;
+	}
+
+	bool partitionTable = rel->rd_rel->relispartition;
 
 	/* keep the lock */
-	heap_close(rel, NoLock);
+	table_close(rel, NoLock);
 
 	return partitionTable;
 }
@@ -110,8 +401,7 @@ PartitionTable(Oid relationId)
 bool
 PartitionTableNoLock(Oid relationId)
 {
-	Relation rel = try_relation_open(relationId, NoLock);
-	bool partitionTable = false;
+	Relation rel = try_relation_open_nolock(relationId);
 
 	/* don't error out for tables that are dropped */
 	if (rel == NULL)
@@ -119,12 +409,44 @@ PartitionTableNoLock(Oid relationId)
 		return false;
 	}
 
-	partitionTable = rel->rd_rel->relispartition;
+	bool partitionTable = rel->rd_rel->relispartition;
 
 	/* keep the lock */
-	heap_close(rel, NoLock);
+	table_close(rel, NoLock);
 
 	return partitionTable;
+}
+
+
+/*
+ * try_relation_open_nolock opens a relation with given relationId without
+ * acquiring locks. PostgreSQL's try_relation_open() asserts that caller
+ * has already acquired a lock on the relation, which we don't always do.
+ *
+ * ATTENTION:
+ *   1. Sync this with try_relation_open(). It hasn't changed for 10 to 12
+ *      releases though.
+ *   2. We should remove this after we fix the locking/distributed deadlock
+ *      issues with MX Truncate. See https://github.com/citusdata/citus/pull/2894
+ *      for more discussion.
+ */
+static Relation
+try_relation_open_nolock(Oid relationId)
+{
+	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relationId)))
+	{
+		return NULL;
+	}
+
+	Relation relation = RelationIdGetRelation(relationId);
+	if (!RelationIsValid(relation))
+	{
+		return NULL;
+	}
+
+	pgstat_initstats(relation);
+
+	return relation;
 }
 
 
@@ -136,20 +458,18 @@ PartitionTableNoLock(Oid relationId)
 bool
 IsChildTable(Oid relationId)
 {
-	Relation pgInherits = NULL;
-	SysScanDesc scan = NULL;
 	ScanKeyData key[1];
 	HeapTuple inheritsTuple = NULL;
 	bool tableInherits = false;
 
-	pgInherits = heap_open(InheritsRelationId, AccessShareLock);
+	Relation pgInherits = table_open(InheritsRelationId, AccessShareLock);
 
 	ScanKeyInit(&key[0], Anum_pg_inherits_inhrelid,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(relationId));
 
-	scan = systable_beginscan(pgInherits, InvalidOid, false,
-							  NULL, 1, key);
+	SysScanDesc scan = systable_beginscan(pgInherits, InvalidOid, false,
+										  NULL, 1, key);
 
 	while ((inheritsTuple = systable_getnext(scan)) != NULL)
 	{
@@ -164,7 +484,7 @@ IsChildTable(Oid relationId)
 	}
 
 	systable_endscan(scan);
-	heap_close(pgInherits, AccessShareLock);
+	table_close(pgInherits, AccessShareLock);
 
 	if (tableInherits && PartitionTable(relationId))
 	{
@@ -183,26 +503,24 @@ IsChildTable(Oid relationId)
 bool
 IsParentTable(Oid relationId)
 {
-	Relation pgInherits = NULL;
-	SysScanDesc scan = NULL;
 	ScanKeyData key[1];
 	bool tableInherited = false;
 
-	pgInherits = heap_open(InheritsRelationId, AccessShareLock);
+	Relation pgInherits = table_open(InheritsRelationId, AccessShareLock);
 
 	ScanKeyInit(&key[0], Anum_pg_inherits_inhparent,
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(relationId));
 
-	scan = systable_beginscan(pgInherits, InheritsParentIndexId, true,
-							  NULL, 1, key);
+	SysScanDesc scan = systable_beginscan(pgInherits, InheritsParentIndexId, true,
+										  NULL, 1, key);
 
 	if (systable_getnext(scan) != NULL)
 	{
 		tableInherited = true;
 	}
 	systable_endscan(scan);
-	heap_close(pgInherits, AccessShareLock);
+	table_close(pgInherits, AccessShareLock);
 
 	if (tableInherited && PartitionedTable(relationId))
 	{
@@ -223,11 +541,36 @@ IsParentTable(Oid relationId)
 Oid
 PartitionParentOid(Oid partitionOid)
 {
-	Oid partitionParentOid = InvalidOid;
-
-	partitionParentOid = get_partition_parent(partitionOid);
+	Oid partitionParentOid = get_partition_parent(partitionOid);
 
 	return partitionParentOid;
+}
+
+
+/*
+ * LongestPartitionName is a uitility function that returns the partition
+ * name which is the longest in terms of number of characters.
+ */
+char *
+LongestPartitionName(Oid parentRelationId)
+{
+	char *longestName = NULL;
+	int longestNameLength = 0;
+	List *partitionList = PartitionList(parentRelationId);
+
+	Oid partitionRelationId = InvalidOid;
+	foreach_oid(partitionRelationId, partitionList)
+	{
+		char *partitionName = get_rel_name(partitionRelationId);
+		int partitionNameLength = strnlen(partitionName, NAMEDATALEN);
+		if (partitionNameLength > longestNameLength)
+		{
+			longestName = partitionName;
+			longestNameLength = partitionNameLength;
+		}
+	}
+
+	return longestName;
 }
 
 
@@ -238,11 +581,9 @@ PartitionParentOid(Oid partitionOid)
 List *
 PartitionList(Oid parentRelationId)
 {
-	Relation rel = heap_open(parentRelationId, AccessShareLock);
+	Relation rel = table_open(parentRelationId, AccessShareLock);
 	List *partitionList = NIL;
 
-	int partitionIndex = 0;
-	int partitionCount = 0;
 
 	if (!PartitionedTable(parentRelationId))
 	{
@@ -250,18 +591,18 @@ PartitionList(Oid parentRelationId)
 
 		ereport(ERROR, (errmsg("\"%s\" is not a parent table", relationName)));
 	}
+	PartitionDesc partDesc = RelationGetPartitionDesc(rel);
+	Assert(partDesc != NULL);
 
-	Assert(rel->rd_partdesc != NULL);
-
-	partitionCount = rel->rd_partdesc->nparts;
-	for (partitionIndex = 0; partitionIndex < partitionCount; ++partitionIndex)
+	int partitionCount = partDesc->nparts;
+	for (int partitionIndex = 0; partitionIndex < partitionCount; ++partitionIndex)
 	{
 		partitionList =
-			lappend_oid(partitionList, rel->rd_partdesc->oids[partitionIndex]);
+			lappend_oid(partitionList, partDesc->oids[partitionIndex]);
 	}
 
 	/* keep the lock */
-	heap_close(rel, NoLock);
+	table_close(rel, NoLock);
 
 	return partitionList;
 }
@@ -275,9 +616,6 @@ char *
 GenerateDetachPartitionCommand(Oid partitionTableId)
 {
 	StringInfo detachPartitionCommand = makeStringInfo();
-	Oid parentId = InvalidOid;
-	char *tableQualifiedName = NULL;
-	char *parentTableQualifiedName = NULL;
 
 	if (!PartitionTable(partitionTableId))
 	{
@@ -286,9 +624,9 @@ GenerateDetachPartitionCommand(Oid partitionTableId)
 		ereport(ERROR, (errmsg("\"%s\" is not a partition", relationName)));
 	}
 
-	parentId = get_partition_parent(partitionTableId);
-	tableQualifiedName = generate_qualified_relation_name(partitionTableId);
-	parentTableQualifiedName = generate_qualified_relation_name(parentId);
+	Oid parentId = get_partition_parent(partitionTableId);
+	char *tableQualifiedName = generate_qualified_relation_name(partitionTableId);
+	char *parentTableQualifiedName = generate_qualified_relation_name(parentId);
 
 	appendStringInfo(detachPartitionCommand,
 					 "ALTER TABLE IF EXISTS %s DETACH PARTITION %s;",
@@ -306,7 +644,6 @@ char *
 GeneratePartitioningInformation(Oid parentTableId)
 {
 	char *partitionBoundCString = "";
-	Datum partitionBoundDatum = 0;
 
 	if (!PartitionedTable(parentTableId))
 	{
@@ -315,8 +652,8 @@ GeneratePartitioningInformation(Oid parentTableId)
 		ereport(ERROR, (errmsg("\"%s\" is not a parent table", relationName)));
 	}
 
-	partitionBoundDatum = DirectFunctionCall1(pg_get_partkeydef,
-											  ObjectIdGetDatum(parentTableId));
+	Datum partitionBoundDatum = DirectFunctionCall1(pg_get_partkeydef,
+													ObjectIdGetDatum(parentTableId));
 
 	partitionBoundCString = TextDatumGetCString(partitionBoundDatum);
 
@@ -339,10 +676,6 @@ GenerateAttachShardPartitionCommand(ShardInterval *shardInterval)
 	char *escapedCommand = quote_literal_cstr(command);
 	int shardIndex = ShardIndex(shardInterval);
 
-	Oid parentSchemaId = InvalidOid;
-	char *parentSchemaName = NULL;
-	char *escapedParentSchemaName = NULL;
-	uint64 parentShardId = INVALID_SHARD_ID;
 
 	StringInfo attachPartitionCommand = makeStringInfo();
 
@@ -354,10 +687,10 @@ GenerateAttachShardPartitionCommand(ShardInterval *shardInterval)
 						errdetail("Referenced relation cannot be found.")));
 	}
 
-	parentSchemaId = get_rel_namespace(parentRelationId);
-	parentSchemaName = get_namespace_name(parentSchemaId);
-	escapedParentSchemaName = quote_literal_cstr(parentSchemaName);
-	parentShardId = ColocatedShardIdInRelation(parentRelationId, shardIndex);
+	Oid parentSchemaId = get_rel_namespace(parentRelationId);
+	char *parentSchemaName = get_namespace_name(parentSchemaId);
+	char *escapedParentSchemaName = quote_literal_cstr(parentSchemaName);
+	uint64 parentShardId = ColocatedShardIdInRelation(parentRelationId, shardIndex);
 
 	appendStringInfo(attachPartitionCommand,
 					 WORKER_APPLY_INTER_SHARD_DDL_COMMAND, parentShardId,
@@ -376,11 +709,7 @@ char *
 GenerateAlterTableAttachPartitionCommand(Oid partitionTableId)
 {
 	StringInfo createPartitionCommand = makeStringInfo();
-	char *partitionBoundCString = NULL;
 
-	Oid parentId = InvalidOid;
-	char *tableQualifiedName = NULL;
-	char *parentTableQualifiedName = NULL;
 
 	if (!PartitionTable(partitionTableId))
 	{
@@ -389,11 +718,11 @@ GenerateAlterTableAttachPartitionCommand(Oid partitionTableId)
 		ereport(ERROR, (errmsg("\"%s\" is not a partition", relationName)));
 	}
 
-	parentId = get_partition_parent(partitionTableId);
-	tableQualifiedName = generate_qualified_relation_name(partitionTableId);
-	parentTableQualifiedName = generate_qualified_relation_name(parentId);
+	Oid parentId = get_partition_parent(partitionTableId);
+	char *tableQualifiedName = generate_qualified_relation_name(partitionTableId);
+	char *parentTableQualifiedName = generate_qualified_relation_name(parentId);
 
-	partitionBoundCString = PartitionBound(partitionTableId);
+	char *partitionBoundCString = PartitionBound(partitionTableId);
 
 	appendStringInfo(createPartitionCommand, "ALTER TABLE %s ATTACH PARTITION %s %s;",
 					 parentTableQualifiedName, tableQualifiedName,
@@ -413,13 +742,9 @@ GenerateAlterTableAttachPartitionCommand(Oid partitionTableId)
 static char *
 PartitionBound(Oid partitionId)
 {
-	char *partitionBoundString = NULL;
-	HeapTuple tuple = NULL;
-	Datum datum = 0;
 	bool isnull = false;
-	Datum partitionBoundDatum = 0;
 
-	tuple = SearchSysCache1(RELOID, partitionId);
+	HeapTuple tuple = SearchSysCache1(RELOID, partitionId);
 	if (!HeapTupleIsValid(tuple))
 	{
 		elog(ERROR, "cache lookup failed for relation %u", partitionId);
@@ -438,15 +763,15 @@ PartitionBound(Oid partitionId)
 		return "";
 	}
 
-	datum = SysCacheGetAttr(RELOID, tuple,
-							Anum_pg_class_relpartbound,
-							&isnull);
+	Datum datum = SysCacheGetAttr(RELOID, tuple,
+								  Anum_pg_class_relpartbound,
+								  &isnull);
 	Assert(!isnull);
 
-	partitionBoundDatum =
+	Datum partitionBoundDatum =
 		DirectFunctionCall2(pg_get_expr, datum, ObjectIdGetDatum(partitionId));
 
-	partitionBoundString = TextDatumGetCString(partitionBoundDatum);
+	char *partitionBoundString = TextDatumGetCString(partitionBoundDatum);
 
 	ReleaseSysCache(tuple);
 

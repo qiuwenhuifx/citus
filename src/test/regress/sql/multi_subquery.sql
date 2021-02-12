@@ -4,6 +4,7 @@
 -- no need to set shardid sequence given that we're not creating any shards
 
 SET citus.next_shard_id TO 570032;
+SET citus.coordinator_aggregation_strategy TO 'disabled';
 
 -- Check that we error out if shard min/max values are not exactly same.
 SELECT
@@ -22,11 +23,11 @@ FROM
 
 -- Update metadata in order to make all shards equal
 -- note that the table is created on multi_insert_select_create_table.sql
-UPDATE 
-	pg_dist_shard 
-SET 
-	shardmaxvalue = '14947' 
-WHERE 
+UPDATE
+	pg_dist_shard
+SET
+	shardmaxvalue = '14947'
+WHERE
 	shardid IN (SELECT shardid FROM pg_dist_shard WHERE logicalrelid = 'orders_subquery'::regclass ORDER BY shardid DESC LIMIT 1);
 
 SET client_min_messages TO DEBUG1;
@@ -272,53 +273,64 @@ LIMIT 10;
 SELECT DISTINCT ON (t1.user_id) t1.user_id, t2.value_1, t2.value_2, t2.value_3
 FROM events_table t1
 LEFT JOIN users_reference_table t2 ON t1.user_id = trunc(t2.user_id)
-ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC 
+ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC
 LIMIT 5;
 
 -- outer joins on reference tables with simple expressions should work
 SELECT DISTINCT ON (t1.user_id) t1.user_id, t2.value_1, t2.value_2, t2.value_3
 FROM events_table t1
 LEFT JOIN users_reference_table t2 ON t1.user_id > t2.user_id
-ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC 
+ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC
 LIMIT 5;
 
 -- outer joins on distributed tables with simple expressions should not work
 SELECT DISTINCT ON (t1.user_id) t1.user_id, t2.value_1, t2.value_2, t2.value_3
 FROM events_table t1
 LEFT JOIN users_table t2 ON t1.user_id > t2.user_id
-ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC 
+ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC
 LIMIT 5;
 
 -- outer joins on reference tables with expressions should work
 SELECT DISTINCT ON (t1.user_id) t1.user_id, t2.value_1, t2.value_2, t2.value_3
 FROM events_table t1
 LEFT JOIN users_reference_table t2 ON t1.user_id = (CASE WHEN t2.user_id > 3 THEN 3 ELSE t2.user_id END)
-ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC 
+ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC
 LIMIT 5;
 
 -- outer joins on distributed tables and reference tables with expressions should work
 SELECT DISTINCT ON (t1.user_id) t1.user_id, t2.value_1, t2.value_2, t2.value_3
- FROM 
+ FROM
  users_table t0 LEFT JOIN
  events_table t1  ON t0.user_id = t1.user_id
  LEFT JOIN users_reference_table t2 ON t1.user_id = trunc(t2.user_id)
- ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC 
+ ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC
  LIMIT 5;
 
 -- outer joins on distributed tables with expressions should not work
 SELECT DISTINCT ON (t1.user_id) t1.user_id, t2.value_1, t2.value_2, t2.value_3
- FROM 
+ FROM
  users_table t0 LEFT JOIN
  events_table t1  ON t0.user_id = trunc(t1.user_id)
  LEFT JOIN users_reference_table t2 ON t1.user_id = trunc(t2.user_id)
- ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC 
+ ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC
  LIMIT 5;
+
+-- outer joins as subqueries should work
+-- https://github.com/citusdata/citus/issues/2739
+SELECT user_id, value_1, event_type
+FROM (
+	SELECT a.user_id, a.value_1, b.event_type
+	FROM users_table a
+	LEFT JOIN events_table b ON a.user_id = b.user_id
+) lo
+ORDER BY 1, 2, 3
+LIMIT 5;
 
 -- inner joins on reference tables with functions works
 SELECT DISTINCT ON (t1.user_id) t1.user_id, t2.value_1, t2.value_2, t2.value_3
 FROM events_table t1
 JOIN users_reference_table t2 ON t1.user_id = trunc(t2.user_id)
-ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC 
+ORDER BY 1 DESC, 2 DESC, 3 DESC, 4 DESC
 LIMIT 5;
 
 -- distinct queries work
@@ -455,6 +467,10 @@ FROM
 WHERE
 	unit_price > 1000 AND
 	unit_price < 10000;
+
+-- Check subqueries in target list
+SELECT (SELECT 1) FROM orders_subquery ORDER BY 1 LIMIT 1;
+SELECT sum((SELECT 1)) FROM orders_subquery;
 
 -- Check that if subquery is pulled, we don't error and run query properly.
 
@@ -604,9 +620,63 @@ SELECT * FROM
 		a_inner)
 AS foo;
 
-DROP TABLE subquery_pruning_varchar_test_table;
-
 RESET citus.enable_router_execution;
+
+-- Test https://github.com/citusdata/citus/issues/3424
+insert into subquery_pruning_varchar_test_table values ('1', '1'), (2, '1'), (3, '2'), (3, '1'), (4, '4'), (5, '6');
+
+WITH cte_1 AS (SELECT b max FROM subquery_pruning_varchar_test_table)
+SELECT a
+FROM subquery_pruning_varchar_test_table
+JOIN cte_1 ON a = max::text
+GROUP BY a HAVING a = (SELECT a)
+ORDER BY 1;
+
+-- Test https://github.com/citusdata/citus/issues/3432
+SELECT t1.event_type FROM events_table t1
+GROUP BY t1.event_type HAVING t1.event_type > avg((SELECT t2.value_2 FROM users_table t2 ORDER BY 1 DESC LIMIT 1))
+ORDER BY 1;
+
+SELECT t1.event_type FROM events_table t1
+GROUP BY t1.event_type HAVING t1.event_type > avg(2 + (SELECT t2.value_2 FROM users_table t2 ORDER BY 1 DESC LIMIT 1))
+ORDER BY 1;
+
+SELECT t1.event_type FROM events_table t1
+GROUP BY t1.event_type HAVING t1.event_type > avg((SELECT t2.value_2 FROM users_table t2 ORDER BY 1 DESC LIMIT 1) - t1.value_2)
+ORDER BY 1;
+
+RESET citus.coordinator_aggregation_strategy;
+SELECT t1.event_type FROM events_table t1
+GROUP BY t1.event_type HAVING t1.event_type > corr(t1.value_3, t1.value_2 + (SELECT t2.value_2 FROM users_table t2 ORDER BY 1 DESC LIMIT 1))
+ORDER BY 1;
+
+SELECT t1.event_type FROM events_table t1
+GROUP BY t1.event_type HAVING t1.event_type * 5 > sum(distinct t1.value_3)
+ORDER BY 1;
+SET citus.coordinator_aggregation_strategy TO 'disabled';
+
+-- Test https://github.com/citusdata/citus/issues/3433
+CREATE TABLE keyval1 (key int, value int);
+SELECT create_distributed_table('keyval1', 'key');
+
+CREATE TABLE keyval2 (key int, value int);
+SELECT create_distributed_table('keyval2', 'key');
+
+CREATE TABLE keyvalref (key int, value int);
+SELECT create_reference_table('keyvalref');
+
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM keyval1 GROUP BY key HAVING sum(value) > (SELECT sum(value) FROM keyvalref GROUP BY key);
+
+-- For some reason 'ORDER BY 1 DESC LIMIT 1' triggers recursive planning
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM keyval1 GROUP BY key HAVING sum(value) > (SELECT sum(value) FROM keyvalref GROUP BY key ORDER BY 1 DESC LIMIT 1);
+
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM keyval1 GROUP BY key HAVING sum(value) > (SELECT sum(value) FROM keyval2 GROUP BY key ORDER BY 1 DESC LIMIT 1);
+
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM keyval1 k1 WHERE k1.key = 2 GROUP BY key HAVING sum(value) > (SELECT sum(value) FROM keyval2 k2 WHERE k2.key = 2 GROUP BY key ORDER BY 1 DESC LIMIT 1);
 
 -- Simple join subquery pushdown
 SELECT
@@ -769,7 +839,7 @@ GROUP BY
 	count_pay
 ORDER BY
 	count_pay;
-	
+
 -- Lateral join subquery pushdown
 -- set subquery_pushdown since there is limit in the query
 SET citus.subquery_pushdown to ON;
@@ -827,16 +897,9 @@ LIMIT
 -- also set the min messages to WARNING to skip
 -- CASCADE NOTICE messagez
 SET client_min_messages TO WARNING;
-DROP TABLE users, events;
+DROP TABLE users, events, subquery_pruning_varchar_test_table, keyval1, keyval2, keyvalref;
 
-SELECT run_command_on_master_and_workers($f$
-	
-	DROP TYPE user_composite_type CASCADE;
-
-$f$);
-
--- createed in multi_behavioral_analytics_create_table
-DROP FUNCTION run_command_on_master_and_workers(p_sql text);
+DROP TYPE user_composite_type CASCADE;
 
 SET client_min_messages TO DEFAULT;
 

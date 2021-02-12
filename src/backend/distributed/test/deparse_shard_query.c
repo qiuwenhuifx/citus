@@ -5,7 +5,7 @@
  * This file contains functions to exercise deparsing of INSERT .. SELECT queries
  * for distributed tables.
  *
- * Copyright (c) 2014-2016, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -17,7 +17,8 @@
 #include <stddef.h>
 
 #include "catalog/pg_type.h"
-#include "distributed/master_protocol.h"
+#include "distributed/listutils.h"
+#include "distributed/coordinator_protocol.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/insert_select_planner.h"
 #include "distributed/multi_router_planner.h"
@@ -44,24 +45,21 @@ deparse_shard_query_test(PG_FUNCTION_ARGS)
 
 	char *queryStringChar = text_to_cstring(queryString);
 	List *parseTreeList = pg_parse_query(queryStringChar);
-	ListCell *parseTreeCell = NULL;
 
-	foreach(parseTreeCell, parseTreeList)
+	Node *parsetree = NULL;
+	foreach_ptr(parsetree, parseTreeList)
 	{
-		Node *parsetree = (Node *) lfirst(parseTreeCell);
-		ListCell *queryTreeCell = NULL;
-		List *queryTreeList = NIL;
+		List *queryTreeList = pg_analyze_and_rewrite((RawStmt *) parsetree,
+													 queryStringChar,
+													 NULL, 0, NULL);
 
-		queryTreeList = pg_analyze_and_rewrite((RawStmt *) parsetree, queryStringChar,
-											   NULL, 0, NULL);
-
-		foreach(queryTreeCell, queryTreeList)
+		Query *query = NULL;
+		foreach_ptr(query, queryTreeList)
 		{
-			Query *query = lfirst(queryTreeCell);
 			StringInfo buffer = makeStringInfo();
 
 			/* reoreder the target list only for INSERT .. SELECT queries */
-			if (InsertSelectIntoDistributedTable(query))
+			if (InsertSelectIntoCitusTable(query))
 			{
 				RangeTblEntry *insertRte = linitial(query->rtable);
 				RangeTblEntry *subqueryRte = lsecond(query->rtable);
@@ -72,7 +70,7 @@ deparse_shard_query_test(PG_FUNCTION_ARGS)
 
 			deparse_shard_query(query, InvalidOid, 0, buffer);
 
-			elog(INFO, "query: %s", ApplyLogRedaction(buffer->data));
+			elog(INFO, "query: %s", buffer->data);
 		}
 	}
 

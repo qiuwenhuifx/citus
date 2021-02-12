@@ -6,6 +6,7 @@
 SET citus.next_shard_id TO 240000;
 SET citus.shard_count TO 8;
 SET citus.shard_replication_factor TO 1;
+SET citus.coordinator_aggregation_strategy TO 'disabled';
 
 CREATE TABLE lineitem_hash (
 	l_orderkey bigint not null,
@@ -25,7 +26,7 @@ CREATE TABLE lineitem_hash (
 	l_shipmode char(10) not null,
 	l_comment varchar(44) not null,
 	PRIMARY KEY(l_orderkey, l_linenumber) );
-	
+
 SELECT create_distributed_table('lineitem_hash', 'l_orderkey', 'hash');
 
 \copy lineitem_hash FROM '@abs_srcdir@/data/lineitem.1.data' with delimiter '|'
@@ -33,10 +34,9 @@ SELECT create_distributed_table('lineitem_hash', 'l_orderkey', 'hash');
 
 ANALYZE lineitem_hash;
 
-SET citus.task_executor_type to "task-tracker";
 
 -- count(distinct) is supported on top level query if there
--- is a grouping on the partition key	
+-- is a grouping on the partition key
 SELECT
 	l_orderkey, count(DISTINCT l_partkey)
 	FROM lineitem_hash
@@ -147,14 +147,6 @@ SELECT
 	ORDER BY 1, 2 DESC;
 
 -- same but having clause is not on target list
-SELECT
-	l_shipmode, count(distinct l_partkey)
-	FROM lineitem_hash
-	GROUP BY l_shipmode
-	HAVING count(distinct l_suppkey) > 1550
-	ORDER BY 1, 2 DESC;
-
-EXPLAIN (COSTS false, VERBOSE true)
 SELECT
 	l_shipmode, count(distinct l_partkey)
 	FROM lineitem_hash
@@ -436,7 +428,7 @@ SELECT *
 -- distinct on non-var (type cast/field select) columns are also
 -- supported if grouped on distribution column
 -- random is added to prevent flattening by postgresql
-SELECT 
+SELECT
 	l_orderkey, count(a::int), count(distinct a::int)
 	FROM (
 		SELECT l_orderkey, l_orderkey * 1.5 a, random() b
@@ -464,11 +456,6 @@ CREATE TYPE test_item AS
   id       INTEGER,
   duration INTEGER
 );
-SELECT * FROM run_command_on_workers($$CREATE TYPE test_item AS
-(
-  id       INTEGER,
-  duration INTEGER
-)$$) ORDER BY nodeport;
 
 CREATE TABLE test_count_distinct_array (key int, value int ,  value_arr test_item[]);
 SELECT create_distributed_table('test_count_distinct_array', 'key');
@@ -491,7 +478,6 @@ LIMIT 5;
 DROP TABLE test_count_distinct_array;
 
 DROP TYPE test_item;
-SELECT * FROM run_command_on_workers($$DROP TYPE test_item$$) ORDER BY nodeport;
 
 -- other distinct aggregate are not supported
 SELECT *
@@ -550,7 +536,6 @@ SELECT *
    ORDER BY 2 DESC, 1
    LIMIT 10;
 
-RESET citus.task_executor_type;
 
 -- count distinct pushdown is enabled
 SELECT *

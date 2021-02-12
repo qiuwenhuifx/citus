@@ -4,7 +4,7 @@
  * Data structure definition for managing backend data and related function
  * declarations.
  *
- * Copyright (c) 2017, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -65,8 +65,11 @@ extern void AssignDistributedTransactionId(void);
 extern void MarkCitusInitiatedCoordinatorBackend(void);
 extern void GetBackendDataForProc(PGPROC *proc, BackendData *result);
 extern void CancelTransactionDueToDeadlock(PGPROC *proc);
-extern bool MyBackendGotCancelledDueToDeadlock(void);
+extern bool MyBackendGotCancelledDueToDeadlock(bool clearState);
 extern List * ActiveDistributedTransactionNumbers(void);
-LocalTransactionId GetMyProcLocalTransactionId(void);
+extern LocalTransactionId GetMyProcLocalTransactionId(void);
+extern int GetAllActiveClientBackendCount(void);
+extern void IncrementClientBackendCounter(void);
+extern void DecrementClientBackendCounter(void);
 
 #endif /* BACKEND_DATA_H */

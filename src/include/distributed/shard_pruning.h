@@ -3,7 +3,7 @@
  * shard_pruning.h
  *   Shard pruning infrastructure.
  *
- * Copyright (c) 2014-2017, Citus Data, Inc.
+ * Copyright (c) Citus Data, Inc.
  *
  *-------------------------------------------------------------------------
  */
@@ -20,5 +20,10 @@
 extern List * PruneShards(Oid relationId, Index rangeTableId, List *whereClauseList,
 						  Const **partitionValueConst);
 extern bool ContainsFalseClause(List *whereClauseList);
+extern List * get_all_actual_clauses(List *restrictinfo_list);
+extern Const * TransformPartitionRestrictionValue(Var *partitionColumn,
+												  Const *restrictionValue,
+												  bool missingOk);
+bool VarConstOpExprClause(OpExpr *opClause, Var **varClause, Const **constantClause);
 
 #endif /* SHARD_PRUNING_H_ */
