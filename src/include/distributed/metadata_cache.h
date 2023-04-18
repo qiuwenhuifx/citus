@@ -244,6 +244,7 @@ extern Oid DistLocalGroupIdRelationId(void);
 extern Oid DistObjectRelationId(void);
 extern Oid DistEnabledCustomAggregatesId(void);
 extern Oid DistTenantSchemaRelationId(void);
+extern Oid DatabaseShardRelationId(void);
 
 /* index oids */
 extern Oid DistNodeNodeIdIndexId(void);
@@ -268,6 +269,7 @@ extern Oid DistObjectPrimaryKeyIndexId(void);
 extern Oid DistCleanupPrimaryKeyIndexId(void);
 extern Oid DistTenantSchemaPrimaryKeyIndexId(void);
 extern Oid DistTenantSchemaUniqueColocationIdIndexId(void);
+extern Oid DatabaseShardPrimaryKeyIndexId(void);
 
 /* sequence oids */
 extern Oid DistBackgroundJobJobIdSequenceId(void);

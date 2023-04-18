@@ -167,6 +167,8 @@ typedef struct MetadataCacheData
 	Oid citusTaskStatusUnscheduledId;
 	Oid citusTaskStatusCancelledId;
 	Oid citusTaskStatusCancellingId;
+	Oid databaseShardRelationId;
+	Oid databaseShardPKeyIndexId;
 	Oid distRebalanceStrategyRelationId;
 	Oid distNodeRelationId;
 	Oid distNodeNodeIdIndexId;
@@ -2712,11 +2714,33 @@ DistRebalanceStrategyRelationId(void)
 }
 
 
+/* return oid of citus_catalog.database_sharding relation */
+Oid
+DatabaseShardRelationId(void)
+{
+	CachedRelationNamespaceLookup("database_shard", CitusCatalogNamespaceId(),
+								  &MetadataCache.databaseShardRelationId);
+
+	return MetadataCache.databaseShardRelationId;
+}
+
+
+/* return oid of citus_catalog.database_sharding primary key */
+Oid
+DatabaseShardPrimaryKeyIndexId(void)
+{
+	CachedRelationNamespaceLookup("database_shard_pkey", CitusCatalogNamespaceId(),
+								  &MetadataCache.databaseShardPKeyIndexId);
+
+	return MetadataCache.databaseShardPKeyIndexId;
+}
+
+
 /* return the oid of citus namespace */
 Oid
 CitusCatalogNamespaceId(void)
 {
-	CachedNamespaceLookup("citus", &MetadataCache.citusCatalogNamespaceId);
+	CachedNamespaceLookup("citus_catalog", &MetadataCache.citusCatalogNamespaceId);
 	return MetadataCache.citusCatalogNamespaceId;
 }
 
@@ -2747,12 +2771,14 @@ DistObjectRelationId(void)
 								 true);
 	if (!OidIsValid(MetadataCache.distObjectRelationId))
 	{
+		Oid citusNamespaceId = get_namespace_oid("citus", false);
+
 		/*
 		 * We can only ever reach here while we are creating/altering our extension before
 		 * the table is moved to pg_catalog.
 		 */
 		CachedRelationNamespaceLookupExtended("pg_dist_object",
-											  CitusCatalogNamespaceId(),
+											  citusNamespaceId,
 											  &MetadataCache.distObjectRelationId,
 											  false);
 	}
@@ -2788,12 +2814,14 @@ DistObjectPrimaryKeyIndexId(void)
 
 	if (!OidIsValid(MetadataCache.distObjectPrimaryKeyIndexId))
 	{
+		Oid citusNamespaceId = get_namespace_oid("citus", false);
+
 		/*
 		 * We can only ever reach here while we are creating/altering our extension before
 		 * the table is moved to pg_catalog.
 		 */
 		CachedRelationNamespaceLookupExtended("pg_dist_object_pkey",
-											  CitusCatalogNamespaceId(),
+											  citusNamespaceId,
 											  &MetadataCache.distObjectPrimaryKeyIndexId,
 											  false);
 	}
