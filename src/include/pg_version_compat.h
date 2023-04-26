@@ -28,6 +28,8 @@
 #define stringToQualifiedNameList_compat(a, b) stringToQualifiedNameList(a, b)
 #define typeStringToTypeName_compat(a, b) typeStringToTypeName(a, b)
 
+#define get_relids_in_jointree_compat(a, b, c) get_relids_in_jointree(a, b, c)
+
 #else
 
 #include "storage/relfilenode.h"
@@ -45,6 +47,8 @@ typedef Oid RelFileNumber;
 
 #define stringToQualifiedNameList_compat(a, b) stringToQualifiedNameList(a)
 #define typeStringToTypeName_compat(a, b) typeStringToTypeName(a)
+
+#define get_relids_in_jointree_compat(a, b, c) get_relids_in_jointree(a, b)
 
 #endif
 
