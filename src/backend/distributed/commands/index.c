@@ -561,7 +561,11 @@ ReindexStmtFindRelationOid(ReindexStmt *reindexStmt, bool missingOk)
 	{
 		relationId = RangeVarGetRelidExtended(reindexStmt->relation, lockmode,
 											  (missingOk) ? RVR_MISSING_OK : 0,
+#if PG_VERSION_NUM >= PG_VERSION_16
+											  RangeVarCallbackMaintainsTable, NULL);
+#else
 											  RangeVarCallbackOwnsTable, NULL);
+#endif
 	}
 
 	return relationId;
