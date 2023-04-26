@@ -2370,8 +2370,13 @@ GetSetCommandListForNewConnections(void)
 {
 	List *commandList = NIL;
 
+#if PG_VERSION_NUM >= PG_VERSION_16
+	int gucCount = 0;
+	struct config_generic **guc_vars = get_guc_variables(&gucCount);
+#else
 	struct config_generic **guc_vars = get_guc_variables();
 	int gucCount = GetNumConfigOptions();
+#endif
 
 	for (int gucIndex = 0; gucIndex < gucCount; gucIndex++)
 	{
