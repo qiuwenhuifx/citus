@@ -25,6 +25,9 @@
 
 #define PG_FUNCNAME_MACRO __func__
 
+#define stringToQualifiedNameList_compat(a, b) stringToQualifiedNameList(a, b)
+#define typeStringToTypeName_compat(a, b) typeStringToTypeName(a, b)
+
 #else
 
 #include "storage/relfilenode.h"
@@ -39,6 +42,9 @@ typedef Oid RelFileNumber;
 #define RelidByRelfilenumber(a, b) RelidByRelfilenode(a, b)
 
 #define tuplesort_getdatum_compat(a, b, c, d, e, f) tuplesort_getdatum(a, b, d, e, f)
+
+#define stringToQualifiedNameList_compat(a, b) stringToQualifiedNameList(a)
+#define typeStringToTypeName_compat(a, b) typeStringToTypeName(a)
 
 #endif
 
