@@ -1851,8 +1851,8 @@ TupleSortSkipSmallerItemPointers(Tuplesortstate *tupleSort, ItemPointer targetIt
 		Datum *abbrev = NULL;
 		Datum tsDatum;
 		bool tsDatumIsNull;
-		if (!tuplesort_getdatum(tupleSort, forwardDirection, &tsDatum,
-								&tsDatumIsNull, abbrev))
+		if (!tuplesort_getdatum_compat(tupleSort, forwardDirection, false,
+									   &tsDatum, &tsDatumIsNull, abbrev))
 		{
 			ItemPointerSetInvalid(&tsItemPointerData);
 			break;

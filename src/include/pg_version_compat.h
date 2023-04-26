@@ -21,6 +21,8 @@
 #define RelationPhysicalIdentifierNumberPtr_compat(a) (a->relNumber)
 #define RelationPhysicalIdentifierBackend_compat(a) (a->smgr_rlocator.locator)
 
+#define tuplesort_getdatum_compat(a, b, c, d, e, f) tuplesort_getdatum(a, b, c, d, e, f)
+
 #else
 
 #include "storage/relfilenode.h"
@@ -33,6 +35,8 @@
 typedef RelFileNode RelFileLocator;
 typedef Oid RelFileNumber;
 #define RelidByRelfilenumber(a, b) RelidByRelfilenode(a, b)
+
+#define tuplesort_getdatum_compat(a, b, c, d, e, f) tuplesort_getdatum(a, b, d, e, f)
 
 #endif
 
