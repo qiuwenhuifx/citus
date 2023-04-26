@@ -535,7 +535,11 @@ ColumnarIndexScanAdditionalCost(PlannerInfo *root, RelOptInfo *rel,
 	 * "anti-correlated" (-1) since both help us avoiding from reading the
 	 * same stripe again and again.
 	 */
+#if PG_VERSION_NUM >= PG_VERSION_16
+	double absIndexCorrelation = fabs(indexCorrelation);
+#else
 	double absIndexCorrelation = Abs(indexCorrelation);
+#endif
 
 	/*
 	 * To estimate the number of stripes that we need to read, we do linear
@@ -654,7 +658,11 @@ CheckVarStats(PlannerInfo *root, Var *var, Oid sortop, float4 *absVarCorrelation
 	 * If the Var is not highly correlated, then the chunk's min/max bounds
 	 * will be nearly useless.
 	 */
+#if PG_VERSION_NUM >= PG_VERSION_16
+	if (fabs(varCorrelation) < ColumnarQualPushdownCorrelationThreshold)
+#else
 	if (Abs(varCorrelation) < ColumnarQualPushdownCorrelationThreshold)
+#endif
 	{
 		if (absVarCorrelation)
 		{
@@ -662,7 +670,11 @@ CheckVarStats(PlannerInfo *root, Var *var, Oid sortop, float4 *absVarCorrelation
 			 * Report absVarCorrelation if caller wants to know why given
 			 * var is rejected.
 			 */
+#if PG_VERSION_NUM >= PG_VERSION_16
+			*absVarCorrelation = fabs(varCorrelation);
+#else
 			*absVarCorrelation = Abs(varCorrelation);
+#endif
 		}
 		return false;
 	}
