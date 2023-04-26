@@ -737,6 +737,15 @@ AddEdgesForLockWaits(WaitGraph *waitGraph, PGPROC *waitingProc, PROCStack *remai
 	int conflictMask = lockMethodTable->conflictTab[waitingProc->waitLockMode];
 
 	/* iterate through the queue of processes holding the lock */
+#if PG_VERSION_NUM >= PG_VERSION_16
+	dlist_head *procLocks = &waitLock->procLocks;
+
+	dlist_iter iter;
+	dlist_foreach(iter, procLocks)
+	{
+		PROCLOCK *procLock = dlist_container(PROCLOCK, lockLink, iter.cur);
+		PGPROC *currentProc = procLock->tag.myProc;
+#else
 	SHM_QUEUE *procLocks = &waitLock->procLocks;
 	PROCLOCK *procLock = (PROCLOCK *) SHMQueueNext(procLocks, procLocks,
 												   offsetof(PROCLOCK, lockLink));
@@ -744,6 +753,7 @@ AddEdgesForLockWaits(WaitGraph *waitGraph, PGPROC *waitingProc, PROCStack *remai
 	while (procLock != NULL)
 	{
 		PGPROC *currentProc = procLock->tag.myProc;
+#endif
 
 		/*
 		 * Skip processes from the same lock group, processes that don't conflict,
@@ -756,8 +766,10 @@ AddEdgesForLockWaits(WaitGraph *waitGraph, PGPROC *waitingProc, PROCStack *remai
 			AddWaitEdge(waitGraph, waitingProc, currentProc, remaining);
 		}
 
+#if PG_VERSION_NUM < PG_VERSION_16
 		procLock = (PROCLOCK *) SHMQueueNext(procLocks, &procLock->lockLink,
 											 offsetof(PROCLOCK, lockLink));
+#endif
 	}
 }
 
@@ -777,6 +789,24 @@ AddEdgesForWaitQueue(WaitGraph *waitGraph, PGPROC *waitingProc, PROCStack *remai
 	int conflictMask = lockMethodTable->conflictTab[waitingProc->waitLockMode];
 
 	/* iterate through the wait queue */
+#if PG_VERSION_NUM >= PG_VERSION_16
+	dclist_head *waitQueue = &waitLock->waitProcs;
+
+	dlist_iter iter;
+	dclist_foreach(iter, waitQueue)
+	{
+		PGPROC *currentProc = dlist_container(PGPROC, links, iter.cur);
+
+		if (currentProc == waitingProc)
+		{
+			/*
+			 * Iterate through the queue from the start until we encounter waitingProc,
+			 * since we only care about processes in front of waitingProc in the queue.
+			 */
+			break;
+		}
+
+#else
 	PROC_QUEUE *waitQueue = &(waitLock->waitProcs);
 	int queueSize = waitQueue->size;
 	PGPROC *currentProc = (PGPROC *) waitQueue->links.next;
@@ -787,6 +817,7 @@ AddEdgesForWaitQueue(WaitGraph *waitGraph, PGPROC *waitingProc, PROCStack *remai
 	 */
 	while (queueSize-- > 0 && currentProc != waitingProc)
 	{
+#endif
 		int awaitMask = LOCKBIT_ON(currentProc->waitLockMode);
 
 		/*
