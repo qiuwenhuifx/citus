@@ -15,6 +15,8 @@
 
 #if PG_VERSION_NUM >= PG_VERSION_16
 
+#include "utils/guc_tables.h"
+
 #define pg_clean_ascii_compat(a, b) pg_clean_ascii(a, b)
 
 #define RelationPhysicalIdentifier_compat(a) ((a)->rd_locator)
@@ -25,9 +27,17 @@
 
 #define tuplesort_getdatum_compat(a, b, c, d, e, f) tuplesort_getdatum(a, b, c, d, e, f)
 
+static inline struct config_generic **
+get_guc_variables_compat(int *gucCount)
+{
+	return get_guc_variables(gucCount);
+}
+
 #else
 
 #include "storage/relfilenode.h"
+#include "utils/guc.h"
+#include "utils/guc_tables.h"
 
 #define pg_clean_ascii_compat(a, b) pg_clean_ascii(a)
 
@@ -41,6 +51,13 @@ typedef Oid RelFileNumber;
 #define RelidByRelfilenumber(a, b) RelidByRelfilenode(a, b)
 
 #define tuplesort_getdatum_compat(a, b, c, d, e, f) tuplesort_getdatum(a, b, d, e, f)
+
+static inline struct config_generic **
+get_guc_variables_compat(int *gucCount)
+{
+	*gucCount = GetNumConfigOptions();
+	return get_guc_variables();
+}
 
 #endif
 
