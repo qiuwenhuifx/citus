@@ -2803,7 +2803,12 @@ ShowShardsForAppNamePrefixesCheckHook(char **newval, void **extra, GucSource sou
 		}
 
 		char *prefixAscii = pstrdup(appNamePrefix);
+
+#if PG_VERSION_NUM >= PG_VERSION_16
+		pg_clean_ascii(prefixAscii, MCXT_ALLOC_HUGE);
+#else
 		pg_clean_ascii(prefixAscii);
+#endif
 
 		if (strcmp(prefixAscii, appNamePrefix) != 0)
 		{
