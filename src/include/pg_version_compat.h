@@ -23,6 +23,8 @@
 
 #define tuplesort_getdatum_compat(a, b, c, d, e, f) tuplesort_getdatum(a, b, c, d, e, f)
 
+#define PG_FUNCNAME_MACRO __func__
+
 #else
 
 #include "storage/relfilenode.h"
