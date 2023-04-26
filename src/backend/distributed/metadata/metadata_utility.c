@@ -29,6 +29,9 @@
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_namespace.h"
+#if PG_VERSION_NUM >= PG_VERSION_16
+#include "catalog/pg_proc_d.h"
+#endif
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
 #include "commands/sequence.h"
@@ -2243,7 +2246,11 @@ EnsureTablePermissions(Oid relationId, AclMode mode)
 void
 EnsureTableOwner(Oid relationId)
 {
+#if PG_VERSION_NUM >= PG_VERSION_16
+	if (!object_ownercheck(RelationRelationId, relationId, GetUserId()))
+#else
 	if (!pg_class_ownercheck(relationId, GetUserId()))
+#endif
 	{
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_TABLE,
 					   get_rel_name(relationId));
@@ -2258,7 +2265,11 @@ EnsureTableOwner(Oid relationId)
 void
 EnsureSchemaOwner(Oid schemaId)
 {
+#if PG_VERSION_NUM >= PG_VERSION_16
+	if (!object_ownercheck(NamespaceRelationId, schemaId, GetUserId()))
+#else
 	if (!pg_namespace_ownercheck(schemaId, GetUserId()))
+#endif
 	{
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_SCHEMA,
 					   get_namespace_name(schemaId));
@@ -2274,7 +2285,11 @@ EnsureSchemaOwner(Oid schemaId)
 void
 EnsureFunctionOwner(Oid functionId)
 {
+#if PG_VERSION_NUM >= PG_VERSION_16
+	if (!object_ownercheck(ProcedureRelationId, functionId, GetUserId()))
+#else
 	if (!pg_proc_ownercheck(functionId, GetUserId()))
+#endif
 	{
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_FUNCTION,
 					   get_func_name(functionId));

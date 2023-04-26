@@ -168,7 +168,11 @@ aclcheckAggregate(ObjectType objectType, Oid userOid, Oid funcOid)
 	AclResult aclresult;
 	if (funcOid != InvalidOid)
 	{
+#if PG_VERSION_NUM >= PG_VERSION_16
+		aclresult = object_aclcheck(ProcedureRelationId, funcOid, userOid, ACL_EXECUTE);
+#else
 		aclresult = pg_proc_aclcheck(funcOid, userOid, ACL_EXECUTE);
+#endif
 		if (aclresult != ACLCHECK_OK)
 		{
 			aclcheck_error(aclresult, objectType, get_func_name(funcOid));
