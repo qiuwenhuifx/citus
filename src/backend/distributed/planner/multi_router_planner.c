@@ -2249,8 +2249,14 @@ SelectsFromDistributedTable(List *rangeTableList, Query *query)
 			continue;
 		}
 
+#if PG_VERSION_NUM >= PG_VERSION_16
+		if (rangeTableEntry->relkind == RELKIND_VIEW ||
+			rangeTableEntry->relkind == RELKIND_MATVIEW ||
+			rangeTableEntry->rtekind == RTE_SUBQUERY)
+#else
 		if (rangeTableEntry->relkind == RELKIND_VIEW ||
 			rangeTableEntry->relkind == RELKIND_MATVIEW)
+#endif
 		{
 			/*
 			 * Skip over views, which would error out in GetCitusTableCacheEntry.
