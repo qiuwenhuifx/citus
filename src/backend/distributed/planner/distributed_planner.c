@@ -464,6 +464,9 @@ static void
 AdjustPartitioningForDistributedPlanning(List *rangeTableList,
 										 bool setPartitionedTablesInherited)
 {
+#if PG_VERSION_NUM >= PG_VERSION_16
+	return;
+#endif
 	ListCell *rangeTableCell = NULL;
 
 	foreach(rangeTableCell, rangeTableList)
