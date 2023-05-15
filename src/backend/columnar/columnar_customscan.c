@@ -34,6 +34,9 @@
 #include "optimizer/plancat.h"
 #include "optimizer/restrictinfo.h"
 #include "utils/builtins.h"
+#if PG_VERSION_NUM >= PG_VERSION_16
+#include "utils/guc.h"
+#endif
 #include "utils/lsyscache.h"
 #include "utils/relcache.h"
 #include "utils/ruleutils.h"
