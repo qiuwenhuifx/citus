@@ -1450,7 +1450,8 @@ ColumnarPerStripeScanCost(RelOptInfo *rel, Oid relationId, int numberOfColumnsRe
 		ereport(ERROR, (errmsg("could not open relation with OID %u", relationId)));
 	}
 
-	List *stripeList = StripesForRelfilenode(relation->rd_node);
+	List *stripeList = StripesForRelfilelocator(RelationPhysicalIdentifier_compat(
+													relation));
 	RelationClose(relation);
 
 	uint32 maxColumnCount = 0;
@@ -1507,7 +1508,8 @@ ColumnarTableStripeCount(Oid relationId)
 		ereport(ERROR, (errmsg("could not open relation with OID %u", relationId)));
 	}
 
-	List *stripeList = StripesForRelfilenode(relation->rd_node);
+	List *stripeList = StripesForRelfilelocator(RelationPhysicalIdentifier_compat(
+													relation));
 	int stripeCount = list_length(stripeList);
 	RelationClose(relation);
 

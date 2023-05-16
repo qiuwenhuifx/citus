@@ -298,7 +298,7 @@ fake_finish_bulk_insert(Relation relation, int options)
  */
 static void
 fake_relation_set_new_filenode(Relation rel,
-							   const RelFileNode *newrnode,
+							   const RelFileLocator *newrnode,
 							   char persistence,
 							   TransactionId *freezeXid,
 							   MultiXactId *minmulti)
@@ -359,7 +359,7 @@ fake_relation_nontransactional_truncate(Relation rel)
 
 
 static void
-fake_copy_data(Relation rel, const RelFileNode *newrnode)
+fake_copy_data(Relation rel, const RelFileLocator *newrnode)
 {
 	elog(ERROR, "fake_copy_data not implemented");
 }
@@ -574,7 +574,11 @@ static const TableAmRoutine fake_methods = {
 	.compute_xid_horizon_for_tuples = fake_compute_xid_horizon_for_tuples,
 #endif
 
+#if PG_VERSION_NUM >= PG_VERSION_16
+	.relation_set_new_filelocator = fake_relation_set_new_filenode,
+#else
 	.relation_set_new_filenode = fake_relation_set_new_filenode,
+#endif
 	.relation_nontransactional_truncate = fake_relation_nontransactional_truncate,
 	.relation_copy_data = fake_copy_data,
 	.relation_copy_for_cluster = fake_copy_for_cluster,
