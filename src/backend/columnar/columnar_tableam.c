@@ -1114,12 +1114,38 @@ columnar_vacuum_rel(Relation rel, VacuumParams *params,
 	List *indexList = RelationGetIndexList(rel);
 	int nindexes = list_length(indexList);
 
+#if PG_VERSION_NUM >= PG_VERSION_16
+	struct VacuumCutoffs cutoffs;
+	vacuum_get_cutoffs(rel, params, &cutoffs);
+
+	Assert(MultiXactIdPrecedesOrEquals(cutoffs.MultiXactCutoff, cutoffs.OldestMxact));
+	Assert(TransactionIdPrecedesOrEquals(cutoffs.FreezeLimit, cutoffs.OldestXmin));
+
+	/*
+	 * Columnar storage doesn't hold any transaction IDs, so we can always
+	 * just advance to the most aggressive value.
+	 */
+	TransactionId newRelFrozenXid = cutoffs.OldestXmin;
+	MultiXactId newRelminMxid = cutoffs.OldestMxact;
+	double new_live_tuples = ColumnarTableTupleCount(rel);
+
+	/* all visible pages are always 0 */
+	BlockNumber new_rel_allvisible = 0;
+
+	bool frozenxid_updated;
+	bool minmulti_updated;
+
+	vac_update_relstats(rel, new_rel_pages, new_live_tuples,
+						new_rel_allvisible, nindexes > 0,
+						newRelFrozenXid, newRelminMxid,
+						&frozenxid_updated, &minmulti_updated, false);
+#else
 	TransactionId oldestXmin;
 	TransactionId freezeLimit;
 	MultiXactId multiXactCutoff;
 
 	/* initialize xids */
-#if PG_VERSION_NUM >= PG_VERSION_15
+#if (PG_VERSION_NUM >= PG_VERSION_15) && (PG_VERSION_NUM < PG_VERSION_16)
 	MultiXactId oldestMxact;
 	vacuum_set_xid_limits(rel,
 						  params->freeze_min_age,
@@ -1149,7 +1175,7 @@ columnar_vacuum_rel(Relation rel, VacuumParams *params,
 	 * just advance to the most aggressive value.
 	 */
 	TransactionId newRelFrozenXid = oldestXmin;
-#if PG_VERSION_NUM >= PG_VERSION_15
+#if (PG_VERSION_NUM >= PG_VERSION_15) && (PG_VERSION_NUM < PG_VERSION_16)
 	MultiXactId newRelminMxid = oldestMxact;
 #else
 	MultiXactId newRelminMxid = multiXactCutoff;
@@ -1160,7 +1186,7 @@ columnar_vacuum_rel(Relation rel, VacuumParams *params,
 	/* all visible pages are always 0 */
 	BlockNumber new_rel_allvisible = 0;
 
-#if PG_VERSION_NUM >= PG_VERSION_15
+#if (PG_VERSION_NUM >= PG_VERSION_15) && (PG_VERSION_NUM < PG_VERSION_16)
 	bool frozenxid_updated;
 	bool minmulti_updated;
 
@@ -1172,6 +1198,7 @@ columnar_vacuum_rel(Relation rel, VacuumParams *params,
 	vac_update_relstats(rel, new_rel_pages, new_live_tuples,
 						new_rel_allvisible, nindexes > 0,
 						newRelFrozenXid, newRelminMxid, false);
+#endif
 #endif
 
 	pgstat_report_vacuum(RelationGetRelid(rel),
