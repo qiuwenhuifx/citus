@@ -942,15 +942,21 @@ StripeMetadataLookupRowNumber(Relation relation, uint64 rowNumber, Snapshot snap
 	Relation columnarStripes = table_open(ColumnarStripeRelationId(), AccessShareLock);
 
 	Oid indexId = ColumnarStripeFirstRowNumberIndexRelationId();
+#if PG_VERSION_NUM >= PG_VERSION_16
+	bool indexOk = false && OidIsValid(indexId);
+#else
 	bool indexOk = OidIsValid(indexId);
+#endif
 	SysScanDesc scanDescriptor = systable_beginscan(columnarStripes, indexId, indexOk,
 													snapshot, 2, scanKey);
 
 	static bool loggedSlowMetadataAccessWarning = false;
 	if (!indexOk && !loggedSlowMetadataAccessWarning)
 	{
+#if PG_VERSION_NUM < PG_VERSION_16
 		ereport(WARNING, (errmsg(SLOW_METADATA_ACCESS_WARNING,
 								 "stripe_first_row_number_idx")));
+#endif
 		loggedSlowMetadataAccessWarning = true;
 	}
 
@@ -1388,14 +1394,20 @@ UpdateStripeMetadataRow(uint64 storageId, uint64 stripeId, bool *update,
 	Relation columnarStripes = table_open(columnarStripesOid, AccessShareLock);
 
 	Oid indexId = ColumnarStripePKeyIndexRelationId();
+#if PG_VERSION_NUM >= PG_VERSION_16
+	bool indexOk = false && OidIsValid(indexId);
+#else
 	bool indexOk = OidIsValid(indexId);
+#endif
 	SysScanDesc scanDescriptor = systable_beginscan(columnarStripes, indexId, indexOk,
 													&dirtySnapshot, 2, scanKey);
 
 	static bool loggedSlowMetadataAccessWarning = false;
 	if (!indexOk && !loggedSlowMetadataAccessWarning)
 	{
+#if PG_VERSION_NUM < PG_VERSION_16
 		ereport(WARNING, (errmsg(SLOW_METADATA_ACCESS_WARNING, "stripe_pkey")));
+#endif
 		loggedSlowMetadataAccessWarning = true;
 	}
 
@@ -1465,15 +1477,21 @@ ReadDataFileStripeList(uint64 storageId, Snapshot snapshot)
 	Relation columnarStripes = table_open(columnarStripesOid, AccessShareLock);
 
 	Oid indexId = ColumnarStripeFirstRowNumberIndexRelationId();
+#if PG_VERSION_NUM >= PG_VERSION_16
+	bool indexOk = false && OidIsValid(indexId);
+#else
 	bool indexOk = OidIsValid(indexId);
+#endif
 	SysScanDesc scanDescriptor = systable_beginscan(columnarStripes, indexId,
 													indexOk, snapshot, 1, scanKey);
 
 	static bool loggedSlowMetadataAccessWarning = false;
 	if (!indexOk && !loggedSlowMetadataAccessWarning)
 	{
+#if PG_VERSION_NUM < PG_VERSION_16
 		ereport(WARNING, (errmsg(SLOW_METADATA_ACCESS_WARNING,
 								 "stripe_first_row_number_idx")));
+#endif
 		loggedSlowMetadataAccessWarning = true;
 	}
 
