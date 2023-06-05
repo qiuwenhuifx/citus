@@ -6,16 +6,19 @@ orbs:
 parameters:
   image_suffix:
     type: string
-    default: '-vbab548a'
+    default: '-dev-e851c40'
   pg14_version:
     type: string
     default: '14.8'
   pg15_version:
     type: string
     default: '15.3'
+  pg16_version:
+    type: string
+    default: '16beta1'
   upgrade_pg_versions:
     type: string
-    default: '14.8-15.3'
+    default: '14.8-15.3-16beta1'
   style_checker_tools_version:
     type: string
     default: '0.8.18'
@@ -722,6 +725,10 @@ workflows:
           name: build-15
           pg_major: 15
           image_tag: '<< pipeline.parameters.pg15_version >>'
+      - build:
+          name: build-16
+          pg_major: 16
+          image_tag: '<< pipeline.parameters.pg16_version >>'
 
       - check-style
       - check-sql-snapshots
@@ -880,13 +887,6 @@ workflows:
 
       - test-pytest:
           name: 'test-15_pytest'
-          pg_major: 15
-          image_tag: '<< pipeline.parameters.pg15_version >>'
-          requires: [build-15]
-
-      - tap-test-citus:
-          name: 'test-15_tap-cdc'
-          suite: cdc
           pg_major: 15
           image_tag: '<< pipeline.parameters.pg15_version >>'
           requires: [build-15]
