@@ -33,6 +33,9 @@
 #include "optimizer/paths.h"
 #include "optimizer/plancat.h"
 #include "optimizer/restrictinfo.h"
+#if PG_VERSION_NUM >= PG_VERSION_16
+#include "parser/parse_relation.h"
+#endif
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/relcache.h"
@@ -1371,8 +1374,25 @@ AddColumnarScanPath(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 		cpath->custom_private = list_make2(NIL, NIL);
 	}
 
+#if PG_VERSION_NUM >= PG_VERSION_16
+	int numberOfColumnsRead = 0;
+
+	/*
+	 * TODO: how can we retrieve number of columns read for child relation?
+	 * Note that perminfo is not available for child relations, perminfoindex is 0 for them
+	 */
+	if (rte->perminfoindex > 0)
+	{
+		RTEPermissionInfo *perminfo = getRTEPermissionInfo(root->parse->rteperminfos,
+														   rte);
+		numberOfColumnsRead = bms_num_members(perminfo->selectedCols);
+	}
+
+	int numberOfClausesPushed = list_length(allClauses);
+#else
 	int numberOfColumnsRead = bms_num_members(rte->selectedCols);
 	int numberOfClausesPushed = list_length(allClauses);
+#endif
 
 	CostColumnarScan(root, rel, rte->relid, cpath, numberOfColumnsRead,
 					 numberOfClausesPushed);
