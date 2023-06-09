@@ -14,6 +14,7 @@
 
 #include "distributed/relation_utils.h"
 
+#include "miscadmin.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
@@ -28,3 +29,35 @@ RelationGetNamespaceName(Relation relation)
 	char *namespaceName = get_namespace_name(namespaceId);
 	return namespaceName;
 }
+
+
+#if PG_VERSION_NUM >= PG_VERSION_16
+
+/*
+ * GetFilledPermissionInfo creates RTEPermissionInfo for a given RTE
+ * and fills it with given data and returns this RTEPermissionInfo object.
+ * Wrote this function since Postgres's addRTEPermissionInfo doesn't fill the data.
+ *
+ * Given data consists of relid, inh and requiredPerms
+ * Currently the following entries are filled like this:
+ *      perminfo->checkAsUser = GetUserId();
+ *		perminfo->selectedCols = NULL;
+ *		perminfo->insertedCols = NULL;
+ *		perminfo->updatedCols = NULL;
+ */
+RTEPermissionInfo *
+GetFilledPermissionInfo(Oid relid, bool inh, AclMode requiredPerms)
+{
+	RTEPermissionInfo *perminfo = makeNode(RTEPermissionInfo);
+	perminfo->relid = relid;
+	perminfo->inh = inh;
+	perminfo->requiredPerms = requiredPerms;
+	perminfo->checkAsUser = GetUserId();
+	perminfo->selectedCols = NULL;
+	perminfo->insertedCols = NULL;
+	perminfo->updatedCols = NULL;
+	return perminfo;
+}
+
+
+#endif
