@@ -40,6 +40,7 @@ RelationGetNamespaceName(Relation relation)
  *
  * Given data consists of relid, inh and requiredPerms
  * Currently the following entries are filled like this:
+ * Took a quick look around Postgres, unless specified otherwise, we are dealing with GetUserId().
  *      perminfo->checkAsUser = GetUserId();
  *		perminfo->selectedCols = NULL;
  *		perminfo->insertedCols = NULL;
