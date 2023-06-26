@@ -1280,6 +1280,7 @@ PreprocessAlterTableStmt(Node *node, const char *alterTableCommand,
 	 *    we also set skip_validation to true to prevent PostgreSQL to verify validity
 	 *    of the foreign constraint in master. Validity will be checked in workers
 	 *    anyway.
+	 *  - an ADD COLUMN .. that is the only subcommand in the list OR
 	 *  - an ADD COLUMN .. DEFAULT nextval('..') OR
 	 *    an ADD COLUMN .. SERIAL pseudo-type OR
 	 *    an ALTER COLUMN .. SET DEFAULT nextval('..'). If there is we set
@@ -1409,13 +1410,6 @@ PreprocessAlterTableStmt(Node *node, const char *alterTableCommand,
 		}
 		else if (alterTableType == AT_AddColumn)
 		{
-			/*
-			 * TODO: This code path is nothing beneficial since we do not
-			 * support ALTER TABLE %s ADD COLUMN %s [constraint] for foreign keys.
-			 * However, the code is kept in case we fix the constraint
-			 * creation without a name and allow foreign key creation with the mentioned
-			 * command.
-			 */
 			ColumnDef *columnDefinition = (ColumnDef *) command->def;
 
 			HeapTuple columnTuple = SearchSysCacheAttName(leftRelationId,
@@ -1456,11 +1450,56 @@ PreprocessAlterTableStmt(Node *node, const char *alterTableCommand,
 			}
 
 			/*
+			 * We support deparsing for ADD COLUMN only of it's the only
+			 * subcommand.
+			 */
+			if (list_length(commandList) == 1 &&
+				alterTableStatement->objtype == OBJECT_TABLE)
+			{
+				deparseAT = true;
+
+				/*
+				 * Given that we're in the preprocess, any reference to the
+				 * column that we're adding would break the deparser. This
+				 * can only be the case with CHECK constraints. For this
+				 * reason, we don't allow check constraints to be added by
+				 * using ADD COLUMN subcommands. For other constraint types,
+				 * we prepare the constraint to make sure that we can deparse
+				 * it.
+				 */
+				foreach_ptr(constraint, columnConstraints)
+				{
+					if (constraint->contype == CONSTR_CHECK)
+					{
+						ereport(ERROR, (errmsg("cannot add check constraint to column "
+											   "by using ADD COLUMN command"),
+										errhint("Consider using ALTER TABLE ... "
+												"ADD CONSTRAINT ... CHECK command "
+												"after adding the column")));
+					}
+					else if (ConstrTypeCitusCanDefaultName(constraint->contype))
+					{
+						PrepareAlterTableStmtForConstraint(alterTableStatement,
+														   leftRelationId,
+														   constraint);
+					}
+				}
+
+				/*
+				 * Copy the constraints to the new subcommand because now we
+				 * might have assigned names to some of them.
+				 */
+				ColumnDef *newColumnDef = (ColumnDef *) newCmd->def;
+				newColumnDef->constraints = copyObject(columnConstraints);
+			}
+
+			/*
 			 * We check for ADD COLUMN .. DEFAULT expr
 			 * if expr contains nextval('user_defined_seq')
 			 * we should deparse the statement
 			 */
 			constraint = NULL;
+			int constraintIdx = 0;
 			foreach_ptr(constraint, columnConstraints)
 			{
 				if (constraint->contype == CONSTR_DEFAULT)
@@ -1476,14 +1515,19 @@ PreprocessAlterTableStmt(Node *node, const char *alterTableCommand,
 							deparseAT = true;
 							useInitialDDLCommandString = false;
 
-							/* the new column definition will have no constraint */
-							ColumnDef *newColDef = copyObject(columnDefinition);
-							newColDef->constraints = NULL;
-
-							newCmd->def = (Node *) newColDef;
+							/* drop the default expression from new subcomand */
+							ColumnDef *newColumnDef = (ColumnDef *) newCmd->def;
+							newColumnDef->constraints =
+								list_delete_nth_cell(newColumnDef->constraints,
+													 constraintIdx);
 						}
 					}
+
+					/* there can only be one DEFAULT constraint that can be used per column */
+					break;
 				}
+
+				constraintIdx++;
 			}
 
 
@@ -3705,13 +3749,6 @@ SetupExecutionModeForAlterTable(Oid relationId, AlterTableCmd *command)
 	}
 	else if (alterTableType == AT_AddColumn)
 	{
-		/*
-		 * TODO: This code path will never be executed since we do not
-		 * support foreign constraint creation via
-		 * ALTER TABLE %s ADD COLUMN %s [constraint]. However, the code
-		 * is kept in case we fix the constraint creation without a name
-		 * and allow foreign key creation with the mentioned command.
-		 */
 		ColumnDef *columnDefinition = (ColumnDef *) command->def;
 		List *columnConstraints = columnDefinition->constraints;
 
