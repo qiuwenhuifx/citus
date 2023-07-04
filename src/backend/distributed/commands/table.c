@@ -1417,6 +1417,22 @@ PreprocessAlterTableStmt(Node *node, const char *alterTableCommand,
 			 * command.
 			 */
 			ColumnDef *columnDefinition = (ColumnDef *) command->def;
+
+			HeapTuple columnTuple = SearchSysCacheAttName(leftRelationId,
+														  columnDefinition->colname);
+			bool columnExists = HeapTupleIsValid(columnTuple);
+			if (columnExists)
+			{
+				/*
+				 * Return NIL regardless of whether IF NOT EXISTS is provided.
+				 * If the column exists and IF NOT EXISTS is provided, standard
+				 * process utility will do nothing. And if that option was not
+				 * provided, standard process utility will throw an error anyway.
+				 */
+				ReleaseSysCache(columnTuple);
+				return NIL;
+			}
+
 			List *columnConstraints = columnDefinition->constraints;
 
 			Constraint *constraint = NULL;
