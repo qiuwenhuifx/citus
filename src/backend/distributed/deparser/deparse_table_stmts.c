@@ -224,7 +224,8 @@ AppendAlterTableCmdConstraint(StringInfo buf, Constraint *constraint,
 
 				bool first = (defListCell == list_head(constraint->options));
 				appendStringInfo(buf, "%s%s=%s", first ? "" : ",",
-								 def->defname, defGetString(def));
+								 quote_identifier(def->defname),
+								 quote_identifier(defGetString(def)));
 			}
 
 			appendStringInfoChar(buf, ')');
@@ -597,7 +598,8 @@ AppendAlterTableCmdAddColumn(StringInfo buf, AlterTableCmd *alterTableCmd,
 
 	if (columnDefinition->compression)
 	{
-		appendStringInfo(buf, " COMPRESSION %s", columnDefinition->compression);
+		appendStringInfo(buf, " COMPRESSION %s",
+						 quote_identifier(columnDefinition->compression));
 	}
 
 	Oid collationOid = GetColumnDefCollation(NULL, columnDefinition, typeOid);
