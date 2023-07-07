@@ -296,7 +296,8 @@ GetExplicitTriggerIdList(Oid relationId)
  * unsupported commands or creates ddl job for supported CREATE TRIGGER commands.
  */
 List *
-PostprocessCreateTriggerStmt(Node *node, const char *queryString)
+PostprocessCreateTriggerStmt(Node *node, const char *queryString,
+							 ProcessUtilityContext processUtilityContext)
 {
 	CreateTrigStmt *createTriggerStmt = castNode(CreateTrigStmt, node);
 	if (IsCreateCitusTruncateTriggerStmt(createTriggerStmt))
@@ -443,7 +444,8 @@ PreprocessAlterTriggerRenameStmt(Node *node, const char *queryString,
  * RENAME commands.
  */
 List *
-PostprocessAlterTriggerRenameStmt(Node *node, const char *queryString)
+PostprocessAlterTriggerRenameStmt(Node *node, const char *queryString,
+								  ProcessUtilityContext processUtilityContext)
 {
 	RenameStmt *renameTriggerStmt = castNode(RenameStmt, node);
 	Assert(renameTriggerStmt->renameType == OBJECT_TRIGGER);
@@ -569,7 +571,8 @@ PreprocessAlterTriggerDependsStmt(Node *node, const char *queryString,
  * ON commands.
  */
 List *
-PostprocessAlterTriggerDependsStmt(Node *node, const char *queryString)
+PostprocessAlterTriggerDependsStmt(Node *node, const char *queryString,
+								   ProcessUtilityContext processUtilityContext)
 {
 	AlterObjectDependsStmt *alterTriggerDependsStmt =
 		castNode(AlterObjectDependsStmt, node);

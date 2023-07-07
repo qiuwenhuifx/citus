@@ -55,7 +55,8 @@ static bool CreateSchemaStmtCreatesTable(CreateSchemaStmt *stmt);
  * CREATE SCHEMA ..
  */
 List *
-PostprocessCreateSchemaStmt(Node *node, const char *queryString)
+PostprocessCreateSchemaStmt(Node *node, const char *queryString,
+							ProcessUtilityContext processUtilityContext)
 {
 	CreateSchemaStmt *createSchemaStmt = castNode(CreateSchemaStmt, node);
 

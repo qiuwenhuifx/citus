@@ -1408,7 +1408,8 @@ PreprocessCreateFunctionStmt(Node *node, const char *queryString,
  * created on all nodes.
  */
 List *
-PostprocessCreateFunctionStmt(Node *node, const char *queryString)
+PostprocessCreateFunctionStmt(Node *node, const char *queryString,
+							  ProcessUtilityContext processUtilityContext)
 {
 	CreateFunctionStmt *stmt = castNode(CreateFunctionStmt, node);
 
@@ -2071,7 +2072,8 @@ PreprocessGrantOnFunctionStmt(Node *node, const char *queryString,
  * distributed function in the statement exist on all nodes
  */
 List *
-PostprocessGrantOnFunctionStmt(Node *node, const char *queryString)
+PostprocessGrantOnFunctionStmt(Node *node, const char *queryString,
+							   ProcessUtilityContext processUtilityContext)
 {
 	GrantStmt *stmt = castNode(GrantStmt, node);
 

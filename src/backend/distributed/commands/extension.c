@@ -138,7 +138,8 @@ ExtractNewExtensionVersion(Node *parseTree)
  * dependencies exist on all nodes.
  */
 List *
-PostprocessCreateExtensionStmt(Node *node, const char *queryString)
+PostprocessCreateExtensionStmt(Node *node, const char *queryString,
+							   ProcessUtilityContext processUtilityContext)
 {
 	CreateExtensionStmt *stmt = castNode(CreateExtensionStmt, node);
 
@@ -411,7 +412,8 @@ PreprocessAlterExtensionSchemaStmt(Node *node, const char *queryString,
  * all its dependencies exist on the workers before we apply the commands remotely.
  */
 List *
-PostprocessAlterExtensionSchemaStmt(Node *node, const char *queryString)
+PostprocessAlterExtensionSchemaStmt(Node *node, const char *queryString,
+									ProcessUtilityContext processUtilityContext)
 {
 	List *extensionAddresses = GetObjectAddressListFromParseTree(node, false, true);
 

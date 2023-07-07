@@ -214,7 +214,8 @@ unparse_policy_command(const char aclchar)
  * DDLJobs in a List. If no distributed table is involved, this returns NIL.
  */
 List *
-PostprocessCreatePolicyStmt(Node *node, const char *queryString)
+PostprocessCreatePolicyStmt(Node *node, const char *queryString,
+							ProcessUtilityContext processUtilityContext)
 {
 	CreatePolicyStmt *stmt = castNode(CreatePolicyStmt, node);
 

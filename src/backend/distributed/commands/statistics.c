@@ -106,7 +106,8 @@ PreprocessCreateStatisticsStmt(Node *node, const char *queryString,
  * been executed by standard process utility.
  */
 List *
-PostprocessCreateStatisticsStmt(Node *node, const char *queryString)
+PostprocessCreateStatisticsStmt(Node *node, const char *queryString,
+								ProcessUtilityContext processUtilityContext)
 {
 	CreateStatsStmt *stmt = castNode(CreateStatsStmt, node);
 	Assert(stmt->type == T_CreateStatsStmt);
@@ -319,7 +320,8 @@ PreprocessAlterStatisticsSchemaStmt(Node *node, const char *queryString,
  * command has been executed by standard process utility.
  */
 List *
-PostprocessAlterStatisticsSchemaStmt(Node *node, const char *queryString)
+PostprocessAlterStatisticsSchemaStmt(Node *node, const char *queryString,
+									 ProcessUtilityContext processUtilityContext)
 {
 	AlterObjectSchemaStmt *stmt = castNode(AlterObjectSchemaStmt, node);
 	Assert(stmt->objectType == OBJECT_STATISTIC_EXT);
@@ -481,7 +483,8 @@ PreprocessAlterStatisticsOwnerStmt(Node *node, const char *queryString,
  * already distributed in the cluster.
  */
 List *
-PostprocessAlterStatisticsOwnerStmt(Node *node, const char *queryString)
+PostprocessAlterStatisticsOwnerStmt(Node *node, const char *queryString,
+									ProcessUtilityContext processUtilityContext)
 {
 	AlterOwnerStmt *stmt = castNode(AlterOwnerStmt, node);
 	Assert(stmt->objectType == OBJECT_STATISTIC_EXT);

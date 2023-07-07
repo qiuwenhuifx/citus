@@ -117,6 +117,10 @@ static void SetInterShardDDLTaskPlacementList(Task *task,
 static void SetInterShardDDLTaskRelationShardList(Task *task,
 												  ShardInterval *leftShardInterval,
 												  ShardInterval *rightShardInterval);
+static List * PostprocessAlterTableStmtPre(Node *node, const char *alterTableCommand,
+										   ProcessUtilityContext processUtilityContext);
+static void PostprocessAlterTableStmtPost(AlterTableStmt *alterTableStatement,
+										  ProcessUtilityContext context);
 static Oid get_attrdef_oid(Oid relationId, AttrNumber attnum);
 
 static char * GetAddColumnWithNextvalDefaultCmd(Oid sequenceOid, Oid relationId,
@@ -731,7 +735,8 @@ ErrorIfAttachCitusTableToPgLocalTable(Oid parentRelationId, Oid partitionRelatio
  * dependencies exist on the workers before we apply the commands remotely.
  */
 List *
-PostprocessAlterTableSchemaStmt(Node *node, const char *queryString)
+PostprocessAlterTableSchemaStmt(Node *node, const char *queryString,
+								ProcessUtilityContext processUtilityContext)
 {
 	AlterObjectSchemaStmt *stmt = castNode(AlterObjectSchemaStmt, node);
 	Assert(stmt->objectType == OBJECT_TABLE || stmt->objectType == OBJECT_FOREIGN_TABLE);
@@ -755,12 +760,14 @@ PostprocessAlterTableSchemaStmt(Node *node, const char *queryString)
 	if (relKind == RELKIND_SEQUENCE)
 	{
 		stmt->objectType = OBJECT_SEQUENCE;
-		return PostprocessAlterSequenceSchemaStmt((Node *) stmt, queryString);
+		return PostprocessAlterSequenceSchemaStmt((Node *) stmt, queryString,
+												  processUtilityContext);
 	}
 	else if (relKind == RELKIND_VIEW)
 	{
 		stmt->objectType = OBJECT_VIEW;
-		return PostprocessAlterViewSchemaStmt((Node *) stmt, queryString);
+		return PostprocessAlterViewSchemaStmt((Node *) stmt, queryString,
+											  processUtilityContext);
 	}
 
 	if (!ShouldPropagate() || !IsCitusTable(tableAddress->objectId))
@@ -1017,61 +1024,6 @@ SwitchToSequentialAndLocalExecutionIfConstraintNameTooLong(Oid relationId,
 
 
 /*
- * PreprocessAlterTableAddConstraint creates a new constraint name for {PRIMARY KEY, UNIQUE, EXCLUDE, CHECK, FOREIGN KEY}
- * and changes the original alterTableCommand run by the standard utility hook to use the new constraint name.
- * Then it converts the ALTER TABLE ... ADD {PRIMARY KEY, UNIQUE, EXCLUDE, CHECK, FOREIGN KEY} ... command
- * into ALTER TABLE ... ADD CONSTRAINT <constraint name> {PRIMARY KEY, UNIQUE, EXCLUDE, CHECK, FOREIGN KEY} format and returns the DDLJob
- * to run this command in the workers.
- */
-static List *
-PreprocessAlterTableAddConstraint(AlterTableStmt *alterTableStatement, Oid
-								  relationId,
-								  Constraint *constraint)
-{
-	PrepareAlterTableStmtForConstraint(alterTableStatement, relationId, constraint);
-
-	char *ddlCommand = DeparseTreeNode((Node *) alterTableStatement);
-
-	DDLJob *ddlJob = palloc0(sizeof(DDLJob));
-
-	ObjectAddressSet(ddlJob->targetObjectAddress, RelationRelationId, relationId);
-	ddlJob->startNewTransaction = false;
-	ddlJob->metadataSyncCommand = ddlCommand;
-
-
-	if (constraint->contype == CONSTR_FOREIGN)
-	{
-		Oid rightRelationId = RangeVarGetRelid(constraint->pktable, NoLock,
-											   false);
-
-		/*
-		 * If one of the relations involved in the FOREIGN KEY constraint is not a distributed table, citus errors out eventually.
-		 * PreprocessAlterTableStmt function returns an empty tasklist in those cases.
-		 * leftRelation is checked in PreprocessAlterTableStmt before
-		 * calling PreprocessAlterTableAddConstraint. However, we need to handle the rightRelation since PreprocessAlterTableAddConstraint
-		 * returns early.
-		 */
-		bool referencedIsLocalTable = !IsCitusTable(rightRelationId);
-		if (referencedIsLocalTable)
-		{
-			ddlJob->taskList = NIL;
-		}
-		else
-		{
-			ddlJob->taskList = InterShardDDLTaskList(relationId, rightRelationId,
-													 ddlCommand);
-		}
-	}
-	else
-	{
-		ddlJob->taskList = DDLTaskList(relationId, ddlCommand);
-	}
-
-	return list_make1(ddlJob);
-}
-
-
-/*
  * PrepareAlterTableStmtForConstraint assigns a name to the constraint if it
  * does not have one and switches to sequential and local execution if the
  * constraint name is too long.
@@ -1112,22 +1064,12 @@ PrepareAlterTableStmtForConstraint(AlterTableStmt *alterTableStatement,
 }
 
 
-/*
- * PreprocessAlterTableStmt determines whether a given ALTER TABLE statement
- * involves a distributed table. If so (and if the statement does not use
- * unsupported options), it modifies the input statement to ensure proper
- * execution against the master node table and creates a DDLJob to encapsulate
- * information needed during the worker node portion of DDL execution before
- * returning that DDLJob in a List. If no distributed table is involved, this
- * function returns NIL.
- */
 List *
 PreprocessAlterTableStmt(Node *node, const char *alterTableCommand,
 						 ProcessUtilityContext processUtilityContext)
 {
 	AlterTableStmt *alterTableStatement = castNode(AlterTableStmt, node);
 
-	/* first check whether a distributed relation is affected */
 	if (alterTableStatement->relation == NULL)
 	{
 		return NIL;
@@ -1138,6 +1080,256 @@ PreprocessAlterTableStmt(Node *node, const char *alterTableCommand,
 
 	if (!OidIsValid(leftRelationId))
 	{
+		return NIL;
+	}
+
+	/*
+	 * check whether we are dealing with a sequence or view here
+	 */
+	char relKind = get_rel_relkind(leftRelationId);
+	if (relKind == RELKIND_SEQUENCE || relKind == RELKIND_VIEW)
+	{
+		return NIL;
+	}
+
+	/*
+	 * AlterTableStmt applies also to INDEX relations, and we have support for
+	 * SET/SET storage parameters in Citus, so we might have to check for
+	 * another relation here.
+	 *
+	 * ALTER INDEX ATTACH PARTITION also applies to INDEX relation, so we might
+	 * check another relation for that option as well.
+	 */
+	char leftRelationKind = get_rel_relkind(leftRelationId);
+	if (leftRelationKind == RELKIND_INDEX ||
+		leftRelationKind == RELKIND_PARTITIONED_INDEX)
+	{
+		bool missingOk = false;
+		leftRelationId = IndexGetRelation(leftRelationId, missingOk);
+	}
+
+	if (ShouldEnableLocalReferenceForeignKeys() &&
+		processUtilityContext != PROCESS_UTILITY_SUBCOMMAND &&
+		ATDefinesFKeyBetweenPostgresAndCitusLocalOrRef(alterTableStatement))
+	{
+		/*
+		 * We don't process subcommands generated by postgres.
+		 * This is mainly because postgres issues ALTER TABLE commands
+		 * for some set of objects that are defined via CREATE TABLE commands.
+		 * However, citus already has a separate logic for CREATE TABLE
+		 * commands.
+		 *
+		 * To support foreign keys from/to postgres local tables to/from reference
+		 * or citus local tables, we convert given postgres local table -and the
+		 * other postgres tables that it is connected via a fkey graph- to a citus
+		 * local table.
+		 *
+		 * Note that we don't convert postgres tables to citus local tables if
+		 * coordinator is not added to metadata as CreateCitusLocalTable requires
+		 * this. In this case, we assume user is about to create reference or
+		 * distributed table from local table and we don't want to break user
+		 * experience by asking to add coordinator to metadata.
+		 */
+		ConvertPostgresLocalTablesToCitusLocalTables(alterTableStatement);
+	}
+
+	if (AlterTableDropsForeignKey(alterTableStatement))
+	{
+		/*
+		 * The foreign key graph keeps track of the foreign keys including local tables.
+		 * So, even if a foreign key on a local table is dropped, we should invalidate
+		 * the graph so that the next commands can see the graph up-to-date.
+		 * We are aware that utility hook would still invalidate foreign key graph
+		 * even when command fails, but currently we are ok with that.
+		 */
+		MarkInvalidateForeignKeyGraph();
+	}
+
+	bool referencingIsLocalTable = !IsCitusTable(leftRelationId);
+	if (referencingIsLocalTable)
+	{
+		return NIL;
+	}
+
+	/*
+	 * The PostgreSQL parser dispatches several commands into the node type
+	 * AlterTableStmt, from ALTER INDEX to ALTER SEQUENCE or ALTER VIEW. Here
+	 * we have a special implementation for ALTER INDEX, and a specific error
+	 * message in case of unsupported sub-command.
+	 */
+	if (leftRelationKind == RELKIND_INDEX ||
+		leftRelationKind == RELKIND_PARTITIONED_INDEX)
+	{
+		ErrorIfUnsupportedAlterIndexStmt(alterTableStatement);
+	}
+	else
+	{
+		/* this function also accepts more than just RELKIND_RELATION... */
+		ErrorIfUnsupportedAlterTableStmt(alterTableStatement);
+	}
+
+	EnsureCoordinator();
+
+	bool executeSequentially = false;
+
+	List *commandList = alterTableStatement->cmds;
+	AlterTableCmd *command = NULL;
+	foreach_ptr(command, commandList)
+	{
+		AlterTableType alterTableType = command->subtype;
+
+		if (alterTableType == AT_AddConstraint)
+		{
+			Constraint *constraint = (Constraint *) command->def;
+			if (constraint->contype == CONSTR_FOREIGN)
+			{
+				/*
+				 * Foreign constraint validations will be done in workers. If we do not
+				 * set this flag, PostgreSQL tries to do additional checking when we drop
+				 * to standard_ProcessUtility. standard_ProcessUtility tries to open new
+				 * connections to workers to verify foreign constraints while original
+				 * transaction is in process, which causes deadlock.
+				 */
+				constraint->skip_validation = true;
+
+				if (constraint->conname == NULL)
+				{
+					PrepareAlterTableStmtForConstraint(alterTableStatement,
+													   leftRelationId,
+													   constraint);
+				}
+			}
+			/*
+			 * When constraint->indexname is not NULL we are handling an
+			 * ADD {PRIMARY KEY, UNIQUE} USING INDEX command. In this case
+			 * we do not have to create a name and change the command.
+			 * The existing index name will be used by the postgres.
+			 */
+			else if (constraint->conname == NULL && constraint->indexname == NULL)
+			{
+				if (ConstrTypeCitusCanDefaultName(constraint->contype))
+				{
+					/*
+					 * Create a constraint name. Convert ALTER TABLE ... ADD PRIMARY ... command into
+					 * ALTER TABLE ... ADD CONSTRAINT <conname> PRIMARY KEY ... form and create the ddl jobs
+					 * for running this form of the command on the workers.
+					 */
+					PrepareAlterTableStmtForConstraint(alterTableStatement,
+													   leftRelationId,
+													   constraint);
+				}
+			}
+		}
+		else if (alterTableType == AT_AddColumn)
+		{
+			ColumnDef *columnDefinition = (ColumnDef *) command->def;
+			List *columnConstraints = columnDefinition->constraints;
+
+			Constraint *constraint = NULL;
+			foreach_ptr(constraint, columnConstraints)
+			{
+				if (constraint->contype == CONSTR_FOREIGN)
+				{
+					/*
+					 * Foreign constraint validations will be done in workers. If we do not
+					 * set this flag, PostgreSQL tries to do additional checking when we drop
+					 * to standard_ProcessUtility. standard_ProcessUtility tries to open new
+					 * connections to workers to verify foreign constraints while original
+					 * transaction is in process, which causes deadlock.
+					 */
+					constraint->skip_validation = true;
+					break;
+				}
+			}
+
+			/*
+			 * We support deparsing for ADD COLUMN only of it's the only
+			 * subcommand.
+			 */
+			if (alterTableStatement->objtype == OBJECT_TABLE)
+			{
+				/*
+				 * Given that we're in the preprocess, any reference to the
+				 * column that we're adding would break the deparser. This
+				 * can only be the case with CHECK constraints. For this
+				 * reason, we don't allow check constraints to be added by
+				 * using ADD COLUMN subcommands. For other constraint types,
+				 * we prepare the constraint to make sure that we can deparse
+				 * it.
+				 */
+				foreach_ptr(constraint, columnConstraints)
+				{
+					if (constraint->contype == CONSTR_CHECK)
+					{
+						ereport(ERROR, (errmsg("cannot add check constraint to column "
+											   "by using ADD COLUMN command"),
+										errhint("Consider using ALTER TABLE ... "
+												"ADD CONSTRAINT ... CHECK command "
+												"after adding the column")));
+					}
+					else if (ConstrTypeCitusCanDefaultName(constraint->contype))
+					{
+						PrepareAlterTableStmtForConstraint(alterTableStatement,
+														   leftRelationId,
+														   constraint);
+					}
+				}
+			}
+		}
+
+		executeSequentially |= SetupExecutionModeForAlterTable(leftRelationId,
+															   command);
+	}
+
+	if (executeSequentially)
+	{
+		SetLocalMultiShardModifyModeToSequential();
+	}
+
+	return NIL;
+}
+
+
+List *
+PostprocessAlterTableStmt(Node *node, const char *alterTableCommand,
+						  ProcessUtilityContext processUtilityContext)
+{
+	List *ddlJobs = PostprocessAlterTableStmtPre(node, alterTableCommand,
+												 processUtilityContext);
+	if (ddlJobs != NIL)
+	{
+		PostprocessAlterTableStmtPost(castNode(AlterTableStmt, node),
+									  processUtilityContext);
+	}
+
+	return ddlJobs;
+}
+
+
+/*
+ * PostprocessAlterTableStmtPre determines whether a given ALTER TABLE statement
+ * involves a distributed table. If so (and if the statement does not use
+ * unsupported options), it modifies the input statement to ensure proper
+ * execution against the master node table and creates a DDLJob to encapsulate
+ * information needed during the worker node portion of DDL execution before
+ * returning that DDLJob in a List. If no distributed table is involved, this
+ * function returns NIL.
+ */
+static List *
+PostprocessAlterTableStmtPre(Node *node, const char *alterTableCommand,
+							 ProcessUtilityContext processUtilityContext)
+{
+	AlterTableStmt *alterTableStatement = castNode(AlterTableStmt, node);
+
+	Assert(alterTableStatement->relation != NULL);
+
+	LOCKMODE lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
+	Oid leftRelationId = AlterTableLookupRelation(alterTableStatement, lockmode);
+
+	if (!OidIsValid(leftRelationId))
+	{
+		/* otherwise, standard process utility hook should've already thrown an error */
+		Assert(alterTableStatement->missing_ok);
 		return NIL;
 	}
 
@@ -1199,79 +1391,14 @@ PreprocessAlterTableStmt(Node *node, const char *alterTableCommand,
 		leftRelationId = IndexGetRelation(leftRelationId, missingOk);
 	}
 
-	if (ShouldEnableLocalReferenceForeignKeys() &&
-		processUtilityContext != PROCESS_UTILITY_SUBCOMMAND &&
-		ATDefinesFKeyBetweenPostgresAndCitusLocalOrRef(alterTableStatement))
-	{
-		/*
-		 * We don't process subcommands generated by postgres.
-		 * This is mainly because postgres issues ALTER TABLE commands
-		 * for some set of objects that are defined via CREATE TABLE commands.
-		 * However, citus already has a separate logic for CREATE TABLE
-		 * commands.
-		 *
-		 * To support foreign keys from/to postgres local tables to/from reference
-		 * or citus local tables, we convert given postgres local table -and the
-		 * other postgres tables that it is connected via a fkey graph- to a citus
-		 * local table.
-		 *
-		 * Note that we don't convert postgres tables to citus local tables if
-		 * coordinator is not added to metadata as CreateCitusLocalTable requires
-		 * this. In this case, we assume user is about to create reference or
-		 * distributed table from local table and we don't want to break user
-		 * experience by asking to add coordinator to metadata.
-		 */
-		ConvertPostgresLocalTablesToCitusLocalTables(alterTableStatement);
-
-		/*
-		 * CreateCitusLocalTable converts relation to a shard relation and creates
-		 * shell table from scratch.
-		 * For this reason we should re-enter to PreprocessAlterTableStmt to operate
-		 * on shell table relation id.
-		 */
-		return PreprocessAlterTableStmt(node, alterTableCommand, processUtilityContext);
-	}
-
-	if (AlterTableDropsForeignKey(alterTableStatement))
-	{
-		/*
-		 * The foreign key graph keeps track of the foreign keys including local tables.
-		 * So, even if a foreign key on a local table is dropped, we should invalidate
-		 * the graph so that the next commands can see the graph up-to-date.
-		 * We are aware that utility hook would still invalidate foreign key graph
-		 * even when command fails, but currently we are ok with that.
-		 */
-		MarkInvalidateForeignKeyGraph();
-	}
-
 	bool referencingIsLocalTable = !IsCitusTable(leftRelationId);
 	if (referencingIsLocalTable)
 	{
 		return NIL;
 	}
 
-	/*
-	 * The PostgreSQL parser dispatches several commands into the node type
-	 * AlterTableStmt, from ALTER INDEX to ALTER SEQUENCE or ALTER VIEW. Here
-	 * we have a special implementation for ALTER INDEX, and a specific error
-	 * message in case of unsupported sub-command.
-	 */
-	if (leftRelationKind == RELKIND_INDEX ||
-		leftRelationKind == RELKIND_PARTITIONED_INDEX)
-	{
-		ErrorIfUnsupportedAlterIndexStmt(alterTableStatement);
-	}
-	else
-	{
-		/* this function also accepts more than just RELKIND_RELATION... */
-		ErrorIfUnsupportedAlterTableStmt(alterTableStatement);
-	}
-
-	EnsureCoordinator();
-
 	/* these will be set in below loop according to subcommands */
 	Oid rightRelationId = InvalidOid;
-	bool executeSequentially = false;
 
 	/*
 	 * We check if there is:
@@ -1343,42 +1470,16 @@ PreprocessAlterTableStmt(Node *node, const char *alterTableCommand,
 					UpdateAutoConvertedForConnectedRelations(relationList, false);
 				}
 
-				/*
-				 * Foreign constraint validations will be done in workers. If we do not
-				 * set this flag, PostgreSQL tries to do additional checking when we drop
-				 * to standard_ProcessUtility. standard_ProcessUtility tries to open new
-				 * connections to workers to verify foreign constraints while original
-				 * transaction is in process, which causes deadlock.
-				 */
-				constraint->skip_validation = true;
-
-				if (constraint->conname == NULL)
-				{
-					return PreprocessAlterTableAddConstraint(alterTableStatement,
-															 leftRelationId,
-															 constraint);
-				}
+				Assert(constraint->conname != NULL);
 			}
+
 			/*
 			 * When constraint->indexname is not NULL we are handling an
 			 * ADD {PRIMARY KEY, UNIQUE} USING INDEX command. In this case
 			 * we do not have to create a name and change the command.
 			 * The existing index name will be used by the postgres.
 			 */
-			else if (constraint->conname == NULL && constraint->indexname == NULL)
-			{
-				if (ConstrTypeCitusCanDefaultName(constraint->contype))
-				{
-					/*
-					 * Create a constraint name. Convert ALTER TABLE ... ADD PRIMARY ... command into
-					 * ALTER TABLE ... ADD CONSTRAINT <conname> PRIMARY KEY ... form and create the ddl jobs
-					 * for running this form of the command on the workers.
-					 */
-					return PreprocessAlterTableAddConstraint(alterTableStatement,
-															 leftRelationId,
-															 constraint);
-				}
-			}
+			Assert(!(constraint->conname == NULL && constraint->indexname == NULL));
 		}
 		else if (alterTableType == AT_DropConstraint)
 		{
@@ -1411,22 +1512,6 @@ PreprocessAlterTableStmt(Node *node, const char *alterTableCommand,
 		else if (alterTableType == AT_AddColumn)
 		{
 			ColumnDef *columnDefinition = (ColumnDef *) command->def;
-
-			HeapTuple columnTuple = SearchSysCacheAttName(leftRelationId,
-														  columnDefinition->colname);
-			bool columnExists = HeapTupleIsValid(columnTuple);
-			if (columnExists)
-			{
-				/*
-				 * Return NIL regardless of whether IF NOT EXISTS is provided.
-				 * If the column exists and IF NOT EXISTS is provided, standard
-				 * process utility will do nothing. And if that option was not
-				 * provided, standard process utility will throw an error anyway.
-				 */
-				ReleaseSysCache(columnTuple);
-				return NIL;
-			}
-
 			List *columnConstraints = columnDefinition->constraints;
 
 			Constraint *constraint = NULL;
@@ -1436,16 +1521,6 @@ PreprocessAlterTableStmt(Node *node, const char *alterTableCommand,
 				{
 					rightRelationId = RangeVarGetRelid(constraint->pktable, lockmode,
 													   alterTableStatement->missing_ok);
-
-					/*
-					 * Foreign constraint validations will be done in workers. If we do not
-					 * set this flag, PostgreSQL tries to do additional checking when we drop
-					 * to standard_ProcessUtility. standard_ProcessUtility tries to open new
-					 * connections to workers to verify foreign constraints while original
-					 * transaction is in process, which causes deadlock.
-					 */
-					constraint->skip_validation = true;
-					break;
 				}
 			}
 
@@ -1457,40 +1532,6 @@ PreprocessAlterTableStmt(Node *node, const char *alterTableCommand,
 				alterTableStatement->objtype == OBJECT_TABLE)
 			{
 				deparseAT = true;
-
-				/*
-				 * Given that we're in the preprocess, any reference to the
-				 * column that we're adding would break the deparser. This
-				 * can only be the case with CHECK constraints. For this
-				 * reason, we don't allow check constraints to be added by
-				 * using ADD COLUMN subcommands. For other constraint types,
-				 * we prepare the constraint to make sure that we can deparse
-				 * it.
-				 */
-				foreach_ptr(constraint, columnConstraints)
-				{
-					if (constraint->contype == CONSTR_CHECK)
-					{
-						ereport(ERROR, (errmsg("cannot add check constraint to column "
-											   "by using ADD COLUMN command"),
-										errhint("Consider using ALTER TABLE ... "
-												"ADD CONSTRAINT ... CHECK command "
-												"after adding the column")));
-					}
-					else if (ConstrTypeCitusCanDefaultName(constraint->contype))
-					{
-						PrepareAlterTableStmtForConstraint(alterTableStatement,
-														   leftRelationId,
-														   constraint);
-					}
-				}
-
-				/*
-				 * Copy the constraints to the new subcommand because now we
-				 * might have assigned names to some of them.
-				 */
-				ColumnDef *newColumnDef = (ColumnDef *) newCmd->def;
-				newColumnDef->constraints = copyObject(columnConstraints);
 			}
 
 			/*
@@ -1655,18 +1696,6 @@ PreprocessAlterTableStmt(Node *node, const char *alterTableCommand,
 			return CitusCreateTriggerCommandDDLJob(leftRelationId, triggerName,
 												   alterTableCommand);
 		}
-
-		/*
-		 * We check and set the execution mode only if we fall into either of first two
-		 * conditional blocks, otherwise we already continue the loop
-		 */
-		executeSequentially |= SetupExecutionModeForAlterTable(leftRelationId,
-															   command);
-	}
-
-	if (executeSequentially)
-	{
-		SetLocalMultiShardModifyModeToSequential();
 	}
 
 	/* fill them here as it is possible to use them in some conditional blocks below */
@@ -2571,14 +2600,15 @@ ErrorIfAlterDropsPartitionColumn(AlterTableStmt *alterTableStatement)
 
 
 /*
- * PostprocessAlterTableStmt runs after the ALTER TABLE command has already run
+ * PostprocessAlterTableStmtPost runs after the ALTER TABLE command has already run
  * on the master, so we are checking constraints over the table with constraints
  * already defined (to make the constraint check process same for ALTER TABLE and
  * CREATE TABLE). If constraints do not fulfill the rules we defined, they will be
  * removed and the table will return back to the state before the ALTER TABLE command.
  */
-void
-PostprocessAlterTableStmt(AlterTableStmt *alterTableStatement)
+static void
+PostprocessAlterTableStmtPost(AlterTableStmt *alterTableStatement,
+							  ProcessUtilityContext context)
 {
 	LOCKMODE lockmode = AlterTableGetLockLevel(alterTableStatement->cmds);
 	Oid relationId = AlterTableLookupRelation(alterTableStatement, lockmode);
@@ -2595,13 +2625,14 @@ PostprocessAlterTableStmt(AlterTableStmt *alterTableStatement)
 		if (relKind == RELKIND_SEQUENCE)
 		{
 			alterTableStatement->objtype = OBJECT_SEQUENCE;
-			PostprocessAlterSequenceOwnerStmt((Node *) alterTableStatement, NULL);
+			PostprocessAlterSequenceOwnerStmt((Node *) alterTableStatement, NULL,
+											  context);
 			return;
 		}
 		else if (relKind == RELKIND_VIEW)
 		{
 			alterTableStatement->objtype = OBJECT_VIEW;
-			PostprocessAlterViewStmt((Node *) alterTableStatement, NULL);
+			PostprocessAlterViewStmt((Node *) alterTableStatement, NULL, context);
 			return;
 		}
 
@@ -2756,7 +2787,7 @@ PostprocessAlterTableStmt(AlterTableStmt *alterTableStatement)
 		 * It's easy to retrieve the sequence id to create the proper commands
 		 * in postprocess, after the dependency between the sequence and the table
 		 * has been created. We already return ddlJobs in PreprocessAlterTableStmt,
-		 * hence we can't return ddlJobs in PostprocessAlterTableStmt.
+		 * hence we can't return ddlJobs in PostprocessAlterTableStmtPost.
 		 * That's why we execute the following here instead of
 		 * in ExecuteDistributedDDLJob
 		 */

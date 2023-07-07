@@ -41,7 +41,9 @@
  * to reduce the complexity of implementation of new DDL commands.
  */
 List *
-PostprocessCreateDistributedObjectFromCatalogStmt(Node *stmt, const char *queryString)
+PostprocessCreateDistributedObjectFromCatalogStmt(Node *stmt, const char *queryString,
+												  ProcessUtilityContext
+												  processUtilityContext)
 {
 	const DistributeObjectOps *ops = GetDistributeObjectOps(stmt);
 	Assert(ops != NULL);
@@ -165,7 +167,8 @@ PreprocessAlterDistributedObjectStmt(Node *stmt, const char *queryString,
  * they get created on the workers before we send the command list to the workers.
  */
 List *
-PostprocessAlterDistributedObjectStmt(Node *stmt, const char *queryString)
+PostprocessAlterDistributedObjectStmt(Node *stmt, const char *queryString,
+									  ProcessUtilityContext processUtilityContext)
 {
 	const DistributeObjectOps *ops = GetDistributeObjectOps(stmt);
 	Assert(ops != NULL);

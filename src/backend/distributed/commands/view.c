@@ -118,7 +118,8 @@ PreprocessViewStmt(Node *node, const char *queryString,
  * created on all nodes.
  */
 List *
-PostprocessViewStmt(Node *node, const char *queryString)
+PostprocessViewStmt(Node *node, const char *queryString,
+					ProcessUtilityContext processUtilityContext)
 {
 	ViewStmt *stmt = castNode(ViewStmt, node);
 
@@ -595,7 +596,8 @@ PreprocessAlterViewStmt(Node *node, const char *queryString, ProcessUtilityConte
  * PostprocessAlterViewStmt is invoked for alter view statements.
  */
 List *
-PostprocessAlterViewStmt(Node *node, const char *queryString)
+PostprocessAlterViewStmt(Node *node, const char *queryString,
+						 ProcessUtilityContext processUtilityContext)
 {
 	AlterTableStmt *stmt = castNode(AlterTableStmt, node);
 	Assert(stmt->objtype == OBJECT_VIEW);
@@ -752,7 +754,8 @@ PreprocessAlterViewSchemaStmt(Node *node, const char *queryString,
  * the workers before we apply the commands remotely.
  */
 List *
-PostprocessAlterViewSchemaStmt(Node *node, const char *queryString)
+PostprocessAlterViewSchemaStmt(Node *node, const char *queryString,
+							   ProcessUtilityContext processUtilityContext)
 {
 	AlterObjectSchemaStmt *stmt = castNode(AlterObjectSchemaStmt, node);
 

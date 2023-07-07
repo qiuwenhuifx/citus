@@ -71,7 +71,8 @@ static List * VacuumRelationIdList(VacuumStmt *vacuumStmt, CitusVacuumParams
  * ANALYZE has already been processed.
  */
 List *
-PostprocessVacuumStmt(Node *node, const char *vacuumCommand)
+PostprocessVacuumStmt(Node *node, const char *vacuumCommand,
+					  ProcessUtilityContext processUtilityContext)
 {
 	VacuumStmt *vacuumStmt = castNode(VacuumStmt, node);
 

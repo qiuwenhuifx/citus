@@ -47,7 +47,8 @@ static List * ObjectAddressForPublicationName(char *publicationName, bool missin
  * that contain distributed tables.
  */
 List *
-PostProcessCreatePublicationStmt(Node *node, const char *queryString)
+PostProcessCreatePublicationStmt(Node *node, const char *queryString,
+								 ProcessUtilityContext processUtilityContext)
 {
 	CreatePublicationStmt *stmt = castNode(CreatePublicationStmt, node);
 

@@ -138,7 +138,8 @@ RoleSpecToObjectAddress(RoleSpec *role, bool missing_ok)
  * password, which is, in some cases, created at standardProcessUtility.
  */
 List *
-PostprocessAlterRoleStmt(Node *node, const char *queryString)
+PostprocessAlterRoleStmt(Node *node, const char *queryString,
+						 ProcessUtilityContext processUtilityContext)
 {
 	List *addresses = GetObjectAddressListFromParseTree(node, false, true);
 
@@ -1151,7 +1152,8 @@ PreprocessGrantRoleStmt(Node *node, const char *queryString,
  * role statement.
  */
 List *
-PostprocessGrantRoleStmt(Node *node, const char *queryString)
+PostprocessGrantRoleStmt(Node *node, const char *queryString,
+						 ProcessUtilityContext processUtilityContext)
 {
 	if (!EnableCreateRolePropagation || !IsCoordinator() || !ShouldPropagate())
 	{

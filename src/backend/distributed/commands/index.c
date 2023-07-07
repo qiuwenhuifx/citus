@@ -786,7 +786,8 @@ PreprocessDropIndexStmt(Node *node, const char *dropIndexCommand,
  * committed.
  */
 List *
-PostprocessIndexStmt(Node *node, const char *queryString)
+PostprocessIndexStmt(Node *node, const char *queryString,
+					 ProcessUtilityContext processUtilityContext)
 {
 	IndexStmt *indexStmt = castNode(IndexStmt, node);
 

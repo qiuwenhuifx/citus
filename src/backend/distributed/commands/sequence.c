@@ -634,7 +634,8 @@ AlterSequenceSchemaStmtObjectAddress(Node *node, bool missing_ok, bool isPostpro
  * exist on the workers before we apply the commands remotely.
  */
 List *
-PostprocessAlterSequenceSchemaStmt(Node *node, const char *queryString)
+PostprocessAlterSequenceSchemaStmt(Node *node, const char *queryString,
+								   ProcessUtilityContext processUtilityContext)
 {
 	AlterObjectSchemaStmt *stmt = castNode(AlterObjectSchemaStmt, node);
 	Assert(stmt->objectType == OBJECT_SEQUENCE);
@@ -718,7 +719,8 @@ AlterSequenceOwnerStmtObjectAddress(Node *node, bool missing_ok, bool isPostproc
  * exist on the workers before we apply the commands remotely.
  */
 List *
-PostprocessAlterSequenceOwnerStmt(Node *node, const char *queryString)
+PostprocessAlterSequenceOwnerStmt(Node *node, const char *queryString,
+								  ProcessUtilityContext processUtilityContext)
 {
 	AlterTableStmt *stmt = castNode(AlterTableStmt, node);
 	Assert(stmt->objtype == OBJECT_SEQUENCE);
@@ -921,7 +923,8 @@ PreprocessGrantOnSequenceStmt(Node *node, const char *queryString,
  * distributed sequence in the statement exist on all nodes
  */
 List *
-PostprocessGrantOnSequenceStmt(Node *node, const char *queryString)
+PostprocessGrantOnSequenceStmt(Node *node, const char *queryString,
+							   ProcessUtilityContext processUtilityContext)
 {
 	GrantStmt *stmt = castNode(GrantStmt, node);
 	Assert(stmt->objtype == OBJECT_SEQUENCE);

@@ -82,7 +82,7 @@ typedef struct DistributeObjectOps
 	char * (*deparse)(Node *);
 	void (*qualify)(Node *);
 	List * (*preprocess)(Node *, const char *, ProcessUtilityContext);
-	List * (*postprocess)(Node *, const char *);
+	List * (*postprocess)(Node *, const char *, ProcessUtilityContext);
 	List * (*address)(Node *, bool, bool);
 	bool markDistributed;
 
@@ -181,11 +181,15 @@ extern List * PreprocessClusterStmt(Node *node, const char *clusterCommand,
 
 /* common.c - forward declarations*/
 extern List * PostprocessCreateDistributedObjectFromCatalogStmt(Node *stmt,
-																const char *queryString);
+																const char *queryString,
+																ProcessUtilityContext
+																processUtilityContext);
 extern List * PreprocessAlterDistributedObjectStmt(Node *stmt, const char *queryString,
 												   ProcessUtilityContext
 												   processUtilityContext);
-extern List * PostprocessAlterDistributedObjectStmt(Node *stmt, const char *queryString);
+extern List * PostprocessAlterDistributedObjectStmt(Node *stmt, const char *queryString,
+													ProcessUtilityContext
+													processUtilityContext);
 extern List * PreprocessDropDistributedObjectStmt(Node *node, const char *queryString,
 												  ProcessUtilityContext
 												  processUtilityContext);
@@ -244,7 +248,8 @@ extern void PreprocessAlterExtensionCitusStmtForCitusColumnar(Node *parsetree);
 extern void PostprocessAlterExtensionCitusStmtForCitusColumnar(Node *parsetree);
 extern bool ShouldMarkRelationDistributed(Oid relationId);
 extern void ErrorIfUnstableCreateOrAlterExtensionStmt(Node *parsetree);
-extern List * PostprocessCreateExtensionStmt(Node *stmt, const char *queryString);
+extern List * PostprocessCreateExtensionStmt(Node *stmt, const char *queryString,
+											 ProcessUtilityContext processUtilityContext);
 extern List * PreprocessDropExtensionStmt(Node *stmt, const char *queryString,
 										  ProcessUtilityContext processUtilityContext);
 extern List * PreprocessAlterExtensionSchemaStmt(Node *stmt,
@@ -252,7 +257,9 @@ extern List * PreprocessAlterExtensionSchemaStmt(Node *stmt,
 												 ProcessUtilityContext
 												 processUtilityContext);
 extern List * PostprocessAlterExtensionSchemaStmt(Node *stmt,
-												  const char *queryString);
+												  const char *queryString,
+												  ProcessUtilityContext
+												  processUtilityContext);
 extern List * PreprocessAlterExtensionUpdateStmt(Node *stmt,
 												 const char *queryString,
 												 ProcessUtilityContext
@@ -344,7 +351,8 @@ extern List * PreprocessAlterForeignTableSchemaStmt(Node *node, const char *quer
 extern List * PreprocessCreateFunctionStmt(Node *stmt, const char *queryString,
 										   ProcessUtilityContext processUtilityContext);
 extern List * PostprocessCreateFunctionStmt(Node *stmt,
-											const char *queryString);
+											const char *queryString,
+											ProcessUtilityContext processUtilityContext);
 extern List * CreateFunctionStmtObjectAddress(Node *stmt,
 											  bool missing_ok, bool isPostprocess);
 extern List * DefineAggregateStmtObjectAddress(Node *stmt,
@@ -367,7 +375,8 @@ extern List * AlterFunctionDependsStmtObjectAddress(Node *stmt,
 													bool missing_ok, bool isPostprocess);
 extern List * PreprocessGrantOnFunctionStmt(Node *node, const char *queryString,
 											ProcessUtilityContext processUtilityContext);
-extern List * PostprocessGrantOnFunctionStmt(Node *node, const char *queryString);
+extern List * PostprocessGrantOnFunctionStmt(Node *node, const char *queryString,
+											 ProcessUtilityContext processUtilityContext);
 
 
 /* grant.c - forward declarations */
@@ -396,7 +405,8 @@ extern List * PreprocessDropIndexStmt(Node *dropIndexStatement,
 									  const char *dropIndexCommand,
 									  ProcessUtilityContext processUtilityContext);
 extern List * PostprocessIndexStmt(Node *node,
-								   const char *queryString);
+								   const char *queryString,
+								   ProcessUtilityContext processUtilityContext);
 extern void ErrorIfUnsupportedAlterIndexStmt(AlterTableStmt *alterTableStatement);
 extern void MarkIndexValid(IndexStmt *indexStmt);
 extern List * ExecuteFunctionOnEachTableIndex(Oid relationId, PGIndexProcessor
@@ -415,7 +425,8 @@ extern List * PreprocessDropOwnedStmt(Node *node, const char *queryString,
 extern List * CreatePolicyCommands(Oid relationId);
 extern void ErrorIfUnsupportedPolicy(Relation relation);
 extern void ErrorIfUnsupportedPolicyExpr(Node *expr);
-extern List * PostprocessCreatePolicyStmt(Node *node, const char *queryString);
+extern List * PostprocessCreatePolicyStmt(Node *node, const char *queryString,
+										  ProcessUtilityContext processUtilityContext);
 extern List * PreprocessAlterPolicyStmt(Node *node, const char *queryString,
 										ProcessUtilityContext processUtilityContext);
 extern List * PreprocessDropPolicyStmt(Node *stmt, const char *queryString,
@@ -433,7 +444,8 @@ extern void DropPolicyEventExtendNames(DropStmt *stmt, const char *schemaName, u
 extern void AddRangeTableEntryToQueryCompat(ParseState *parseState, Relation relation);
 
 /* publication.c - forward declarations */
-extern List * PostProcessCreatePublicationStmt(Node *node, const char *queryString);
+extern List * PostProcessCreatePublicationStmt(Node *node, const char *queryString,
+											   ProcessUtilityContext context);
 extern List * CreatePublicationDDLCommandsIdempotent(const ObjectAddress *address);
 extern char * CreatePublicationDDLCommand(Oid publicationId);
 extern List * PreprocessAlterPublicationStmt(Node *stmt, const char *queryString,
@@ -459,7 +471,8 @@ extern List * PreprocessRenameAttributeStmt(Node *stmt, const char *queryString,
 
 
 /* role.c - forward declarations*/
-extern List * PostprocessAlterRoleStmt(Node *stmt, const char *queryString);
+extern List * PostprocessAlterRoleStmt(Node *stmt, const char *queryString,
+									   ProcessUtilityContext processUtilityContext);
 extern List * PreprocessAlterRoleSetStmt(Node *stmt, const char *queryString,
 										 ProcessUtilityContext processUtilityContext);
 extern List * GenerateAlterRoleSetCommandForRole(Oid roleid);
@@ -473,7 +486,8 @@ extern List * PreprocessDropRoleStmt(Node *stmt, const char *queryString,
 									 ProcessUtilityContext processUtilityContext);
 extern List * PreprocessGrantRoleStmt(Node *stmt, const char *queryString,
 									  ProcessUtilityContext processUtilityContext);
-extern List * PostprocessGrantRoleStmt(Node *stmt, const char *queryString);
+extern List * PostprocessGrantRoleStmt(Node *stmt, const char *queryString,
+									   ProcessUtilityContext processUtilityContext);
 extern List * GenerateCreateOrAlterRoleCommand(Oid roleOid);
 extern List * CreateRoleStmtObjectAddress(Node *stmt, bool missing_ok, bool
 										  isPostprocess);
@@ -481,7 +495,8 @@ extern void UnmarkRolesDistributed(List *roles);
 extern List * FilterDistributedRoles(List *roles);
 
 /* schema.c - forward declarations */
-extern List * PostprocessCreateSchemaStmt(Node *node, const char *queryString);
+extern List * PostprocessCreateSchemaStmt(Node *node, const char *queryString,
+										  ProcessUtilityContext processUtilityContext);
 extern List * PreprocessDropSchemaStmt(Node *dropSchemaStatement,
 									   const char *queryString,
 									   ProcessUtilityContext processUtilityContext);
@@ -502,10 +517,14 @@ extern List * PreprocessAlterSequenceStmt(Node *node, const char *queryString,
 extern List * PreprocessAlterSequenceSchemaStmt(Node *node, const char *queryString,
 												ProcessUtilityContext
 												processUtilityContext);
-extern List * PostprocessAlterSequenceSchemaStmt(Node *node, const char *queryString);
+extern List * PostprocessAlterSequenceSchemaStmt(Node *node, const char *queryString,
+												 ProcessUtilityContext
+												 processUtilityContext);
 extern List * PreprocessAlterSequenceOwnerStmt(Node *node, const char *queryString,
 											   ProcessUtilityContext processUtilityContext);
-extern List * PostprocessAlterSequenceOwnerStmt(Node *node, const char *queryString);
+extern List * PostprocessAlterSequenceOwnerStmt(Node *node, const char *queryString,
+												ProcessUtilityContext
+												processUtilityContext);
 #if (PG_VERSION_NUM >= PG_VERSION_15)
 extern List * PreprocessAlterSequencePersistenceStmt(Node *node, const char *queryString,
 													 ProcessUtilityContext
@@ -521,7 +540,8 @@ extern List * PreprocessRenameSequenceStmt(Node *node, const char *queryString,
 										   ProcessUtilityContext processUtilityContext);
 extern List * PreprocessGrantOnSequenceStmt(Node *node, const char *queryString,
 											ProcessUtilityContext processUtilityContext);
-extern List * PostprocessGrantOnSequenceStmt(Node *node, const char *queryString);
+extern List * PostprocessGrantOnSequenceStmt(Node *node, const char *queryString,
+											 ProcessUtilityContext processUtilityContext);
 extern List * AlterSequenceStmtObjectAddress(Node *node, bool missing_ok, bool
 											 isPostprocess);
 extern List * AlterSequenceSchemaStmtObjectAddress(Node *node, bool missing_ok, bool
@@ -543,7 +563,8 @@ extern void RenameExistingSequenceWithDifferentTypeIfExists(RangeVar *sequence,
 /* statistics.c - forward declarations */
 extern List * PreprocessCreateStatisticsStmt(Node *node, const char *queryString,
 											 ProcessUtilityContext processUtilityContext);
-extern List * PostprocessCreateStatisticsStmt(Node *node, const char *queryString);
+extern List * PostprocessCreateStatisticsStmt(Node *node, const char *queryString,
+											  ProcessUtilityContext processUtilityContext);
 extern List * CreateStatisticsStmtObjectAddress(Node *node, bool missingOk, bool
 												isPostprocess);
 extern List * PreprocessDropStatisticsStmt(Node *node, const char *queryString,
@@ -556,7 +577,9 @@ extern List * PreprocessAlterStatisticsRenameStmt(Node *node, const char *queryS
 extern List * PreprocessAlterStatisticsSchemaStmt(Node *node, const char *queryString,
 												  ProcessUtilityContext
 												  processUtilityContext);
-extern List * PostprocessAlterStatisticsSchemaStmt(Node *node, const char *queryString);
+extern List * PostprocessAlterStatisticsSchemaStmt(Node *node, const char *queryString,
+												   ProcessUtilityContext
+												   processUtilityContext);
 extern List * AlterStatisticsSchemaStmtObjectAddress(Node *node, bool missingOk, bool
 													 isPostprocess);
 extern List * PreprocessAlterStatisticsStmt(Node *node, const char *queryString,
@@ -564,7 +587,9 @@ extern List * PreprocessAlterStatisticsStmt(Node *node, const char *queryString,
 extern List * PreprocessAlterStatisticsOwnerStmt(Node *node, const char *queryString,
 												 ProcessUtilityContext
 												 processUtilityContext);
-extern List * PostprocessAlterStatisticsOwnerStmt(Node *node, const char *queryString);
+extern List * PostprocessAlterStatisticsOwnerStmt(Node *node, const char *queryString,
+												  ProcessUtilityContext
+												  processUtilityContext);
 extern List * GetExplicitStatisticsCommandList(Oid relationId);
 extern List * GetExplicitStatisticsSchemaIdList(Oid relationId);
 extern List * GetAlterIndexStatisticsCommands(Oid indexOid);
@@ -581,11 +606,14 @@ extern void PostprocessCreateTableStmt(CreateStmt *createStatement,
 extern bool ShouldEnableLocalReferenceForeignKeys(void);
 extern List * PreprocessAlterTableStmtAttachPartition(AlterTableStmt *alterTableStatement,
 													  const char *queryString);
-extern List * PostprocessAlterTableSchemaStmt(Node *node, const char *queryString);
+extern List * PostprocessAlterTableSchemaStmt(Node *node, const char *queryString,
+											  ProcessUtilityContext processUtilityContext);
 extern void PrepareAlterTableStmtForConstraint(AlterTableStmt *alterTableStatement,
 											   Oid relationId, Constraint *constraint);
 extern List * PreprocessAlterTableStmt(Node *node, const char *alterTableCommand,
 									   ProcessUtilityContext processUtilityContext);
+extern List * PostprocessAlterTableStmt(Node *node, const char *alterTableCommand,
+										ProcessUtilityContext processUtilityContext);
 extern List * PreprocessAlterTableMoveAllStmt(Node *node, const char *queryString,
 											  ProcessUtilityContext processUtilityContext);
 extern List * PreprocessAlterTableSchemaStmt(Node *node, const char *queryString,
@@ -594,7 +622,6 @@ extern void SkipForeignKeyValidationIfConstraintIsFkey(AlterTableStmt *alterTabl
 													   bool processLocalRelation);
 extern bool IsAlterTableRenameStmt(RenameStmt *renameStmt);
 extern void ErrorIfAlterDropsPartitionColumn(AlterTableStmt *alterTableStatement);
-extern void PostprocessAlterTableStmt(AlterTableStmt *pStmt);
 extern void FixAlterTableStmtIndexNames(AlterTableStmt *pStmt);
 extern void ErrorUnsupportedAlterTableAddColumn(Oid relationId, AlterTableCmd *command,
 												Constraint *constraint);
@@ -692,12 +719,14 @@ extern void UpdateFunctionDistributionInfo(const ObjectAddress *distAddress,
 										   bool *forceDelegation);
 
 /* vacuum.c - forward declarations */
-extern List * PostprocessVacuumStmt(Node *node, const char *vacuumCommand);
+extern List * PostprocessVacuumStmt(Node *node, const char *vacuumCommand,
+									ProcessUtilityContext processUtilityContext);
 
 /* view.c - forward declarations */
 extern List * PreprocessViewStmt(Node *node, const char *queryString,
 								 ProcessUtilityContext processUtilityContext);
-extern List * PostprocessViewStmt(Node *node, const char *queryString);
+extern List * PostprocessViewStmt(Node *node, const char *queryString,
+								  ProcessUtilityContext processUtilityContext);
 extern List * ViewStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess);
 extern List * AlterViewStmtObjectAddress(Node *node, bool missing_ok, bool isPostprocess);
 extern List * PreprocessDropViewStmt(Node *node, const char *queryString,
@@ -712,14 +741,16 @@ extern bool IsViewDistributed(Oid viewOid);
 extern List * CreateViewDDLCommandsIdempotent(Oid viewOid);
 extern List * PreprocessAlterViewStmt(Node *node, const char *queryString,
 									  ProcessUtilityContext processUtilityContext);
-extern List * PostprocessAlterViewStmt(Node *node, const char *queryString);
+extern List * PostprocessAlterViewStmt(Node *node, const char *queryString,
+									   ProcessUtilityContext processUtilityContext);
 extern List * PreprocessRenameViewStmt(Node *node, const char *queryString,
 									   ProcessUtilityContext processUtilityContext);
 extern List * RenameViewStmtObjectAddress(Node *node, bool missing_ok, bool
 										  isPostprocess);
 extern List * PreprocessAlterViewSchemaStmt(Node *node, const char *queryString,
 											ProcessUtilityContext processUtilityContext);
-extern List * PostprocessAlterViewSchemaStmt(Node *node, const char *queryString);
+extern List * PostprocessAlterViewSchemaStmt(Node *node, const char *queryString,
+											 ProcessUtilityContext processUtilityContext);
 extern List * AlterViewSchemaStmtObjectAddress(Node *node, bool missing_ok, bool
 											   isPostprocess);
 extern bool IsViewRenameStmt(RenameStmt *renameStmt);
@@ -728,17 +759,22 @@ extern bool IsViewRenameStmt(RenameStmt *renameStmt);
 extern List * GetExplicitTriggerCommandList(Oid relationId);
 extern HeapTuple GetTriggerTupleById(Oid triggerId, bool missingOk);
 extern List * GetExplicitTriggerIdList(Oid relationId);
-extern List * PostprocessCreateTriggerStmt(Node *node, const char *queryString);
+extern List * PostprocessCreateTriggerStmt(Node *node, const char *queryString,
+										   ProcessUtilityContext processUtilityContext);
 extern List * CreateTriggerStmtObjectAddress(Node *node, bool missingOk, bool
 											 isPostprocess);
 extern void CreateTriggerEventExtendNames(CreateTrigStmt *createTriggerStmt,
 										  char *schemaName, uint64 shardId);
 extern List * PreprocessAlterTriggerRenameStmt(Node *node, const char *queryString,
 											   ProcessUtilityContext processUtilityContext);
-extern List * PostprocessAlterTriggerRenameStmt(Node *node, const char *queryString);
+extern List * PostprocessAlterTriggerRenameStmt(Node *node, const char *queryString,
+												ProcessUtilityContext
+												processUtilityContext);
 extern void AlterTriggerRenameEventExtendNames(RenameStmt *renameTriggerStmt,
 											   char *schemaName, uint64 shardId);
-extern List * PostprocessAlterTriggerDependsStmt(Node *node, const char *queryString);
+extern List * PostprocessAlterTriggerDependsStmt(Node *node, const char *queryString,
+												 ProcessUtilityContext
+												 processUtilityContext);
 extern List * PreprocessAlterTriggerDependsStmt(Node *node, const char *queryString,
 												ProcessUtilityContext
 												processUtilityContext);

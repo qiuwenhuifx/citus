@@ -795,7 +795,7 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 	{
 		if (ops && ops->postprocess)
 		{
-			List *processJobs = ops->postprocess(parsetree, queryString);
+			List *processJobs = ops->postprocess(parsetree, queryString, context);
 
 			if (processJobs)
 			{
@@ -839,10 +839,6 @@ ProcessUtilityInternal(PlannedStmt *pstmt,
 	/* after local command has completed, finish by executing worker DDLJobs, if any */
 	if (ddlJobs != NIL)
 	{
-		if (IsA(parsetree, AlterTableStmt))
-		{
-			PostprocessAlterTableStmt(castNode(AlterTableStmt, parsetree));
-		}
 		if (IsA(parsetree, GrantStmt))
 		{
 			GrantStmt *grantStmt = (GrantStmt *) parsetree;
