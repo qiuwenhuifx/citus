@@ -526,6 +526,14 @@ GetRebalanceSteps(RebalanceOptions *options)
 		}
 	}
 
+	if (shardAllowedNodeCount < ShardReplicationFactor)
+	{
+		ereport(ERROR, (errmsg("Shard replication factor (%d) cannot be greater than "
+							   "shard allowed node count (%d).", ShardReplicationFactor,
+							   shardAllowedNodeCount
+							  )));
+	}
+
 	List *activeShardPlacementListList = NIL;
 	List *unbalancedShards = NIL;
 
